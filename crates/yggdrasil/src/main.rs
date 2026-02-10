@@ -1,3 +1,4 @@
+use std::fs::File;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 use time::macros::format_description;
@@ -20,6 +21,10 @@ struct Args {
     /// Read configuration from stdin
     #[arg(long)]
     useconf: bool,
+
+    /// Log level (error, warn, info, debug, trace)
+    #[arg(long, default_value = "config.json")]
+    useconffile: String,
 
     /// Run without a configuration file (generate ephemeral keys)
     #[arg(long)]
@@ -68,6 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         serde_json::from_str::<Config>(&stdin)?
     } else if args.autoconf {
         Config::generate()
+    } else if !args.useconffile.is_empty() {
+        let file = File::open(&args.useconffile)?;
+        let config = std::io::read_to_string(file)?;
+        serde_json::from_str::<Config>(&config)?
     } else {
         tracing::error!("Please specify --genconf, --useconf, or --autoconf");
         std::process::exit(1);
