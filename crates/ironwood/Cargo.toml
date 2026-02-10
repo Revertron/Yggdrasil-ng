@@ -1,0 +1,20 @@
+[package]
+name = "ironwood"
+version = "0.1.0"
+edition = "2021"
+description = "Routing library: ed25519-addressed PacketConn over spanning tree"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+crypto_box = "0.9"
+murmur3 = "0.5"
+rand = "0.8"
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+async-trait = "0.1"
+sha2 = "0.10"
+tokio-util = { version = "0.7", features = ["rt"] }
+hex = "0.4.3"
