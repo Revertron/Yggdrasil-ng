@@ -30,6 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] 
 time = { version = "0.3.47", features = ["macros"] }
 tun-rs = { version = "2", features = ["async_tokio"] }
 getopts = "0.2"
+toml = "0.8"
 hex = "0.4"
 url = "2"
 tokio-util = { version = "0.7", features = ["rt"] }

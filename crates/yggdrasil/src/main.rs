@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut opts = Options::new();
     opts.optflag("", "genconf", "Generate a new configuration and print to stdout");
-    opts.optopt("c", "config", "Config file path (default: config.json)", "FILE");
+    opts.optopt("c", "config", "Config file path (default: yggdrasil.toml)", "FILE");
     opts.optflag("", "autoconf", "Run without a configuration file (generate ephemeral keys)");
     opts.optflag("a", "address", "Print the IPv6 address for the given config and exit");
     opts.optflag("s", "subnet", "Print the IPv6 subnet for the given config and exit");
@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let genconf = matches.opt_present("genconf");
-    let config_path = matches.opt_str("config").unwrap_or_else(|| "config.json".to_string());
+    let config_path = matches.opt_str("config").unwrap_or_else(|| "yggdrasil.toml".to_string());
     let autoconf = matches.opt_present("autoconf");
     let address = matches.opt_present("address");
     let subnet = matches.opt_present("subnet");
@@ -53,8 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --genconf: generate and print config
     if genconf {
-        let config = Config::generate();
-        println!("{}", serde_json::to_string_pretty(&config)?);
+        print!("{}", Config::generate_config_text());
         return Ok(());
     }
 
@@ -73,24 +72,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load config
     let config = if autoconf {
-        Config::generate()
+        Config::default()
     } else if !config_path.is_empty() {
         let file = File::open(&config_path)?;
         let config = std::io::read_to_string(file)?;
-        serde_json::from_str::<Config>(&config)?
+        toml::from_str::<Config>(&config)?
     } else {
         tracing::error!("Please specify --genconf, --config, or --autoconf");
         std::process::exit(1);
     };
 
     // Parse or generate signing key
-    let signing_key = if config.private_key.is_empty() {
-        tracing::warn!("No private key configured, generating ephemeral key");
-        SigningKey::generate(&mut rand::rngs::OsRng)
-    } else {
+    // Priority: config file > YGGDRASIL_PRIVATE_KEY env var > ephemeral
+    let signing_key = if !config.private_key.is_empty() {
         config
             .signing_key()
             .map_err(|e| format!("invalid private key: {}", e))?
+    } else if let Ok(env_key) = std::env::var("YGGDRASIL_PRIVATE_KEY") {
+        tracing::info!("Using private key from YGGDRASIL_PRIVATE_KEY environment variable");
+        let bytes = hex::decode(&env_key)
+            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY hex: {}", e))?;
+        let key_bytes: [u8; 64] = bytes.try_into()
+            .map_err(|v: Vec<u8>| format!("YGGDRASIL_PRIVATE_KEY should be 64 bytes, got {}", v.len()))?;
+        SigningKey::from_keypair_bytes(&key_bytes)
+            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?
+    } else {
+        tracing::warn!("No private key configured, generating ephemeral key");
+        SigningKey::generate(&mut rand::rngs::OsRng)
     };
 
     let public_key = signing_key.verifying_key().to_bytes();

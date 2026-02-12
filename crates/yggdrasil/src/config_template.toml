@@ -1,0 +1,45 @@
+# Yggdrasil configuration file
+#
+# This is a TOML configuration file for the Yggdrasil mesh network daemon.
+# Documentation: https://yggdrasil-network.github.io/
+
+# Your private key. DO NOT share this with anyone!
+# This is a hex-encoded Ed25519 keypair (64 bytes = 128 hex characters).
+# Delete this line and restart to generate a new identity.
+private_key = "{{PRIVATE_KEY}}"
+
+# List of connection strings for outbound peer connections in URI format,
+# e.g. tcp://a.b.c.d:e, tls://a.b.c.d:e, quic://a.b.c.d:e, etc.
+# NOTE: Now Yggdrasil-ng supports only TCP connections.
+# You can find public peers at https://publicpeers.neilalexander.dev/
+peers = []
+
+# Listen addresses for inbound connections. You'll need to add port
+# forwarding for these ports if you are behind a NAT/firewall.
+# e.g. tcp://[::]:12345, tls://[::]:12345
+# NOTE: Now Yggdrasil-ng supports only TCP connections.
+listen = ["tcp://0.0.0.0:0"]
+
+# Listen address for the admin socket.
+# This is used by yggdrasilctl to query and control the node.
+# Set to "" to disable the admin socket.
+admin_listen = "tcp://localhost:9001"
+
+# Name of the TUN interface to use.
+# "auto" = automatically assign a name.
+# "none" = disable the TUN interface (useful for router-only nodes).
+if_name = "auto"
+
+# Maximum Transmission Unit (MTU) for the TUN interface.
+if_mtu = 65535
+
+# Custom node info that is advertised to other nodes.
+# This can be any TOML table, e.g. { name = "my-node", location = "earth" }
+[node_info]
+
+# If true, your node_info will not be visible to other nodes.
+# node_info_privacy = false
+
+# List of allowed public keys (hex-encoded). If non-empty, only peers with
+# these public keys will be allowed to connect. Leave empty to allow all peers.
+# allowed_public_keys = []

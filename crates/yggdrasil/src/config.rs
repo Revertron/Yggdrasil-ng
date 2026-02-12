@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 
 /// Yggdrasil node configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
 pub struct Config {
     /// Ed25519 private key as hex string (128 hex chars = 64 bytes).
     #[serde(default)]
@@ -13,7 +12,7 @@ pub struct Config {
     #[serde(default)]
     pub peers: Vec<String>,
 
-    /// Listen addresses, e.g. `["tcp://[::]:9001"]`.
+    /// Listen addresses, e.g. `["tcp://[::]:1234"]`.
     #[serde(default)]
     pub listen: Vec<String>,
 
@@ -26,12 +25,12 @@ pub struct Config {
     pub if_name: String,
 
     /// TUN MTU (default 65535).
-    #[serde(default = "default_mtu", rename = "IfMTU")]
+    #[serde(default = "default_mtu")]
     pub if_mtu: u64,
 
-    /// Custom node info (arbitrary JSON).
-    #[serde(default)]
-    pub node_info: serde_json::Value,
+    /// Custom node info (arbitrary TOML value).
+    #[serde(default = "default_node_info")]
+    pub node_info: toml::Value,
 
     /// If true, don't expose node info to other nodes.
     #[serde(default)]
@@ -50,6 +49,10 @@ fn default_mtu() -> u64 {
     65535
 }
 
+fn default_node_info() -> toml::Value {
+    toml::Value::Table(toml::map::Map::new())
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -59,24 +62,30 @@ impl Default for Config {
             admin_listen: "tcp://localhost:9001".to_string(),
             if_name: default_if_name(),
             if_mtu: default_mtu(),
-            node_info: serde_json::Value::Null,
+            node_info: toml::Value::Table(toml::map::Map::new()),
             node_info_privacy: false,
             allowed_public_keys: Vec::new(),
         }
     }
 }
 
+const CONFIG_TEMPLATE: &str = include_str!("config_template.toml");
+
 impl Config {
     /// Generate a new config with a fresh random keypair.
     pub fn generate() -> Self {
+        let text = Self::generate_config_text();
+        toml::from_str(&text).expect("config template must be valid TOML")
+    }
+
+    /// Generate a commented config file as a TOML string with a fresh keypair.
+    pub fn generate_config_text() -> String {
         use ed25519_dalek::SigningKey;
         use rand::rngs::OsRng;
 
         let signing_key = SigningKey::generate(&mut OsRng);
-        let key_bytes = signing_key.to_keypair_bytes();
-        let mut config = Config::default();
-        config.private_key = hex::encode(key_bytes);
-        config
+        let key_hex = hex::encode(signing_key.to_keypair_bytes());
+        CONFIG_TEMPLATE.replace("{{PRIVATE_KEY}}", &key_hex)
     }
 
     /// Parse the private key from hex.
