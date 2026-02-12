@@ -642,6 +642,8 @@ async fn handle_connection(
         .register(uri.to_string(), inbound, remote_meta.public_key, priority)
         .await;
 
+    let conn_start = Instant::now();
+
     // Hand off to ironwood (blocks until peer disconnects)
     let result = core
         .handle_conn(remote_meta.public_key, Box::new(stream), priority)
@@ -650,6 +652,30 @@ async fn handle_connection(
 
     // Unregister when done
     active.unregister(conn_id).await;
+
+    // Log disconnection
+    let uptime = conn_start.elapsed();
+    match &result {
+        Ok(()) => {
+            tracing::info!(
+                "Disconnected {}: {} @ {} (uptime: {:.1}s)",
+                direction,
+                remote_addr,
+                peer_addr,
+                uptime.as_secs_f64()
+            );
+        }
+        Err(e) => {
+            tracing::info!(
+                "Disconnected {}: {} @ {} (uptime: {:.1}s, error: {})",
+                direction,
+                remote_addr,
+                peer_addr,
+                uptime.as_secs_f64(),
+                e
+            );
+        }
+    }
 
     result
 }
