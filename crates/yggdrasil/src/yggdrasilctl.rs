@@ -1,3 +1,4 @@
+use comfy_table::{presets, Table};
 use getopts::Options;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -141,26 +142,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if peers.is_empty() {
                     println!("No peers connected.");
                 } else {
-                    for (i, peer) in peers.iter().enumerate() {
-                        if i > 0 {
-                            println!();
-                        }
-                        print_kv(peer, &[
-                            ("URI", "uri"),
-                            ("Up", "up"),
-                            ("Inbound", "inbound"),
-                            ("Public key", "key"),
-                            ("IPv6 address", "address"),
-                            ("IPv6 subnet", "subnet"),
-                            ("Priority", "priority"),
-                            ("Bytes received", "bytes_recvd"),
-                            ("Bytes sent", "bytes_sent"),
-                            ("RX rate", "rx_rate"),
-                            ("TX rate", "tx_rate"),
-                            ("Uptime", "uptime"),
-                            ("Last error", "last_error"),
+                    let mut table = Table::new();
+                    table.load_preset(presets::NOTHING);
+                    table.set_header(vec![
+                        "URI", "State", "Dir", "IP Address", "Uptime", "RX", "TX",
+                        "RX Rate", "TX Rate", "Pr", "Last Error"
+                    ]);
+
+                    for peer in peers {
+                        let uri = peer.get("uri")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let up = peer.get("up")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let state = if up { "Up" } else { "Down" };
+                        let inbound = peer.get("inbound")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let dir = if inbound { "In" } else { "Out" };
+                        let address = peer.get("address")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let uptime = peer.get("uptime")
+                            .and_then(|v| v.as_f64())
+                            .map(format_uptime)
+                            .unwrap_or_else(|| "-".to_string());
+                        let rx_bytes = peer.get("bytes_recvd")
+                            .and_then(|v| v.as_u64())
+                            .map(format_bytes)
+                            .unwrap_or_else(|| "-".to_string());
+                        let tx_bytes = peer.get("bytes_sent")
+                            .and_then(|v| v.as_u64())
+                            .map(format_bytes)
+                            .unwrap_or_else(|| "-".to_string());
+                        let rx_rate = peer.get("rx_rate")
+                            .and_then(|v| v.as_u64())
+                            .map(|r| if r > 0 { format!("{}/s", format_bytes(r)) } else { "-".to_string() })
+                            .unwrap_or_else(|| "-".to_string());
+                        let tx_rate = peer.get("tx_rate")
+                            .and_then(|v| v.as_u64())
+                            .map(|r| if r > 0 { format!("{}/s", format_bytes(r)) } else { "-".to_string() })
+                            .unwrap_or_else(|| "-".to_string());
+                        let priority = peer.get("priority")
+                            .and_then(|v| v.as_u64())
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "-".to_string());
+                        let last_error = peer.get("last_error")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("-");
+
+                        table.add_row(vec![
+                            uri, state, dir, address, &uptime, &rx_bytes, &tx_bytes,
+                            &rx_rate, &tx_rate, &priority, last_error
                         ]);
                     }
+
+                    println!("{}", table);
                 }
             }
         }
@@ -170,17 +209,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if tree.is_empty() {
                     println!("No tree entries.");
                 } else {
-                    for (i, entry) in tree.iter().enumerate() {
-                        if i > 0 {
-                            println!();
-                        }
-                        print_kv(entry, &[
-                            ("Public key", "key"),
-                            ("IPv6 address", "address"),
-                            ("Parent", "parent"),
-                            ("Sequence", "sequence"),
-                        ]);
+                    let mut table = Table::new();
+                    table.load_preset(presets::NOTHING);
+                    table.set_header(vec!["Public Key", "IP Address", "Parent", "Sequence"]);
+
+                    for entry in tree {
+                        let key = entry.get("key")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let address = entry.get("address")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let parent = entry.get("parent")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let sequence = entry.get("sequence")
+                            .and_then(|v| v.as_u64())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "-".to_string());
+
+                        table.add_row(vec![key, address, parent, &sequence]);
                     }
+
+                    println!("{}", table);
                 }
             }
         }
@@ -205,5 +256,43 @@ fn print_kv(obj: &serde_json::Value, fields: &[(&str, &str)]) {
             };
             println!("  {:width$}  {}", format!("{}:", label), val_str, width = max_label + 1);
         }
+    }
+}
+
+/// Format bytes as human-readable string (KB, MB, GB, etc.)
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+
+    let mut size = bytes as f64;
+    let mut unit_idx = 0;
+
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+
+    if unit_idx == 0 {
+        format!("{} {}", bytes, UNITS[0])
+    } else {
+        format!("{:.2} {}", size, UNITS[unit_idx])
+    }
+}
+
+/// Format uptime in seconds as human-readable string (e.g., "1h23m45s")
+fn format_uptime(seconds: f64) -> String {
+    let total_secs = seconds as u64;
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    if hours > 0 {
+        format!("{}h{}m{}s", hours, minutes, secs)
+    } else if minutes > 0 {
+        format!("{}m{}s", minutes, secs)
+    } else {
+        format!("{}s", secs)
     }
 }

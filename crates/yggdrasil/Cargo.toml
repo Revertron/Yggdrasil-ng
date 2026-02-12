@@ -34,3 +34,4 @@ toml = "0.8"
 hex = "0.4"
 url = "2"
 tokio-util = { version = "0.7", features = ["rt"] }
+comfy-table = "7"
