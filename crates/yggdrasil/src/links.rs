@@ -628,7 +628,7 @@ async fn handle_connection(
     };
     let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     tracing::info!(
-        "Connected {}: {} @ {} (v0.{}.{})",
+        "Connected {}: {} @ {} (v{}.{})",
         direction,
         remote_addr,
         peer_addr,
