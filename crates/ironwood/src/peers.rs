@@ -157,7 +157,19 @@ impl Peers {
     pub async fn send_to_peer(&self, peer_id: PeerId, msg: PeerMessage) -> bool {
         for peers in self.handles.values() {
             if let Some(handle) = peers.get(&peer_id) {
-                return handle.tx.send(msg).await.is_ok();
+                // Use try_send to avoid blocking dispatch_actions
+                match handle.tx.try_send(msg) {
+                    Ok(_) => return true,
+                    Err(mpsc::error::TrySendError::Full(msg)) => {
+                        // Channel full - spawn background task
+                        let tx = handle.tx.clone();
+                        tokio::spawn(async move {
+                            let _ = tx.send(msg).await;
+                        });
+                        return true;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                }
             }
         }
         false
@@ -208,16 +220,26 @@ async fn send_traffic_to_peer(
     let mut payload = Vec::new();
     wire_traffic.encode(&mut payload);
     let frame = wire::encode_frame(wire::PacketType::Traffic, &payload);
+    let msg = PeerMessage::SendFrame(frame);
 
-    // Send to channel - this will wait if channel is full (backpressure)
-    // Don't use try_send because that causes unnecessary queuing
+    // Try non-blocking send first
     let tx = handle.tx.clone();
     drop(peers_lock);
 
-    // Blocking send - wait for space in channel
-    if tx.send(PeerMessage::SendFrame(frame)).await.is_err() {
-        // Peer disconnected
-        return;
+    match tx.try_send(msg) {
+        Ok(_) => {
+            // Fast path: sent immediately
+        }
+        Err(mpsc::error::TrySendError::Full(msg)) => {
+            // Channel full - spawn background task to wait for space
+            // This prevents blocking dispatch_actions
+            tokio::spawn(async move {
+                let _ = tx.send(msg).await;
+            });
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            // Peer disconnected, ignore
+        }
     }
 }
 
@@ -337,7 +359,7 @@ pub(crate) async fn peer_reader(
     traffic_tx: mpsc::Sender<TrafficPacket>,
     cancel: CancellationToken,
     max_message_size: u64,
-    peer_timeout: Duration,
+    _peer_timeout: Duration,
     _keepalive_delay: Duration,
 ) {
     let mut reader = BufReader::new(conn_read);
@@ -345,23 +367,19 @@ pub(crate) async fn peer_reader(
 
     loop {
         // Read frame: length(uvarint) | content
-        // Timeout after peer_timeout (default 3s) to detect dead connections
+        // No timeout by default - rely on TCP keepalives
+        // (Go only sets timeout when expecting a response after sending non-keepalive traffic)
         let frame_result = tokio::select! {
             _ = cancel.cancelled() => { break },
-            result = tokio::time::timeout(peer_timeout, read_uvarint(&mut reader)) => {
-                match result {
-                    Ok(r) => r,
-                    Err(_) => {
-                        tracing::debug!("Peer {} read timeout, closing connection", peer_id);
-                        break;
-                    }
-                }
-            }
+            result = read_uvarint(&mut reader) => result,
         };
 
         let frame_len = match frame_result {
             Ok(len) => len,
-            Err(_e) => { break },
+            Err(e) => {
+                tracing::info!("Peer {} read_uvarint error: {}, closing connection", peer_id, e);
+                break;
+            },
         };
 
         if frame_len > max_message_size {
@@ -371,18 +389,11 @@ pub(crate) async fn peer_reader(
         let mut buf = vec![0u8; frame_len as usize];
         let read_result = tokio::select! {
             _ = cancel.cancelled() => { break },
-            result = tokio::time::timeout(peer_timeout, reader.read_exact(&mut buf)) => {
-                match result {
-                    Ok(r) => r,
-                    Err(_) => {
-                        tracing::debug!("Peer {} read timeout, closing connection", peer_id);
-                        break;
-                    }
-                }
-            }
+            result = reader.read_exact(&mut buf) => result,
         };
 
-        if read_result.is_err() {
+        if let Err(e) = read_result {
+            tracing::info!("Peer {} read_exact error: {}, closing connection", peer_id, e);
             break;
         }
 
@@ -608,6 +619,10 @@ pub(crate) async fn peer_writer(
     // Write directly without BufWriter to ensure immediate transmission
     let keepalive_frame = wire::encode_frame(wire::PacketType::KeepAlive, &[]);
 
+    // Use interval for persistent keepalive timer (not sleep which resets each loop)
+    let mut keepalive_timer = tokio::time::interval(keepalive_delay);
+    keepalive_timer.tick().await; // skip first immediate tick
+
     loop {
         let msg = tokio::select! {
             _ = cancel.cancelled() => break,
@@ -615,8 +630,9 @@ pub(crate) async fn peer_writer(
                 Some(m) => Some(m),
                 None => break,
             },
-            _ = tokio::time::sleep(keepalive_delay) => {
-                // No data sent recently, send keepalive
+            _ = keepalive_timer.tick() => {
+                // Timer fired, send keepalive
+                tracing::trace!("Peer {} sending keepalive", peer_id);
                 if conn_write.write_all(&keepalive_frame).await.is_err() {
                     break;
                 }

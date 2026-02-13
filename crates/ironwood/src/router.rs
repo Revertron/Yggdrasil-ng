@@ -247,6 +247,7 @@ pub(crate) struct Router {
     pub refresh: bool,
     pub do_root1: bool,
     pub do_root2: bool,
+    pub last_refresh: Instant,
 
     // Config
     pub router_refresh: Duration,
@@ -280,6 +281,7 @@ impl Router {
             refresh: false,
             do_root1: false,
             do_root2: true,
+            last_refresh: Instant::now(),
             router_refresh: config.router_refresh,
             router_timeout: config.router_timeout,
             path_timeout: config.path_timeout,
@@ -297,6 +299,15 @@ impl Router {
     /// Returns a list of actions to execute.
     pub fn do_maintenance(&mut self) -> Vec<RouterAction> {
         let mut actions = Vec::new();
+
+        // Check if it's time to refresh (send periodic SigReq to all peers)
+        // This triggers keepalive timers on Go peers and refreshes routing info
+        if self.last_refresh.elapsed() >= self.router_refresh {
+            tracing::debug!("Router refresh timer expired, triggering refresh");
+            self.refresh = true;
+            self.last_refresh = Instant::now();
+        }
+
         self.do_root2 = self.do_root2 || self.do_root1;
         self.reset_cache();
         self.update_ancestries();
