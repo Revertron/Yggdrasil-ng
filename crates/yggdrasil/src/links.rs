@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -132,6 +134,61 @@ impl BanList {
                 now.duration_since(entry.last_attempt) < FAILED_ATTEMPT_WINDOW * 2
             }
         });
+    }
+}
+
+/// Wrapper that counts bytes read/written from a stream.
+struct CountingStream {
+    inner: TcpStream,
+    rx_counter: Arc<AtomicU64>,
+    tx_counter: Arc<AtomicU64>,
+}
+
+impl CountingStream {
+    fn new(stream: TcpStream, rx_counter: Arc<AtomicU64>, tx_counter: Arc<AtomicU64>) -> Self {
+        Self {
+            inner: stream,
+            rx_counter,
+            tx_counter,
+        }
+    }
+}
+
+impl AsyncRead for CountingStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result {
+            let bytes_read = buf.filled().len() - before;
+            self.rx_counter.fetch_add(bytes_read as u64, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl AsyncWrite for CountingStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &result {
+            self.tx_counter.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -638,15 +695,18 @@ async fn handle_connection(
 
     // Register in active links
     let inbound = link_type == LinkType::Incoming;
-    let (conn_id, _rx_counter, _tx_counter) = active
+    let (conn_id, rx_counter, tx_counter) = active
         .register(uri.to_string(), inbound, remote_meta.public_key, priority)
         .await;
 
     let conn_start = Instant::now();
 
+    // Wrap stream to count bytes
+    let counting_stream = CountingStream::new(stream, rx_counter, tx_counter);
+
     // Hand off to ironwood (blocks until peer disconnects)
     let result = core
-        .handle_conn(remote_meta.public_key, Box::new(stream), priority)
+        .handle_conn(remote_meta.public_key, Box::new(counting_stream), priority)
         .await
         .map_err(|e| format!("ironwood: {}", e));
 
