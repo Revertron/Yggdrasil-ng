@@ -485,7 +485,7 @@ impl Links {
                                         &active,
                                         &remote_str,
                                     ).await {
-                                        tracing::info!("Incoming connection failed: {}", e);
+                                        tracing::info!("Incoming connection from {} failed: {}", remote, e);
                                     }
                                     // Permit automatically released when dropped
                                     drop(permit);
