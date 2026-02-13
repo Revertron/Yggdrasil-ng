@@ -1220,26 +1220,18 @@ impl Router {
     }
 
     /// Handle incoming lookup from a peer.
-    pub fn handle_lookup(
-        &mut self,
-        peer_key: &PublicKey,
-        lookup: &wire::PathLookup,
-    ) -> Vec<RouterAction> {
-        tracing::debug!("Received lookup from {:?} for dest {:?} (source={:?})", hex::encode(&peer_key[..4]), hex::encode(&lookup.dest[..4]), hex::encode(&lookup.source[..4]));
+    pub fn handle_lookup(&mut self,peer_key: &PublicKey, lookup: &wire::PathLookup) -> Vec<RouterAction> {
+        tracing::debug!("Received lookup from {:?} for dest {:?} (source={:?})", hex::encode(&peer_key[..8]), hex::encode(&lookup.dest[..8]), hex::encode(&lookup.source[..8]));
         if !self.blooms.is_on_tree(peer_key) {
-            tracing::warn!("Dropping lookup from {:?}: peer not on tree", hex::encode(&peer_key[..4]));
+            tracing::debug!("Dropping lookup from {:?}: peer not on tree", hex::encode(&peer_key[..8]));
             return Vec::new();
         }
         self.handle_lookup_internal(peer_key, lookup)
     }
 
-    fn handle_notify_internal(
-        &mut self,
-        _from_key: &PublicKey,
-        notify: &wire::PathNotify,
-    ) -> Vec<RouterAction> {
+    fn handle_notify_internal(&mut self,_from_key: &PublicKey, notify: &wire::PathNotify) -> Vec<RouterAction> {
         let mut actions = Vec::new();
-        tracing::debug!("PathNotify: src={:?} dest={:?} path_len={}", hex::encode(&notify.source[..4]), hex::encode(&notify.dest[..4]), notify.path.len());
+        tracing::debug!("PathNotify: src={:?} dest={:?} path_len={}", hex::encode(&notify.source[..8]), hex::encode(&notify.dest[..8]), notify.path.len());
 
         // Try to route towards destination
         let mut watermark = notify.watermark;
