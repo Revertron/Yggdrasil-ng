@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::crypto::{Crypto, PublicKey, PUBLIC_KEY_SIZE};
+use crate::crypto::{Crypto, PublicKey};
 use crate::peers::{
     dispatch_actions, peer_reader, peer_writer, PeerMessage, Peers,
 };

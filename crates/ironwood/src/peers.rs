@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -21,16 +21,11 @@ use crate::traffic::{PacketQueue, TrafficPacket};
 use crate::types::Error;
 use crate::wire::{self, PeerPort};
 
-/// Maximum age for queued packets before they are dropped (25 milliseconds).
-const MAX_PACKET_AGE: Duration = Duration::from_millis(25);
-
 /// Messages sent from the system to a peer's writer task.
 #[derive(Debug)]
 pub(crate) enum PeerMessage {
     /// Raw frame bytes to write (already length-prefixed).
     SendFrame(Vec<u8>),
-    /// Flush the write buffer.
-    Flush,
 }
 
 /// Handle to a peer's writer task.
@@ -214,40 +209,16 @@ async fn send_traffic_to_peer(
     wire_traffic.encode(&mut payload);
     let frame = wire::encode_frame(wire::PacketType::Traffic, &payload);
 
-    // Try to send immediately (non-blocking)
-    match handle.tx.try_send(PeerMessage::SendFrame(frame)) {
-        Ok(_) => {
-            // Success, sent immediately
-            drop(peers_lock);
-            return;
-        }
-        Err(mpsc::error::TrySendError::Full(_frame)) => {
-            // Channel is full, need to queue
-            tracing::debug!("Peer {} writer channel full, queueing traffic", peer_id);
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            // Peer disconnected
-            drop(peers_lock);
-            return;
-        }
-    }
-
-    // Channel is full, queue the traffic packet
-    let queue = handle.traffic_queue.clone();
+    // Send to channel - this will wait if channel is full (backpressure)
+    // Don't use try_send because that causes unnecessary queuing
+    let tx = handle.tx.clone();
     drop(peers_lock);
 
-    let mut queue_lock = queue.lock().await;
-
-    // Check if oldest packet is too old (>25ms), drop it to make room
-    if let Some(age) = queue_lock.oldest_age() {
-        if age > MAX_PACKET_AGE {
-            queue_lock.drop_largest();
-            tracing::debug!("Dropped oldest queued traffic for peer {} (age > 25ms)", peer_id);
-        }
+    // Blocking send - wait for space in channel
+    if tx.send(PeerMessage::SendFrame(frame)).await.is_err() {
+        // Peer disconnected
+        return;
     }
-
-    // Queue the new packet
-    queue_lock.push(traffic);
 }
 
 // ---------------------------------------------------------------------------
@@ -583,8 +554,9 @@ pub(crate) async fn peer_reader(
 async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
     peer_id: PeerId,
     queue: &Arc<tokio::sync::Mutex<PacketQueue>>,
-    writer: &mut BufWriter<W>,
+    writer: &mut W,
 ) {
+    use tokio::io::AsyncWriteExt;
     loop {
         // Try to pop a packet from the queue
         let traffic = {
@@ -625,14 +597,15 @@ async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
 pub(crate) async fn peer_writer(
     peer_id: PeerId,
     mut rx: mpsc::Receiver<PeerMessage>,
-    conn_write: impl tokio::io::AsyncWrite + Unpin + Send,
+    mut conn_write: impl tokio::io::AsyncWrite + Unpin + Send,
     traffic_queue: Arc<tokio::sync::Mutex<PacketQueue>>,
     keepalive_delay: Duration,
     cancel: CancellationToken,
 ) {
     use crate::wire;
+    use tokio::io::AsyncWriteExt;
 
-    let mut writer = BufWriter::new(conn_write);
+    // Write directly without BufWriter to ensure immediate transmission
     let keepalive_frame = wire::encode_frame(wire::PacketType::KeepAlive, &[]);
 
     loop {
@@ -644,10 +617,10 @@ pub(crate) async fn peer_writer(
             },
             _ = tokio::time::sleep(keepalive_delay) => {
                 // No data sent recently, send keepalive
-                if writer.write_all(&keepalive_frame).await.is_err() {
+                if conn_write.write_all(&keepalive_frame).await.is_err() {
                     break;
                 }
-                if writer.flush().await.is_err() {
+                if conn_write.flush().await.is_err() {
                     break;
                 }
                 continue;
@@ -665,22 +638,15 @@ pub(crate) async fn peer_writer(
                 if let Some(ptype) = peek_frame_type(&data) {
                     tracing::debug!("peer_writer: sending {:?} frame, {} bytes", ptype, data.len());
                 }
-                if writer.write_all(&data).await.is_err() {
+                if conn_write.write_all(&data).await.is_err() {
                     break;
                 }
 
                 // After successfully writing, drain queued traffic
-                drain_traffic_queue(peer_id, &traffic_queue, &mut writer).await;
+                drain_traffic_queue(peer_id, &traffic_queue, &mut conn_write).await;
 
-                // If no more messages are immediately available, flush
-                if rx.is_empty() {
-                    if writer.flush().await.is_err() {
-                        break;
-                    }
-                }
-            }
-            PeerMessage::Flush => {
-                if writer.flush().await.is_err() {
+                // Always flush to ensure data reaches the network immediately
+                if conn_write.flush().await.is_err() {
                     break;
                 }
             }
