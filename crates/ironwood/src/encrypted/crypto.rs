@@ -1,7 +1,7 @@
 //! Cryptographic primitives for the encrypted layer.
 //!
-//! - Ed25519 ↔ Curve25519 key conversion
-//! - NaCl box encryption/decryption with precomputed shared secrets
+//! - Ed25519 ↔ Curve25519 key conversion using `curve25519-dalek`
+//! - XSalsa20-Poly1305 authenticated encryption (NaCl box construction) using `crypto_box` crate
 //! - Nonce construction from u64 counters
 
 use crypto_box::aead::Aead;
@@ -10,10 +10,10 @@ use crypto_box::{PublicKey as BoxPublicKey, SecretKey as BoxSecretKey, SalsaBox}
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha512};
 
-/// NaCl box overhead (Poly1305 tag).
+/// XSalsa20-Poly1305 overhead (Poly1305 authentication tag).
 pub(crate) const BOX_OVERHEAD: usize = 16;
 
-/// NaCl box nonce size.
+/// XSalsa20-Poly1305 nonce size (24 bytes).
 pub(crate) const BOX_NONCE_SIZE: usize = 24;
 
 /// Curve25519 public key (32 bytes).
@@ -64,7 +64,7 @@ pub(crate) fn ed25519_public_to_curve25519(
 }
 
 // ---------------------------------------------------------------------------
-// NaCl box operations
+// XSalsa20-Poly1305 encryption (crypto_box crate)
 // ---------------------------------------------------------------------------
 
 /// Generate a new random Curve25519 keypair.
@@ -78,7 +78,7 @@ pub(crate) fn new_box_keys() -> (CurvePublicKey, CurvePrivateKey) {
     (pub_bytes, priv_bytes)
 }
 
-/// Encrypt a message with a precomputed NaCl box (XSalsa20-Poly1305).
+/// Encrypt a message using XSalsa20-Poly1305 (via crypto_box crate).
 ///
 /// Returns ciphertext (plaintext.len() + 16 bytes overhead).
 pub(crate) fn box_seal(
@@ -93,7 +93,7 @@ pub(crate) fn box_seal(
     salsa_box.encrypt(nonce_ga, msg).map_err(|_| ())
 }
 
-/// Decrypt a message with a precomputed NaCl box (XSalsa20-Poly1305).
+/// Decrypt a message using XSalsa20-Poly1305 (via crypto_box crate).
 ///
 /// Returns plaintext (ciphertext.len() - 16 bytes).
 pub(crate) fn box_open(
@@ -140,7 +140,7 @@ pub(crate) fn make_salsa_box(
     SalsaBox::new(&pk, &sk)
 }
 
-/// Convert a u64 counter to a 24-byte NaCl nonce.
+/// Convert a u64 counter to a 24-byte XSalsa20 nonce.
 ///
 /// Format: 16 zero bytes followed by 8 bytes big-endian u64.
 /// Matches Go's `nonceForUint64`.

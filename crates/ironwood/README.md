@@ -72,7 +72,7 @@ let conn = new_packet_conn(signing_key, Config::default());
 
 ### `EncryptedPacketConn`
 
-Wraps the plain `PacketConn` with end-to-end [NaCl box](https://nacl.cr.yp.to/box.html) encryption (X25519 / XSalsa20 / Poly1305). Provides authenticated encryption with forward secrecy through key ratcheting.
+Wraps the plain `PacketConn` with end-to-end encryption using the [NaCl box](https://nacl.cr.yp.to/box.html) construction (X25519 + XSalsa20-Poly1305) via RustCrypto's `crypto_box` crate. Provides authenticated encryption with forward secrecy through session key ratcheting.
 
 Sessions are established automatically: the first write triggers a handshake (Init -> Ack -> Traffic), after which all packets are encrypted with ephemeral keys.
 

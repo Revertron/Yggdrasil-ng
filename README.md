@@ -5,12 +5,30 @@ This project aims to provide a lightweight, self-arranging, and secure mesh netw
 
 ## Features
 
-- **End-to-end encryption** for all network traffic
-- **Self-arranging mesh topology** — nodes automatically discover optimal paths
-- **IPv6 native** — provides every node with a unique, cryptographically bound IPv6 address
-- **Cross-platform** support (Linux, macOS, Windows, Android, iOS)
-- **Lightweight** — minimal resource footprint suitable for embedded devices
-- **Rust implementation** — memory safety, performance, and modern tooling
+- **End-to-end encryption** for all network traffic using XSalsa20-Poly1305 (RustCrypto implementation)
+- **Self-arranging mesh topology** — nodes automatically discover optimal paths via spanning tree routing
+- **IPv6 native** — provides every node with a unique, cryptographically bound IPv6 address derived from Ed25519 public key
+- **Cross-platform** support (Linux, macOS, Windows)
+- **Lightweight** — minimal resource footprint, suitable for embedded devices and routers
+- **Rust implementation** — memory safety, performance, zero-cost abstractions, and modern tooling
+
+### Implementation Status
+
+**✅ Fully Implemented:**
+- Core routing protocol (spanning tree, path discovery, bloom filters)
+- End-to-end encryption with forward secrecy (session key ratcheting)
+- TCP transport with automatic reconnection and exponential backoff
+- TUN/TAP interface for IPv6 traffic
+- Admin socket API (getSelf, getPeers, getTree)
+- Session cleanup and timeout handling
+- Optimized Ed25519→Curve25519 key conversion
+
+**⏳ Planned Features:**
+- Additional transports: TLS, QUIC, WebSocket
+- Multicast peer discovery on local networks
+- More admin API endpoints (DHT, sessions, detailed stats)
+- Mobile platform support (Android, iOS)
+- Performance optimizations and protocol improvements
 
 ## Building from Source
 
@@ -85,24 +103,56 @@ cargo install --path .
 
 ## Usage
 
+### Command Line Options
+
+```bash
+yggdrasil [options]
+```
+
+**Available options:**
+
+| Option | Description |
+|--------|-------------|
+| `-g, --genconf [FILE]` | Generate a new configuration (save to FILE or print to stdout) |
+| `-c, --config FILE` | Config file path (default: `yggdrasil.toml`) |
+| `--autoconf` | Run without a configuration file (use ephemeral keys) |
+| `-a, --address` | Print the IPv6 address for the given config and exit |
+| `-s, --subnet` | Print the IPv6 subnet for the given config and exit |
+| `-l, --loglevel LEVEL` | Log level: error, warn, info, debug, trace (default: info) |
+| `-n, --no-replace` | With `--genconf FILE`, skip if the file already exists |
+| `-h, --help` | Print help message |
+| `-v, --version` | Print version |
+
+**Environment variables:**
+
+- `YGGDRASIL_PRIVATE_KEY`: Hex-encoded Ed25519 private key (128 hex chars). Overrides config file if set.
+
 ### Starting Yggdrasil
 
 Generate a default configuration file:
 
 ```bash
-yggdrasil --genconf > /etc/yggdrasil.conf
+yggdrasil --genconf > yggdrasil.toml
+# Or save directly to a file:
+yggdrasil --genconf=yggdrasil.toml
 ```
 
 Edit the configuration to add peers, then start the daemon:
 
 ```bash
-sudo yggdrasil -useconffile /etc/yggdrasil.conf
+sudo yggdrasil -c yggdrasil.toml
 ```
 
-Or run with auto-configuration:
+Or run with auto-configuration (ephemeral key):
 
 ```bash
 sudo yggdrasil --autoconf
+```
+
+Print your address without starting the daemon:
+
+```bash
+yggdrasil --config yggdrasil.toml --address
 ```
 
 ### Using yggdrasilctl
@@ -116,38 +166,96 @@ yggdrasilctl getSelf
 # List connected peers
 yggdrasilctl getPeers
 
-# Show DHT (Distributed Hash Table) entries
-yggdrasilctl getDHT
+# View routing table (spanning tree)
+yggdrasilctl getTree
+```
 
-# View session information
-yggdrasilctl getSessions
+**Note**: Currently supported commands are limited compared to the Go version:
+- ✅ `getSelf` - Show node info (address, subnet, public key)
+- ✅ `getPeers` - List active peer connections
+- ✅ `getTree` - Show routing table entries
+- ⏳ Other commands (DHT, sessions, paths) coming in future updates
 
-# Check the routing table
-yggdrasilctl getSwitchPeers
+By default, `yggdrasilctl` connects to `tcp://localhost:9001`. You can specify a different address:
+
+```bash
+yggdrasilctl -endpoint tcp://127.0.0.1:9001 getPeers
 ```
 
 ## Configuration
 
-Yggdrasil uses a JSON configuration file. Key settings include:
+### Config File Format: TOML
 
-- **Peers**: Static peers to connect to (TCP or TLS)
-- **Listen**: Address to listen for incoming connections
-- **AdminSocket**: Path to the admin socket for `yggdrasilctl`
-- **NodeInfo**: Optional metadata about your node
+Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which uses HJSON/JSON).
 
-Example minimal configuration:
+**Key configuration options:**
 
-```json
-{
-  "Peers": [
+| Option | Type | Description |
+|--------|------|-------------|
+| `private_key` | string | Hex-encoded Ed25519 private key (128 hex chars, 64 bytes) |
+| `peers` | array | Peer URIs to connect to, e.g. `["tcp://host:port"]` |
+| `listen` | array | Listen addresses, e.g. `["tcp://[::]:1234"]` |
+| `admin_listen` | string | Admin socket address, e.g. `"tcp://localhost:9001"` |
+| `if_name` | string | TUN interface name: "auto" (default) or "none" to disable |
+| `if_mtu` | integer | TUN MTU (default: 65535) |
+| `node_info` | table | Custom node metadata (TOML table) |
+| `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
+| `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
+
+**Example minimal configuration:**
+
+```toml
+# Your private Ed25519 key (DO NOT share!)
+private_key = "0123456789abcdef..."
+
+# Peers to connect to
+peers = [
     "tcp://192.0.2.1:443",
     "tcp://[2001:db8::1]:12345"
-  ],
-  "Listen": [
-    "tcp://[::]:1234"
-  ]
-}
+]
+
+# Listen for incoming connections
+listen = ["tcp://[::]:1234"]
+
+# Admin socket for yggdrasilctl
+admin_listen = "tcp://localhost:9001"
+
+# TUN interface settings
+if_name = "auto"
+if_mtu = 65535
+
+# Custom node metadata (optional)
+[node_info]
+name = "my-node"
+location = "datacenter-1"
 ```
+
+### Differences from Go Version
+
+**Command line:**
+- `-c/--config` instead of `-useconffile`
+- `--genconf [FILE]` instead of `-genconf` (can save directly to file)
+- Config file defaults to `yggdrasil.toml` (not required to specify)
+- New `YGGDRASIL_PRIVATE_KEY` environment variable support
+
+**Config file:**
+- **Format**: TOML instead of HJSON/JSON
+- **Field names**: `snake_case` instead of `PascalCase`
+  - `private_key` instead of `PrivateKey`
+  - `admin_listen` instead of `AdminListen`
+  - `if_name` instead of `IfName`
+  - `if_mtu` instead of `IfMTU`
+  - `node_info` instead of `NodeInfo`
+  - `node_info_privacy` instead of `NodeInfoPrivacy`
+  - `allowed_public_keys` instead of `AllowedPublicKeys`
+- **Transport support**: Currently only TCP (TLS, QUIC, WebSocket coming later)
+- **Admin socket**: Defaults to TCP `localhost:9001` instead of Unix socket
+
+**Migration from Go config:**
+1. Convert HJSON/JSON to TOML format
+2. Rename all fields from PascalCase to snake_case
+3. Change transport URIs to TCP-only (remove `tls://`, `quic://`, etc.)
+4. Update admin socket to TCP format if using Unix socket
 
 ## Development
 
@@ -172,6 +280,25 @@ This project is licensed under the same terms as the original Yggdrasil project 
 - [Original Yggdrasil (Go implementation)](https://github.com/yggdrasil-network/yggdrasil-go)
 - [Project Wiki](https://github.com/Revertron/Yggdrasil-ng/wiki)
 
+## Compatibility with Go Version
+
+Yggdrasil-ng is designed to be **wire-compatible** with the original Go implementation:
+
+- ✅ Can peer with Go nodes over TCP
+- ✅ Uses the same routing protocol and wire format
+- ✅ Compatible address derivation (Ed25519 → IPv6)
+- ✅ Compatible encryption (XSalsa20-Poly1305, session key ratcheting)
+- ⚠️  Config files are **not** directly compatible (different format and field names)
+
+**Interoperability tested with:**
+- Yggdrasil-go v0.5.x
+
+## Performance
+
+- Thorough tests are to be made, but some tests with iperf3 show significant improvements over the Go's version.
+- Also, the memory footprint is a lot smaller.
+- And binaries are smaller too :)
+
 ---
 
-**Note**: This is an experimental implementation. Network protocols and APIs may change. Not recommended for production-critical deployments without thorough testing.
+**Note**: This is an experimental implementation under active development. While core functionality is stable and tested, some features are still being implemented. The network protocol is compatible with the Go version, but configuration format and CLI options differ. Suitable for testing and development; use in production at your own discretion.
