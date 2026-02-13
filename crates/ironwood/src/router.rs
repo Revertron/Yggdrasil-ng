@@ -489,11 +489,7 @@ impl Router {
     }
 
     /// Handle an incoming signature request with explicit req data.
-    pub fn handle_request_with_data(
-        &self,
-        peer: &PeerEntry,
-        req: &wire::SigReq,
-    ) -> RouterAction {
+    pub fn handle_request_with_data(&self,peer: &PeerEntry, req: &wire::SigReq) -> RouterAction {
         let res_bytes = Self::sig_res_bytes_for_sig(&peer.key, &self.crypto.public_key, req.seq, req.nonce, peer.port);
         let psig = self.crypto.sign(&res_bytes);
 
@@ -508,13 +504,7 @@ impl Router {
         }
     }
 
-    fn sig_res_bytes_for_sig(
-        node: &PublicKey,
-        parent: &PublicKey,
-        seq: u64,
-        nonce: u64,
-        port: PeerPort,
-    ) -> Vec<u8> {
+    fn sig_res_bytes_for_sig(node: &PublicKey, parent: &PublicKey, seq: u64, nonce: u64, port: PeerPort) -> Vec<u8> {
         let mut out = Vec::with_capacity(32 + 32 + 20);
         out.extend_from_slice(node);
         out.extend_from_slice(parent);
@@ -525,13 +515,7 @@ impl Router {
     }
 
     /// Handle a signature response from a peer.
-    pub fn handle_response(
-        &mut self,
-        peer_id: PeerId,
-        key: &PublicKey,
-        res: &wire::SigRes,
-        rtt: Duration,
-    ) {
+    pub fn handle_response(&mut self,peer_id: PeerId, key: &PublicKey, res: &wire::SigRes, rtt: Duration) {
         let req_match = self
             .requests
             .get(key)
@@ -1154,17 +1138,11 @@ impl Router {
         self.handle_lookup_internal(&self_key, &lookup)
     }
 
-    fn handle_lookup_internal(
-        &mut self,
-        from_key: &PublicKey,
-        lookup: &wire::PathLookup,
-    ) -> Vec<RouterAction> {
+    fn handle_lookup_internal(&mut self,from_key: &PublicKey, lookup: &wire::PathLookup) -> Vec<RouterAction> {
         let mut actions = Vec::new();
 
         // Multicast to matching peers
-        let targets =
-            self.blooms
-                .get_multicast_targets(from_key, &lookup.dest, &self.bloom_transform);
+        let targets = self.blooms.get_multicast_targets(from_key, &lookup.dest, &self.bloom_transform);
         tracing::debug!("Lookup multicast to {} targets", targets.len());
         for target_key in targets {
             if let Some(peer_id) = self.best_peer_for_key(&target_key) {
@@ -1288,11 +1266,7 @@ impl Router {
     }
 
     /// Handle incoming path notify from a peer.
-    pub fn handle_notify(
-        &mut self,
-        peer_key: &PublicKey,
-        notify: &wire::PathNotify,
-    ) -> Vec<RouterAction> {
+    pub fn handle_notify(&mut self,peer_key: &PublicKey, notify: &wire::PathNotify) -> Vec<RouterAction> {
         self.handle_notify_internal(peer_key, notify)
     }
 
@@ -1313,10 +1287,7 @@ impl Router {
         if let Some(peer_id) = self.lookup(&broken.path, &mut watermark) {
             let mut fwd = broken.clone();
             fwd.watermark = watermark;
-            actions.push(RouterAction::SendPathBroken {
-                peer_id,
-                broken: fwd,
-            });
+            actions.push(RouterAction::SendPathBroken { peer_id, broken: fwd, });
             return actions;
         }
 
@@ -1386,11 +1357,7 @@ impl Router {
     }
 
     /// Handle incoming bloom filter from a peer.
-    pub fn handle_bloom(
-        &mut self,
-        peer_key: &PublicKey,
-        filter: crate::bloom::BloomFilter,
-    ) {
+    pub fn handle_bloom(&mut self,peer_key: &PublicKey, filter: crate::bloom::BloomFilter) {
         self.blooms.handle_bloom(peer_key, filter);
     }
 }

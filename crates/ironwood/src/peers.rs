@@ -17,9 +17,12 @@ use tokio_util::sync::CancellationToken;
 use crate::bloom::BloomFilter;
 use crate::crypto::{Crypto, PublicKey};
 use crate::router::{PeerId, PeerEntry, Router, RouterAction, RouterAnnounce};
-use crate::traffic::TrafficPacket;
+use crate::traffic::{PacketQueue, TrafficPacket};
 use crate::types::Error;
 use crate::wire::{self, PeerPort};
+
+/// Maximum age for queued packets before they are dropped (25 milliseconds).
+const MAX_PACKET_AGE: Duration = Duration::from_millis(25);
 
 /// Messages sent from the system to a peer's writer task.
 #[derive(Debug)]
@@ -39,6 +42,8 @@ pub(crate) struct PeerHandle {
     pub order: u64,
     pub tx: mpsc::Sender<PeerMessage>,
     pub cancel: CancellationToken,
+    /// Queue for outbound traffic when writer is busy.
+    pub traffic_queue: Arc<tokio::sync::Mutex<PacketQueue>>,
 }
 
 impl PeerHandle {
@@ -116,6 +121,7 @@ impl Peers {
             order,
             tx,
             cancel,
+            traffic_queue: Arc::new(tokio::sync::Mutex::new(PacketQueue::new())),
         };
 
         self.handles
@@ -129,6 +135,7 @@ impl Peers {
                 order,
                 tx: handle.tx.clone(),
                 cancel: handle.cancel.clone(),
+                traffic_queue: handle.traffic_queue.clone(),
             });
 
         handle
@@ -170,6 +177,77 @@ impl Peers {
         }
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Peer traffic sending with queuing
+// ---------------------------------------------------------------------------
+
+/// Send traffic to a peer, queuing if the channel is full.
+/// This implements the same backpressure logic as Go's peers.go _push() method.
+async fn send_traffic_to_peer(
+    peers: &Arc<tokio::sync::Mutex<Peers>>,
+    peer_id: PeerId,
+    traffic: TrafficPacket,
+) {
+    let peers_lock = peers.lock().await;
+
+    // Find the peer handle
+    let handle = match peers_lock.get_handle(peer_id) {
+        Some(h) => h,
+        None => {
+            drop(peers_lock);
+            return;
+        }
+    };
+
+    // Encode the traffic frame
+    let wire_traffic = wire::Traffic {
+        path: traffic.path.clone(),
+        from: traffic.from.clone(),
+        source: traffic.source,
+        dest: traffic.dest,
+        watermark: traffic.watermark,
+        payload: traffic.payload.clone(),
+    };
+    let mut payload = Vec::new();
+    wire_traffic.encode(&mut payload);
+    let frame = wire::encode_frame(wire::PacketType::Traffic, &payload);
+
+    // Try to send immediately (non-blocking)
+    match handle.tx.try_send(PeerMessage::SendFrame(frame)) {
+        Ok(_) => {
+            // Success, sent immediately
+            drop(peers_lock);
+            return;
+        }
+        Err(mpsc::error::TrySendError::Full(_frame)) => {
+            // Channel is full, need to queue
+            tracing::debug!("Peer {} writer channel full, queueing traffic", peer_id);
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            // Peer disconnected
+            drop(peers_lock);
+            return;
+        }
+    }
+
+    // Channel is full, queue the traffic packet
+    let queue = handle.traffic_queue.clone();
+    drop(peers_lock);
+
+    let mut queue_lock = queue.lock().await;
+
+    // Check if oldest packet is too old (>25ms), drop it to make room
+    if let Some(age) = queue_lock.oldest_age() {
+        if age > MAX_PACKET_AGE {
+            queue_lock.drop_largest();
+            tracing::debug!("Dropped oldest queued traffic for peer {} (age > 25ms)", peer_id);
+        }
+    }
+
+    // Queue the new packet
+    queue_lock.push(traffic);
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +362,7 @@ pub(crate) async fn peer_reader(
     conn_read: impl tokio::io::AsyncRead + Unpin + Send,
     router: Arc<tokio::sync::Mutex<Router>>,
     peers: Arc<tokio::sync::Mutex<Peers>>,
+    delivery_queue: Arc<crate::traffic::DeliveryQueue>,
     traffic_tx: mpsc::Sender<TrafficPacket>,
     cancel: CancellationToken,
     max_message_size: u64,
@@ -393,7 +472,7 @@ pub(crate) async fn peer_reader(
                 let mut router = router.lock().await;
                 let actions = router.handle_announce(peer_id, &peer_key, &router_ann);
                 drop(router);
-                dispatch_actions(actions, &peers, &traffic_tx).await;
+                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
             }
             wire::PacketType::ProtoBloomFilter => {
                 let raw = match wire::decode_bloom(payload) {
@@ -414,7 +493,7 @@ pub(crate) async fn peer_reader(
                 let mut router = router.lock().await;
                 let actions = router.handle_lookup(&peer_key, &lookup);
                 drop(router);
-                dispatch_actions(actions, &peers, &traffic_tx).await;
+                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
             }
             wire::PacketType::ProtoPathNotify => {
                 let notify = match wire::PathNotify::decode(payload) {
@@ -424,7 +503,7 @@ pub(crate) async fn peer_reader(
                 let mut router = router.lock().await;
                 let actions = router.handle_notify(&peer_key, &notify);
                 drop(router);
-                dispatch_actions(actions, &peers, &traffic_tx).await;
+                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
             }
             wire::PacketType::ProtoPathBroken => {
                 let broken = match wire::PathBroken::decode(payload) {
@@ -434,7 +513,7 @@ pub(crate) async fn peer_reader(
                 let mut router = router.lock().await;
                 let actions = router.handle_broken(&broken);
                 drop(router);
-                dispatch_actions(actions, &peers, &traffic_tx).await;
+                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
             }
             wire::PacketType::Traffic => {
                 let tr = match wire::Traffic::decode(payload) {
@@ -452,7 +531,7 @@ pub(crate) async fn peer_reader(
                 let mut router = router.lock().await;
                 let actions = router.handle_traffic(traffic);
                 drop(router);
-                dispatch_actions(actions, &peers, &traffic_tx).await;
+                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
             }
         }
     }
@@ -476,16 +555,61 @@ pub(crate) async fn peer_reader(
         peers_lock.remove_peer(peer_id, &peer_key);
         drop(peers_lock);
 
-        dispatch_actions(actions, &peers, &traffic_tx).await;
+        dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
     }
 
     cancel.cancel();
 }
 
+/// Drain queued traffic packets and send them.
+/// This is called by peer_writer after successfully writing a frame.
+async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
+    peer_id: PeerId,
+    queue: &Arc<tokio::sync::Mutex<PacketQueue>>,
+    writer: &mut BufWriter<W>,
+) {
+    loop {
+        // Try to pop a packet from the queue
+        let traffic = {
+            let mut q = queue.lock().await;
+            q.pop()
+        };
+
+        let traffic = match traffic {
+            Some(t) => t,
+            None => break, // Queue is empty
+        };
+
+        // Encode the traffic frame
+        let wire_traffic = wire::Traffic {
+            path: traffic.path,
+            from: traffic.from,
+            source: traffic.source,
+            dest: traffic.dest,
+            watermark: traffic.watermark,
+            payload: traffic.payload,
+        };
+        let mut payload = Vec::new();
+        wire_traffic.encode(&mut payload);
+        let frame = wire::encode_frame(wire::PacketType::Traffic, &payload);
+
+        // Write the frame
+        if writer.write_all(&frame).await.is_err() {
+            tracing::debug!("peer_writer: failed to write queued traffic for peer {}", peer_id);
+            break;
+        }
+
+        tracing::debug!("peer_writer: sent queued traffic for peer {}", peer_id);
+    }
+}
+
 /// The peer writer task. Receives frames and writes them to the connection.
+/// After writing each frame, it drains queued traffic packets.
 pub(crate) async fn peer_writer(
+    peer_id: PeerId,
     mut rx: mpsc::Receiver<PeerMessage>,
     conn_write: impl tokio::io::AsyncWrite + Unpin + Send,
+    traffic_queue: Arc<tokio::sync::Mutex<PacketQueue>>,
     cancel: CancellationToken,
 ) {
     use crate::wire;
@@ -527,6 +651,10 @@ pub(crate) async fn peer_writer(
                 if writer.write_all(&data).await.is_err() {
                     break;
                 }
+
+                // After successfully writing, drain queued traffic
+                drain_traffic_queue(peer_id, &traffic_queue, &mut writer).await;
+
                 // If no more messages are immediately available, flush
                 if rx.is_empty() {
                     if writer.flush().await.is_err() {
@@ -584,12 +712,22 @@ async fn dispatch_action(
 pub(crate) async fn dispatch_actions(
     actions: Vec<RouterAction>,
     peers: &Arc<tokio::sync::Mutex<Peers>>,
+    delivery_queue: &Arc<crate::traffic::DeliveryQueue>,
     traffic_tx: &mpsc::Sender<TrafficPacket>,
 ) {
     for action in actions {
         match action {
             RouterAction::DeliverTraffic { traffic } => {
-                let _ = traffic_tx.send(traffic).await;
+                // Use delivery queue for backpressure handling
+                if let Some(pkt) = delivery_queue.deliver(traffic).await {
+                    // Reader is waiting, send immediately via channel
+                    let _ = traffic_tx.send(pkt).await;
+                }
+                // Otherwise packet was queued (or dropped if too old)
+            }
+            RouterAction::SendTraffic { peer_id, traffic } => {
+                // Use queuing logic for outbound traffic
+                send_traffic_to_peer(peers, peer_id, traffic).await;
             }
             RouterAction::PathNotifyCallback { key } => {
                 // Path notify callback handled by upper layer

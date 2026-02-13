@@ -4,7 +4,9 @@
 //! providing fair scheduling across flows. When dropping, it removes
 //! the oldest packet from the largest source within the largest destination.
 
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::crypto::PublicKey;
 use crate::wire::PeerPort;
@@ -257,6 +259,83 @@ impl PacketQueue {
             .flat_map(|s| s.infos.first())
             .min_by_key(|info| info.time)
             .map(|info| &info.packet)
+    }
+
+    /// Get the age of the oldest packet in the queue.
+    pub fn oldest_age(&self) -> Option<Duration> {
+        if self.dests.is_empty() {
+            return None;
+        }
+        // Find the oldest time across all dests/sources
+        self.dests
+            .iter()
+            .flat_map(|d| d.sources.iter())
+            .flat_map(|s| s.infos.first())
+            .min_by_key(|info| info.time)
+            .map(|info| info.time.elapsed())
+    }
+}
+
+/// Maximum age for queued packets before they are dropped (25 milliseconds).
+const MAX_PACKET_AGE: Duration = Duration::from_millis(25);
+
+/// DeliveryQueue manages the packet queue with receive-ready counting.
+/// This matches Go's packetconn.go logic where packets are queued when no
+/// reader is waiting, and sent directly when a reader is ready.
+pub(crate) struct DeliveryQueue {
+    /// The underlying packet queue.
+    queue: tokio::sync::Mutex<PacketQueue>,
+    /// Number of readers waiting (atomic for lock-free check).
+    recv_ready: AtomicUsize,
+}
+
+impl DeliveryQueue {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queue: tokio::sync::Mutex::new(PacketQueue::new()),
+            recv_ready: AtomicUsize::new(0),
+        })
+    }
+
+    /// Attempt to deliver a packet. Returns Some(packet) if a reader is waiting
+    /// (in which case the caller should send it via channel), or None if the
+    /// packet was queued (or dropped due to age).
+    pub async fn deliver(&self, packet: TrafficPacket) -> Option<TrafficPacket> {
+        // Fast path: check if a reader is waiting
+        if self.recv_ready.load(Ordering::Acquire) > 0 {
+            // Decrement recv_ready and return packet for immediate send
+            self.recv_ready.fetch_sub(1, Ordering::AcqRel);
+            return Some(packet);
+        }
+
+        // Slow path: queue the packet
+        let mut queue = self.queue.lock().await;
+
+        // Check if the oldest packet is too old (>25ms), if so drop it
+        if let Some(age) = queue.oldest_age() {
+            if age > MAX_PACKET_AGE {
+                queue.drop_largest();
+                tracing::debug!("Dropped oldest packet from queue (age > 25ms)");
+            }
+        }
+
+        queue.push(packet);
+        None
+    }
+
+    /// Called by read_from() before waiting on channel. Returns Some(packet)
+    /// if one is already queued, or None if the reader should wait (recv_ready incremented).
+    pub async fn try_pop_or_wait(&self) -> Option<TrafficPacket> {
+        let mut queue = self.queue.lock().await;
+
+        if let Some(packet) = queue.pop() {
+            // Packet was queued, return it immediately
+            Some(packet)
+        } else {
+            // No packet queued, increment recv_ready to signal we're waiting
+            self.recv_ready.fetch_add(1, Ordering::AcqRel);
+            None
+        }
     }
 }
 

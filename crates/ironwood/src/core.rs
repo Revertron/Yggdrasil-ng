@@ -22,7 +22,7 @@ use crate::peers::{
     dispatch_actions, peer_reader, peer_writer, PeerMessage, Peers,
 };
 use crate::router::Router;
-use crate::traffic::TrafficPacket;
+use crate::traffic::{DeliveryQueue, TrafficPacket};
 use crate::types::{Addr, AsyncConn, Error, Result};
 use crate::wire;
 
@@ -44,6 +44,8 @@ pub struct PacketConnImpl {
     router: Arc<Mutex<Router>>,
     /// The peer manager (shared with peer tasks).
     peers: Arc<Mutex<Peers>>,
+    /// Delivery queue for receive buffering with backpressure.
+    delivery_queue: Arc<DeliveryQueue>,
     /// Inbound traffic channel (reader side).
     traffic_rx: Mutex<mpsc::Receiver<TrafficPacket>>,
     /// Inbound traffic channel (writer side, given to peer readers).
@@ -63,6 +65,7 @@ impl PacketConnImpl {
         let pub_key = crypto.public_key;
         let router = Arc::new(Mutex::new(Router::new(crypto, &config)));
         let peers = Arc::new(Mutex::new(Peers::new()));
+        let delivery_queue = DeliveryQueue::new();
         let (traffic_tx, traffic_rx) = mpsc::channel(RECV_CHANNEL_SIZE);
         let cancel = CancellationToken::new();
 
@@ -70,9 +73,10 @@ impl PacketConnImpl {
         let maintenance_handle = {
             let router = router.clone();
             let peers = peers.clone();
+            let delivery_queue = delivery_queue.clone();
             let traffic_tx = traffic_tx.clone();
             let cancel = cancel.clone();
-            tokio::spawn(maintenance_loop(router, peers, traffic_tx, cancel))
+            tokio::spawn(maintenance_loop(router, peers, delivery_queue, traffic_tx, cancel))
         };
 
         Self {
@@ -81,6 +85,7 @@ impl PacketConnImpl {
             config,
             router,
             peers,
+            delivery_queue,
             traffic_rx: Mutex::new(traffic_rx),
             traffic_tx,
             closed: AtomicBool::new(false),
@@ -91,7 +96,13 @@ impl PacketConnImpl {
 }
 
 /// Background maintenance loop — runs every 1 second.
-async fn maintenance_loop(router: Arc<Mutex<Router>>, peers: Arc<Mutex<Peers>>, traffic_tx: mpsc::Sender<TrafficPacket>, cancel: CancellationToken) {
+async fn maintenance_loop(
+    router: Arc<Mutex<Router>>,
+    peers: Arc<Mutex<Peers>>,
+    delivery_queue: Arc<DeliveryQueue>,
+    traffic_tx: mpsc::Sender<TrafficPacket>,
+    cancel: CancellationToken,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.tick().await; // skip first immediate tick
 
@@ -108,7 +119,7 @@ async fn maintenance_loop(router: Arc<Mutex<Router>>, peers: Arc<Mutex<Peers>>, 
         };
 
         if !actions.is_empty() {
-            dispatch_actions(actions, &peers, &traffic_tx).await;
+            dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
         }
     }
 }
@@ -120,15 +131,22 @@ impl crate::types::PacketConn for PacketConnImpl {
             return Err(Error::Closed);
         }
 
-        let mut rx = self.traffic_rx.lock().await;
-        let cancel = self.cancel.clone();
+        // First, try to pop from the queue (if packets are already buffered)
+        let traffic = if let Some(pkt) = self.delivery_queue.try_pop_or_wait().await {
+            // Got a packet from the queue
+            pkt
+        } else {
+            // Queue was empty, recv_ready was incremented, now wait on channel
+            let mut rx = self.traffic_rx.lock().await;
+            let cancel = self.cancel.clone();
 
-        let traffic = tokio::select! {
-            _ = cancel.cancelled() => return Err(Error::Closed),
-            pkt = rx.recv() => match pkt {
-                Some(t) => t,
-                None => return Err(Error::Closed),
-            },
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(Error::Closed),
+                pkt = rx.recv() => match pkt {
+                    Some(t) => t,
+                    None => return Err(Error::Closed),
+                },
+            }
         };
 
         let n = buf.len().min(traffic.payload.len());
@@ -155,7 +173,7 @@ impl crate::types::PacketConn for PacketConnImpl {
         };
 
         if !actions.is_empty() {
-            dispatch_actions(actions, &self.peers, &self.traffic_tx).await;
+            dispatch_actions(actions, &self.peers, &self.delivery_queue, &self.traffic_tx).await;
         }
 
         Ok(buf.len())
@@ -193,6 +211,7 @@ impl crate::types::PacketConn for PacketConnImpl {
 
         let peer_id = handle.id;
         let entry = handle.to_entry();
+        let traffic_queue = handle.traffic_queue.clone();
 
         // Register with router and get initial actions
         let actions = {
@@ -202,7 +221,7 @@ impl crate::types::PacketConn for PacketConnImpl {
 
         // Send initial actions (sig req, bloom, etc.)
         if !actions.is_empty() {
-            dispatch_actions(actions, &self.peers, &self.traffic_tx).await;
+            dispatch_actions(actions, &self.peers, &self.delivery_queue, &self.traffic_tx).await;
         }
 
         // Send a keepalive as initial message
@@ -213,7 +232,13 @@ impl crate::types::PacketConn for PacketConnImpl {
 
         // Spawn writer task
         let writer_cancel = peer_cancel.clone();
-        let _writer_handle = tokio::spawn(peer_writer(writer_rx, write_half, writer_cancel));
+        let _writer_handle = tokio::spawn(peer_writer(
+            peer_id,
+            writer_rx,
+            write_half,
+            traffic_queue,
+            writer_cancel,
+        ));
 
         // Run reader task (blocks until peer disconnects)
         peer_reader(
@@ -223,6 +248,7 @@ impl crate::types::PacketConn for PacketConnImpl {
             read_half,
             self.router.clone(),
             self.peers.clone(),
+            self.delivery_queue.clone(),
             self.traffic_tx.clone(),
             peer_cancel.clone(),
             self.config.peer_max_message_size,
@@ -263,7 +289,7 @@ impl crate::types::PacketConn for PacketConnImpl {
         };
 
         if !actions.is_empty() {
-            dispatch_actions(actions, &self.peers, &self.traffic_tx).await;
+            dispatch_actions(actions, &self.peers, &self.delivery_queue, &self.traffic_tx).await;
         }
     }
 
