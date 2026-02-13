@@ -138,11 +138,16 @@ impl BanList {
 }
 
 /// Wrapper that counts bytes read/written from a stream.
+/// Uses local buffering to minimize atomic operations.
 struct CountingStream {
     inner: TcpStream,
     rx_counter: Arc<AtomicU64>,
     tx_counter: Arc<AtomicU64>,
+    rx_buffer: u64,
+    tx_buffer: u64,
 }
+
+const FLUSH_THRESHOLD: u64 = 65536; // Flush to atomic counters every 64KB
 
 impl CountingStream {
     fn new(stream: TcpStream, rx_counter: Arc<AtomicU64>, tx_counter: Arc<AtomicU64>) -> Self {
@@ -150,6 +155,22 @@ impl CountingStream {
             inner: stream,
             rx_counter,
             tx_counter,
+            rx_buffer: 0,
+            tx_buffer: 0,
+        }
+    }
+
+    fn flush_rx(&mut self) {
+        if self.rx_buffer > 0 {
+            self.rx_counter.fetch_add(self.rx_buffer, Ordering::Relaxed);
+            self.rx_buffer = 0;
+        }
+    }
+
+    fn flush_tx(&mut self) {
+        if self.tx_buffer > 0 {
+            self.tx_counter.fetch_add(self.tx_buffer, Ordering::Relaxed);
+            self.tx_buffer = 0;
         }
     }
 }
@@ -163,8 +184,11 @@ impl AsyncRead for CountingStream {
         let before = buf.filled().len();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &result {
-            let bytes_read = buf.filled().len() - before;
-            self.rx_counter.fetch_add(bytes_read as u64, Ordering::Relaxed);
+            let bytes_read = (buf.filled().len() - before) as u64;
+            self.rx_buffer += bytes_read;
+            if self.rx_buffer >= FLUSH_THRESHOLD {
+                self.flush_rx();
+            }
         }
         result
     }
@@ -178,17 +202,34 @@ impl AsyncWrite for CountingStream {
     ) -> Poll<std::io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &result {
-            self.tx_counter.fetch_add(*n as u64, Ordering::Relaxed);
+            self.tx_buffer += *n as u64;
+            if self.tx_buffer >= FLUSH_THRESHOLD {
+                self.flush_tx();
+            }
         }
         result
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let result = Pin::new(&mut self.inner).poll_flush(cx);
+        if let Poll::Ready(Ok(())) = &result {
+            self.flush_tx(); // Flush buffered counts on stream flush
+        }
+        result
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.flush_rx(); // Flush all buffered counts on shutdown
+        self.flush_tx();
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Drop for CountingStream {
+    fn drop(&mut self) {
+        // Ensure any buffered counts are flushed when stream is dropped
+        self.flush_rx();
+        self.flush_tx();
     }
 }
 
