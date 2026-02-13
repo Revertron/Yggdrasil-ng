@@ -237,6 +237,7 @@ impl crate::types::PacketConn for PacketConnImpl {
             writer_rx,
             write_half,
             traffic_queue,
+            self.config.peer_keepalive_delay,
             writer_cancel,
         ));
 
