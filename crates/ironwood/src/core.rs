@@ -251,6 +251,7 @@ impl crate::types::PacketConn for PacketConnImpl {
             self.peers.clone(),
             self.delivery_queue.clone(),
             self.traffic_tx.clone(),
+            writer_tx.clone(),
             peer_cancel.clone(),
             self.config.peer_max_message_size,
             self.config.peer_timeout,

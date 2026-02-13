@@ -26,6 +26,8 @@ use crate::wire::{self, PeerPort};
 pub(crate) enum PeerMessage {
     /// Raw frame bytes to write (already length-prefixed).
     SendFrame(Vec<u8>),
+    /// Schedule a keepalive to be sent after the delay (unless cancelled by sending other traffic).
+    ScheduleKeepalive,
 }
 
 /// Handle to a peer's writer task.
@@ -357,6 +359,7 @@ pub(crate) async fn peer_reader(
     peers: Arc<tokio::sync::Mutex<Peers>>,
     delivery_queue: Arc<crate::traffic::DeliveryQueue>,
     traffic_tx: mpsc::Sender<TrafficPacket>,
+    writer_tx: mpsc::Sender<PeerMessage>,
     cancel: CancellationToken,
     max_message_size: u64,
     _peer_timeout: Duration,
@@ -413,6 +416,9 @@ pub(crate) async fn peer_reader(
         };
 
         tracing::debug!("peer_reader[{}]: received {:?} frame, {} bytes payload", peer_id, ptype, payload.len());
+
+        // Track whether we should schedule a keepalive response
+        let should_schedule_keepalive = !matches!(ptype, wire::PacketType::Dummy | wire::PacketType::KeepAlive);
 
         // Dispatch based on message type
         match ptype {
@@ -533,6 +539,12 @@ pub(crate) async fn peer_reader(
                 dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
             }
         }
+
+        // After processing non-keepalive traffic, schedule a keepalive response
+        // (matches Go's behavior: recv() schedules keepalive for non-dummy/non-keepalive packets)
+        if should_schedule_keepalive {
+            let _ = writer_tx.send(PeerMessage::ScheduleKeepalive).await;
+        }
     }
 
     // Peer disconnected — remove from router and peers
@@ -605,6 +617,11 @@ async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
 
 /// The peer writer task. Receives frames and writes them to the connection.
 /// After writing each frame, it drains queued traffic packets.
+///
+/// Keepalive behavior (matches Go implementation):
+/// - Only send keepalives AFTER receiving non-keepalive traffic
+/// - Schedule keepalive timer when ScheduleKeepalive message is received
+/// - Cancel keepalive timer when sending any frame
 pub(crate) async fn peer_writer(
     peer_id: PeerId,
     mut rx: mpsc::Receiver<PeerMessage>,
@@ -616,31 +633,36 @@ pub(crate) async fn peer_writer(
     use crate::wire;
     use tokio::io::AsyncWriteExt;
 
-    // Write directly without BufWriter to ensure immediate transmission
+    // Pre-encode keepalive frame
     let keepalive_frame = wire::encode_frame(wire::PacketType::KeepAlive, &[]);
 
-    // Use interval for persistent keepalive timer (not sleep which resets each loop)
-    let mut keepalive_timer = tokio::time::interval(keepalive_delay);
-    keepalive_timer.tick().await; // skip first immediate tick
+    // Optional keepalive deadline (None = no keepalive scheduled)
+    let mut keepalive_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
 
     loop {
-        let msg = tokio::select! {
-            _ = cancel.cancelled() => break,
-            msg = rx.recv() => match msg {
-                Some(m) => Some(m),
-                None => break,
-            },
-            _ = keepalive_timer.tick() => {
-                // Timer fired, send keepalive
-                //tracing::trace!("Peer {} sending keepalive", peer_id);
-                if conn_write.write_all(&keepalive_frame).await.is_err() {
-                    break;
-                }
-                if conn_write.flush().await.is_err() {
-                    break;
-                }
-                continue;
-            },
+        let msg = if let Some(ref mut deadline) = keepalive_deadline {
+            // Keepalive is scheduled, wait for it or a message
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                msg = rx.recv() => msg,
+                _ = deadline => {
+                    // Keepalive timer fired, send keepalive
+                    keepalive_deadline = None; // Clear the deadline
+                    if conn_write.write_all(&keepalive_frame).await.is_err() {
+                        break;
+                    }
+                    if conn_write.flush().await.is_err() {
+                        break;
+                    }
+                    continue;
+                },
+            }
+        } else {
+            // No keepalive scheduled, just wait for messages
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                msg = rx.recv() => msg,
+            }
         };
 
         let msg = match msg {
@@ -650,6 +672,9 @@ pub(crate) async fn peer_writer(
 
         match msg {
             PeerMessage::SendFrame(data) => {
+                // Cancel any pending keepalive (we're sending traffic)
+                keepalive_deadline = None;
+
                 // Log outgoing frame type for diagnostics
                 if let Some(ptype) = peek_frame_type(&data) {
                     tracing::debug!("peer_writer: sending {:?} frame, {} bytes", ptype, data.len());
@@ -664,6 +689,13 @@ pub(crate) async fn peer_writer(
                 // Always flush to ensure data reaches the network immediately
                 if conn_write.flush().await.is_err() {
                     break;
+                }
+            }
+            PeerMessage::ScheduleKeepalive => {
+                // Schedule a keepalive to be sent after keepalive_delay
+                // (unless we send other traffic first, which will cancel it)
+                if keepalive_deadline.is_none() {
+                    keepalive_deadline = Some(Box::pin(tokio::time::sleep(keepalive_delay)));
                 }
             }
         }
