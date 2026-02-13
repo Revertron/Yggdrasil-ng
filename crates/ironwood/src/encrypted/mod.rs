@@ -47,8 +47,10 @@ pub struct EncryptedPacketConn {
     closed: AtomicBool,
     /// Cancellation for background tasks.
     cancel: CancellationToken,
-    /// Reader task handle.
-    _reader_handle: JoinHandle<()>,
+    /// Reader task handle (wrapped in Mutex so we can await it in close()).
+    reader_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Session cleanup task handle (wrapped in Mutex so we can await it in close()).
+    cleanup_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl EncryptedPacketConn {
@@ -78,6 +80,13 @@ impl EncryptedPacketConn {
             ))
         };
 
+        // Spawn session cleanup task: removes expired sessions every 30s
+        let cleanup_handle = {
+            let sessions = sessions.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(session_cleanup_loop(sessions, cancel))
+        };
+
         Self {
             inner,
             signing_key: secret,
@@ -87,7 +96,8 @@ impl EncryptedPacketConn {
             recv_tx,
             closed: AtomicBool::new(false),
             cancel,
-            _reader_handle: reader_handle,
+            reader_handle: Mutex::new(Some(reader_handle)),
+            cleanup_handle: Mutex::new(Some(cleanup_handle)),
         }
     }
 
@@ -108,6 +118,25 @@ impl EncryptedPacketConn {
 }
 
 /// Background reader loop: reads from inner PacketConn, decrypts via sessions, delivers.
+/// Background task that periodically cleans up expired sessions and buffers.
+/// Runs every 30 seconds to remove sessions/buffers older than SESSION_TIMEOUT (60s).
+async fn session_cleanup_loop(sessions: Arc<Mutex<SessionManager>>, cancel: CancellationToken) {
+    use std::time::Duration;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.tick().await; // Skip first immediate tick
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => {
+                let mut mgr = sessions.lock().await;
+                mgr.cleanup_expired();
+            }
+        }
+    }
+}
+
 async fn encrypted_reader_loop(
     inner: Arc<PacketConnImpl>,
     sessions: Arc<Mutex<SessionManager>>,
@@ -215,12 +244,7 @@ impl crate::types::PacketConn for EncryptedPacketConn {
         Ok(buf.len())
     }
 
-    async fn handle_conn(
-        &self,
-        key: Addr,
-        conn: Box<dyn crate::types::AsyncConn>,
-        prio: u8,
-    ) -> Result<()> {
+    async fn handle_conn(&self,key: Addr, conn: Box<dyn crate::types::AsyncConn>, prio: u8) -> Result<()> {
         self.inner.handle_conn(key, conn, prio).await
     }
 
@@ -249,7 +273,18 @@ impl crate::types::PacketConn for EncryptedPacketConn {
             return Err(Error::Closed);
         }
 
+        // Cancel background tasks
         self.cancel.cancel();
+
+        // Wait for background tasks to finish gracefully
+        if let Some(handle) = self.reader_handle.lock().await.take() {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.cleanup_handle.lock().await.take() {
+            let _ = handle.await;
+        }
+
+        // Close the inner connection
         self.inner.close().await
     }
 
