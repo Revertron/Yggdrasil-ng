@@ -10,8 +10,8 @@ ProtectSystem=true
 SyslogIdentifier=yggdrasil
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 ExecStartPre=+-/usr/sbin/modprobe tun
-ExecStartPre=/usr/bin/yggdrasil --genconf=/etc/yggdrasil-ng.conf --no-replace
-ExecStart=/usr/bin/yggdrasil --config /etc/yggdrasil-ng.conf
+ExecStartPre=/usr/bin/yggdrasil --genconf=/etc/yggdrasil/yggdrasil-ng.conf --no-replace
+ExecStart=/usr/bin/yggdrasil --config /etc/yggdrasil/yggdrasil-ng.conf
 Restart=always
 TimeoutStopSec=5
 
