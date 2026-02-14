@@ -3,6 +3,7 @@ name = "ironwood"
 version = "0.1.0"
 edition = "2021"
 description = "Routing library: ed25519-addressed PacketConn over spanning tree"
+license = "MPL-2.0"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
