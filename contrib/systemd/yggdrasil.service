@@ -1,0 +1,19 @@
+[Unit]
+Description=yggdrasil
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Group=yggdrasil
+ProtectHome=true
+ProtectSystem=true
+SyslogIdentifier=yggdrasil
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+ExecStartPre=+-/usr/sbin/modprobe tun
+ExecStartPre=/usr/bin/yggdrasil --genconf --no-replace /etc/yggdrasil.conf
+ExecStart=/usr/bin/yggdrasil --config /etc/yggdrasil.conf
+Restart=always
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target
