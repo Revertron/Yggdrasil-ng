@@ -1,5 +1,5 @@
 [Unit]
-Description=yggdrasil
+Description=Yggdrasil Network NG
 Wants=network-online.target
 After=network-online.target
 
@@ -10,7 +10,7 @@ ProtectSystem=true
 SyslogIdentifier=yggdrasil
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 ExecStartPre=+-/usr/sbin/modprobe tun
-ExecStartPre=/usr/bin/yggdrasil --genconf --no-replace /etc/yggdrasil.conf
+ExecStartPre=/usr/bin/yggdrasil --genconf /etc/yggdrasil.conf --no-replace
 ExecStart=/usr/bin/yggdrasil --config /etc/yggdrasil.conf
 Restart=always
 TimeoutStopSec=5
