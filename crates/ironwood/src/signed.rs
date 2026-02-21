@@ -34,11 +34,8 @@ pub struct SignedPacketConn {
     inner: Arc<PacketConnImpl>,
     /// Our Ed25519 signing key.
     signing_key: SigningKey,
-    /// Our public key.
-    pub_key: PublicKey,
     /// Channel for delivering verified traffic to read_from.
     recv_rx: Mutex<mpsc::Receiver<VerifiedMessage>>,
-    recv_tx: mpsc::Sender<VerifiedMessage>,
     /// Whether this conn is closed.
     closed: AtomicBool,
     /// Cancellation for background tasks.
@@ -66,9 +63,7 @@ impl SignedPacketConn {
         Self {
             inner,
             signing_key: secret,
-            pub_key,
             recv_rx: Mutex::new(recv_rx),
-            recv_tx,
             closed: AtomicBool::new(false),
             cancel,
             _reader_handle: reader_handle,
@@ -286,9 +281,7 @@ mod tests {
         let conn_a = SignedPacketConn {
             inner: Arc::new(PacketConnImpl::new(key_a.clone(), Config::default())),
             signing_key: key_a,
-            pub_key: pub_a,
             recv_rx: Mutex::new(mpsc::channel(1).1),
-            recv_tx: mpsc::channel(1).0,
             closed: AtomicBool::new(false),
             cancel: CancellationToken::new(),
             _reader_handle: tokio::spawn(async {}),

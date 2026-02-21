@@ -176,7 +176,6 @@ impl SessionInit {
 pub(crate) struct SessionInfo {
     // Remote state
     pub seq: u64,
-    pub ed: PublicKey,
     pub remote_key_seq: u64,
     pub current: CurvePublicKey, // remote's current key
     pub next: CurvePublicKey,    // remote's next key
@@ -215,7 +214,6 @@ pub(crate) struct SessionInfo {
 impl SessionInfo {
     /// Create a new session with the given remote keys.
     pub fn new(
-        ed: &PublicKey,
         current: CurvePublicKey,
         next: CurvePublicKey,
         seq: u64,
@@ -231,7 +229,6 @@ impl SessionInfo {
 
         Self {
             seq: seq.wrapping_sub(1), // so first update works
-            ed: *ed,
             remote_key_seq: 0,
             current,
             next,
@@ -502,7 +499,7 @@ impl SessionManager {
         ed: &PublicKey,
         init: &SessionInit,
     ) -> &mut SessionInfo {
-        let mut info = SessionInfo::new(ed, init.current, init.next, init.seq);
+        let mut info = SessionInfo::new(init.current, init.next, init.seq);
 
         // If there's a buffer, migrate its keys
         if let Some(buf) = self.buffers.remove(ed) {
@@ -782,8 +779,8 @@ mod tests {
 
     #[test]
     fn init_encrypt_decrypt() {
-        let (priv_a, pub_a, curve_priv_a) = make_keys();
-        let (priv_b, pub_b, curve_priv_b) = make_keys();
+        let (priv_a, pub_a, _curve_priv_a) = make_keys();
+        let (_priv_b, pub_b, curve_priv_b) = make_keys();
 
         let (current, _) = new_box_keys();
         let (next, _) = new_box_keys();

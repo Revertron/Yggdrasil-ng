@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{ AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -8,13 +8,75 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use url::Url;
 
 use crate::core::Core;
 use crate::version::Metadata;
+
+/// Enum to handle both TCP and TLS streams uniformly.
+enum Stream {
+    Tcp(TcpStream),
+    Tls(tokio_rustls::server::TlsStream<TcpStream>),
+    TlsClient(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+impl Stream {
+    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Stream::Tcp(s) => s.peer_addr(),
+            Stream::Tls(s) => s.get_ref().0.peer_addr(),
+            Stream::TlsClient(s) => s.get_ref().0.peer_addr(),
+        }
+    }
+}
+
+impl AsyncRead for Stream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Stream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            Stream::TlsClient(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Stream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Stream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            Stream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            Stream::TlsClient(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Stream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            Stream::Tls(s) => Pin::new(s).poll_flush(cx),
+            Stream::TlsClient(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Stream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            Stream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            Stream::TlsClient(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 const DEFAULT_BACKOFF_LIMIT: Duration = Duration::from_secs(4096);
 const MINIMUM_BACKOFF_LIMIT: Duration = Duration::from_secs(5);
@@ -143,7 +205,7 @@ impl BanList {
 /// Wrapper that counts bytes read/written from a stream.
 /// Uses local buffering to minimize atomic operations.
 struct CountingStream {
-    inner: TcpStream,
+    inner: Stream,
     rx_counter: Arc<AtomicUsize>,
     tx_counter: Arc<AtomicUsize>,
     rx_buffer: usize,
@@ -153,7 +215,7 @@ struct CountingStream {
 const FLUSH_THRESHOLD: usize = 65536; // Flush to atomic counters every 64KB
 
 impl CountingStream {
-    fn new(stream: TcpStream, rx_counter: Arc<AtomicUsize>, tx_counter: Arc<AtomicUsize>) -> Self {
+    fn new(stream: Stream, rx_counter: Arc<AtomicUsize>, tx_counter: Arc<AtomicUsize>) -> Self {
         Self {
             inner: stream,
             rx_counter,
@@ -183,7 +245,7 @@ impl AsyncRead for CountingStream {
         let before = buf.filled().len();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &result {
-            let bytes_read = (buf.filled().len() - before);
+            let bytes_read = buf.filled().len() - before;
             self.rx_buffer += bytes_read;
             if self.rx_buffer >= FLUSH_THRESHOLD {
                 self.flush_rx();
@@ -241,6 +303,8 @@ pub struct LinkPeerInfo {
     pub rx_rate: usize,
     pub tx_rate: usize,
     pub uptime_secs: f64,
+    pub latency_ms: f64,
+    pub cost: u64,
     pub last_error: Option<String>,
 }
 
@@ -342,6 +406,8 @@ impl ActiveLinks {
                 rx_rate: c.rx_rate.load(Ordering::Relaxed),
                 tx_rate: c.tx_rate.load(Ordering::Relaxed),
                 uptime_secs: c.up.elapsed().as_secs_f64(),
+                latency_ms: 0.0,
+                cost: 0,
                 last_error: None,
             })
             .collect()
@@ -358,8 +424,14 @@ pub struct Links {
     core: Option<Arc<Core>>,
     active: ActiveLinks,
     peers: HashMap<String, PeerEntry>,
+    /// Track resolved IP:port to detect duplicate peers (e.g., same host via IP and domain)
+    peer_addrs: HashMap<String, String>, // "IP:port" -> original URI
     listeners: HashMap<String, (CancellationToken, JoinHandle<()>)>,
     rate_handle: Option<JoinHandle<()>>,
+    /// Notifier to wake all sleeping reconnect loops immediately.
+    retry_notify: Arc<Notify>,
+    /// Global semaphore shared across ALL listeners — enforces total incoming connection limit.
+    connection_limiter: Arc<Semaphore>,
 }
 
 impl Links {
@@ -368,9 +440,17 @@ impl Links {
             core: None,
             active,
             peers: HashMap::new(),
+            peer_addrs: HashMap::new(),
             listeners: HashMap::new(),
             rate_handle: None,
+            retry_notify: Arc::new(Notify::new()),
+            connection_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING)),
         }
+    }
+
+    /// Wake all sleeping peer reconnect loops so they retry immediately.
+    pub fn retry_peers_now(&self) {
+        self.retry_notify.notify_waiters();
     }
 
     /// Set the core reference. Must be called before listen/add_peer.
@@ -399,12 +479,15 @@ impl Links {
         self.core.clone().ok_or_else(|| "core not initialized".to_string())
     }
 
-    /// Start listening on an address (e.g. "tcp://0.0.0.0:9001").
+    /// Start listening on an address (e.g. "tcp://0.0.0.0:1234" or "tls://0.0.0.0:2345").
     pub async fn listen(&mut self, addr: &str) -> Result<(), String> {
         let url = Url::parse(addr).map_err(|e| format!("invalid URL: {}", e))?;
-        if url.scheme() != "tcp" {
-            return Err(format!("unsupported scheme: {}", url.scheme()));
-        }
+        let scheme = url.scheme();
+        let use_tls = match scheme {
+            "tcp" => false,
+            "tls" => true,
+            _ => return Err(format!("unsupported scheme: {}", scheme)),
+        };
 
         let host_port = url
             .socket_addrs(|| Some(0))
@@ -427,10 +510,17 @@ impl Links {
         let actual_addr = listener
             .local_addr()
             .map_err(|e| format!("local_addr failed: {}", e))?;
-        tracing::info!("Listening on tcp://{}", actual_addr);
+        tracing::info!("Listening on {}://{}", scheme, actual_addr);
 
-        // Semaphore to limit concurrent incoming connections
-        let connection_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING));
+        let tls_acceptor = if use_tls {
+            let server_config = core.tls_server_config.read().await.clone();
+            Some(TlsAcceptor::from(server_config))
+        } else {
+            None
+        };
+
+        // Shared semaphore — global limit across all listeners
+        let connection_limiter = self.connection_limiter.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -439,6 +529,7 @@ impl Links {
                     result = listener.accept() => {
                         match result {
                             Ok((stream, remote)) => {
+                                apply_tcp_socket_options(&stream);
                                 // Try to acquire permit for new connection
                                 let permit = match connection_limiter.clone().try_acquire_owned() {
                                     Ok(permit) => permit,
@@ -459,14 +550,34 @@ impl Links {
                                 let core = core.clone();
                                 let opts = options.clone();
                                 let active = active.clone();
-                                let remote_str = format!("tcp://{}", remote);
+                                let acceptor = tls_acceptor.clone();
+                                let remote_str = if acceptor.is_some() {
+                                    format!("tls://{}", remote)
+                                } else {
+                                    format!("tcp://{}", remote)
+                                };
 
                                 tokio::spawn(async move {
                                     // Permit is held for the duration of this task
+
+                                    // Perform TLS handshake if needed
+                                    let wrapped_stream = if let Some(acceptor) = acceptor {
+                                        match acceptor.accept(stream).await {
+                                            Ok(tls_stream) => Stream::Tls(tls_stream),
+                                            Err(e) => {
+                                                tracing::debug!("TLS handshake failed from {}: {}", remote, e);
+                                                drop(permit);
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        Stream::Tcp(stream)
+                                    };
+
                                     let _ = handle_connection(
                                         LinkType::Incoming,
                                         opts,
-                                        stream,
+                                        wrapped_stream,
                                         &core,
                                         &active,
                                         &remote_str,
@@ -496,20 +607,49 @@ impl Links {
         }
 
         let url = Url::parse(uri).map_err(|e| format!("invalid URI: {}", e))?;
-        if url.scheme() != "tcp" {
-            return Err(format!("unsupported scheme: {}", url.scheme()));
+        let scheme = url.scheme();
+        if scheme != "tcp" && scheme != "tls" {
+            return Err(format!("unsupported scheme: {}", scheme));
         }
+
+        let host = url.host_str().ok_or("missing host")?.to_string();
+        let port = url.port().ok_or("missing port")?;
+        let target = format!("{}:{}", host, port);
+
+        // Resolve DNS to detect duplicates (e.g., same peer via IP and domain)
+        let mut resolved_addrs: Vec<_> = tokio::net::lookup_host(&target)
+            .await
+            .map_err(|e| format!("DNS lookup failed for {}: {}", target, e))?
+            .collect();
+        resolved_addrs.sort();
+
+        // Check if any resolved IP:port is already connected
+        for addr in &resolved_addrs {
+            let addr_key = addr.to_string();
+            if let Some(existing_uri) = self.peer_addrs.get(&addr_key) {
+                return Err(format!("peer {} already connected as {} (resolves to same address {})", uri, existing_uri, addr_key));
+            }
+        }
+
+        // Get the primary address for tracking
+        let primary_addr = resolved_addrs.first().ok_or("failed to resolve address")?;
+        let addr_key = primary_addr.to_string();
 
         let options = parse_link_options(&url)?;
         let core = self.core()?;
         let active = self.active.clone();
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
-
-        let host = url.host_str().ok_or("missing host")?.to_string();
-        let port = url.port().ok_or("missing port")?;
-        let target = format!("{}:{}", host, port);
         let uri_str = uri.to_string();
+        let retry_notify = self.retry_notify.clone();
+
+        let use_tls = scheme == "tls";
+        let tls_connector = if use_tls {
+            let client_config = core.tls_client_config.read().await.clone();
+            Some(TlsConnector::from(client_config))
+        } else {
+            None
+        };
 
         let handle = tokio::spawn(async move {
             let mut backoff: u32 = 0;
@@ -526,17 +666,41 @@ impl Links {
 
                 match result {
                     Ok(Ok(stream)) => {
-                        stream.set_nodelay(true).ok();
-                        match handle_connection(
-                            LinkType::Persistent,
-                            options.clone(),
-                            stream,
-                            &core,
-                            &active,
-                            &uri_str,
-                        )
-                        .await
-                        {
+                        apply_tcp_socket_options(&stream);
+
+                        // Perform TLS handshake if needed
+                        let wrapped_stream = if let Some(ref connector) = tls_connector {
+                            // Use the hostname from the URI for SNI
+                            let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+                                .unwrap_or_else(|_| {
+                                    // Fallback to using IP address as server name if hostname parsing fails
+                                    rustls::pki_types::ServerName::IpAddress(
+                                        rustls::pki_types::IpAddr::try_from(host.as_str())
+                                            .expect("invalid hostname")
+                                    )
+                                });
+
+                            match connector.connect(server_name, stream).await {
+                                Ok(tls_stream) => Stream::TlsClient(tls_stream),
+                                Err(e) => {
+                                    tracing::debug!("TLS handshake failed to {}: {}", target, e);
+                                    // Continue to backoff logic below
+                                    backoff = (backoff + 1).min(32);
+                                    let wait = Duration::from_secs(1u64 << backoff.min(31))
+                                        .min(options.max_backoff);
+                                    tokio::select! {
+                                        _ = cancel_clone.cancelled() => break,
+                                        _ = tokio::time::sleep(wait) => {}
+                                        _ = retry_notify.notified() => {}
+                                    }
+                                    continue;
+                                }
+                            }
+                        } else {
+                            Stream::Tcp(stream)
+                        };
+
+                        match handle_connection(LinkType::Persistent, options.clone(), wrapped_stream, &core, &active, &uri_str).await {
                             Ok(()) => {
                                 // Clean disconnection - reset backoff
                                 backoff = 0;
@@ -564,11 +728,13 @@ impl Links {
                 tokio::select! {
                     _ = cancel_clone.cancelled() => break,
                     _ = tokio::time::sleep(wait) => {}
+                    _ = retry_notify.notified() => {}
                 }
             }
         });
 
         self.peers.insert(uri.to_string(), PeerEntry { cancel, handle });
+        self.peer_addrs.insert(addr_key, uri.to_string());
         Ok(())
     }
 
@@ -577,6 +743,10 @@ impl Links {
         if let Some(entry) = self.peers.remove(uri) {
             entry.cancel.cancel();
             entry.handle.abort();
+
+            // Also remove from peer_addrs map
+            self.peer_addrs.retain(|_, v| v != uri);
+
             Ok(())
         } else {
             Err("peer not found".to_string())
@@ -596,14 +766,15 @@ impl Links {
             entry.cancel.cancel();
             entry.handle.abort();
         }
+        self.peer_addrs.clear();
     }
 }
 
-/// Perform the Yggdrasil handshake over a TCP connection, then hand off to ironwood.
+/// Perform the Yggdrasil handshake over a stream (TCP or TLS), then hand off to ironwood.
 async fn handle_connection(
     link_type: LinkType,
     options: LinkOptions,
-    mut stream: TcpStream,
+    mut stream: Stream,
     core: &Arc<Core>,
     active: &ActiveLinks,
     uri: &str,
@@ -790,6 +961,22 @@ async fn handle_connection(
     }
 
     result
+}
+
+/// Apply TCP socket options that keep connections alive through NAT devices.
+///
+/// Sets SO_KEEPALIVE with a 30-second idle time so NAT entries (typically
+/// killed after 3–5 minutes of silence) are refreshed well before expiry.
+fn apply_tcp_socket_options(stream: &TcpStream) {
+    stream.set_nodelay(true).ok();
+
+    let sock = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(5));
+    if let Err(e) = sock.set_tcp_keepalive(&ka) {
+        tracing::debug!("Failed to set TCP keepalive: {}", e);
+    }
 }
 
 /// Parse link options from a URL's query parameters.

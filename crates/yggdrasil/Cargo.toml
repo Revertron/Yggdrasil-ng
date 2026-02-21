@@ -29,10 +29,17 @@ blake2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
 time = { version = "0.3.47", features = ["macros"] }
-tun-rs = { version = "2", features = ["async_tokio"] }
 getopts = "0.2"
 toml = "0.8"
 hex = "0.4"
 url = "2"
+socket2 = { version = "0.5", features = ["all"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 comfy-table = "7"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
+rcgen = "0.14.7"
+
+# tun-rs is not available on Android; TUN is handled at the OS/framework level there.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tun-rs = { version = "2", features = ["async_tokio"] }

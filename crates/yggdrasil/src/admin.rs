@@ -158,23 +158,22 @@ async fn handle_admin_conn(stream: tokio::net::TcpStream, core: Arc<Core>) {
     }
 }
 
-async fn handle_request(
-    req: &AdminRequest,
-    core: &Arc<Core>,
-) -> Result<serde_json::Value, String> {
+async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_json::Value, String> {
     match req.request.to_lowercase().as_str() {
         "list" => Ok(serde_json::json!({
-            "list": ["list", "getself", "getpeers", "gettree", "addpeer", "removepeer"],
+            "list": ["list", "getself", "getpeers", "gettree", "getpaths", "getsessions", "gettun", "addpeer", "removepeer", "getdebug", "getlookup", "forcelookup", "getnodeinfo", "debug_remotegetself", "debug_remotegetpeers", "debug_remotegettree"],
         })),
 
         "getself" => {
             let routing_entries = core.routing_entries().await;
+            let coordinates = core.tree_coordinates().await;
             Ok(serde_json::json!({
                 "build_name": env!("CARGO_PKG_NAME"),
                 "build_version": env!("CARGO_PKG_VERSION"),
                 "key": hex::encode(core.public_key()),
                 "address": core.address().to_string(),
                 "subnet": core.subnet().to_string(),
+                "coordinates": coordinates,
                 "routing_entries": routing_entries,
             }))
         }
@@ -194,6 +193,8 @@ async fn handle_request(
                         "address": address.to_string(),
                         "subnet": subnet.to_string(),
                         "priority": p.priority,
+                        "cost": p.cost,
+                        "latency": p.latency_ms,
                         "bytes_recvd": p.rx_bytes,
                         "bytes_sent": p.tx_bytes,
                         "rx_rate": p.rx_rate,
@@ -247,6 +248,281 @@ async fn handle_request(
             Ok(serde_json::json!({}))
         }
 
+        "getpaths" => {
+            let paths = core.get_paths().await;
+            let paths_json: Vec<serde_json::Value> = paths
+                .iter()
+                .map(|p| {
+                    let address = addr_for_key(&p.key);
+                    serde_json::json!({
+                        "key": hex::encode(p.key),
+                        "address": address.to_string(),
+                        "path": p.path,
+                        "sequence": p.sequence,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "paths": paths_json }))
+        }
+
+        "getsessions" => {
+            let sessions = core.get_sessions().await;
+            let sessions_json: Vec<serde_json::Value> = sessions
+                .iter()
+                .map(|s| {
+                    let address = addr_for_key(&s.key);
+                    serde_json::json!({
+                        "key": hex::encode(s.key),
+                        "address": address.to_string(),
+                        "bytes_sent": s.bytes_sent,
+                        "bytes_recvd": s.bytes_recvd,
+                        "uptime": s.uptime_seconds,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "sessions": sessions_json }))
+        }
+
+        "gettun" => {
+            let (enabled, name, mtu) = core.get_tun_status();
+            Ok(serde_json::json!({
+                "enabled": enabled,
+                "name": name,
+                "mtu": mtu,
+            }))
+        }
+
+        "getdebug" => {
+            let snap = core.get_debug_snapshot().await;
+            let sessions = core.get_sessions().await;
+            let peers = core.get_peers().await;
+
+            let peer_latencies: Vec<serde_json::Value> = snap.peer_latencies_ms
+                .iter()
+                .map(|(key, ms)| {
+                    let address = addr_for_key(key);
+                    serde_json::json!({
+                        "key": hex::encode(key),
+                        "address": address.to_string(),
+                        "latency_ms": ms,
+                    })
+                })
+                .collect();
+
+            let peers_down: Vec<serde_json::Value> = peers
+                .iter()
+                .filter(|p| !p.up)
+                .map(|p| serde_json::json!({
+                    "uri": p.uri,
+                    "last_error": p.last_error,
+                }))
+                .collect();
+
+            let sessions_json: Vec<serde_json::Value> = sessions
+                .iter()
+                .map(|s| {
+                    let address = addr_for_key(&s.key);
+                    serde_json::json!({
+                        "key": hex::encode(s.key),
+                        "address": address.to_string(),
+                        "uptime": s.uptime_seconds,
+                        "bytes_sent": s.bytes_sent,
+                        "bytes_recvd": s.bytes_recvd,
+                    })
+                })
+                .collect();
+
+            let pending_lookups: Vec<serde_json::Value> = snap.pending_lookups
+                .iter()
+                .map(|p| {
+                    let dest_info = p.dest_key.map(|k| {
+                        let address = addr_for_key(&k);
+                        serde_json::json!({
+                            "key": hex::encode(k),
+                            "address": address.to_string(),
+                        })
+                    });
+                    serde_json::json!({
+                        "dest": dest_info,
+                        "xformed_key": hex::encode(p.xformed_key),
+                        "age_secs": p.age_secs,
+                        "sent": p.sent,
+                        "multicast_count": p.multicast_count,
+                    })
+                })
+                .collect();
+
+            Ok(serde_json::json!({
+                "tree_node_count": snap.tree_node_count,
+                "routing_peer_count": snap.routing_peer_count,
+                "tree_root": hex::encode(snap.tree_root),
+                "our_coords": snap.our_coords,
+                "path_cache_count": snap.path_cache_count,
+                "broken_path_count": snap.broken_path_count,
+                "pending_lookups": pending_lookups,
+                "unresponded_peers": snap.unresponded_peers,
+                "delivery_queue_bytes": snap.delivery_queue_bytes,
+                "peer_latencies": peer_latencies,
+                "peers_down": peers_down,
+                "sessions": sessions_json,
+            }))
+        }
+
+        "getlookup" => {
+            let key_str = req
+                .arguments
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'key' argument")?;
+            let key_bytes = hex::decode(key_str)
+                .map_err(|_| "invalid hex key")?;
+            if key_bytes.len() != 32 {
+                return Err("key must be 32 bytes".to_string());
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&key_bytes);
+
+            let address = addr_for_key(&key);
+            let (xformed_key, multicast_count) = core.count_lookup_targets(key).await;
+
+            Ok(serde_json::json!({
+                "key": hex::encode(key),
+                "address": address.to_string(),
+                "xformed_key": hex::encode(xformed_key),
+                "multicast_count": multicast_count,
+            }))
+        }
+
+        "forcelookup" => {
+            let key_str = req
+                .arguments
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'key' argument")?;
+            let key_bytes = hex::decode(key_str)
+                .map_err(|_| "invalid hex key")?;
+            if key_bytes.len() != 32 {
+                return Err("key must be 32 bytes".to_string());
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&key_bytes);
+
+            let address = addr_for_key(&key);
+            let (xformed_key, bloom_targets) = core.count_lookup_targets(key).await;
+            let sent_to = core.force_lookup(key).await;
+
+            Ok(serde_json::json!({
+                "key": hex::encode(key),
+                "address": address.to_string(),
+                "xformed_key": hex::encode(xformed_key),
+                "bloom_targets": bloom_targets,
+                "sent_to": sent_to,
+            }))
+        }
+
+        "getnodeinfo" => {
+            let key_str = req
+                .arguments
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'key' argument")?;
+            let key_bytes = hex::decode(key_str)
+                .map_err(|_| "invalid hex key")?;
+            if key_bytes.len() != 32 {
+                return Err("key must be 32 bytes".to_string());
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&key_bytes);
+
+            let response = core.proto_handler().send_nodeinfo_request(key).await
+                .map_err(|e| format!("getNodeInfo failed: {}", e))?;
+
+            Ok(serde_json::json!({
+                hex::encode(key): response
+            }))
+        }
+
+        "debug_remotegetself" => {
+            let key_str = req
+                .arguments
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'key' argument")?;
+            let key_bytes = hex::decode(key_str)
+                .map_err(|_| "invalid hex key")?;
+            if key_bytes.len() != 32 {
+                return Err("key must be 32 bytes".to_string());
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&key_bytes);
+
+            let response = core.proto_handler().send_get_self_request(key).await
+                .map_err(|e| format!("debug_remoteGetSelf failed: {}", e))?;
+
+            let address = addr_for_key(&key);
+            Ok(serde_json::json!({
+                address.to_string(): response
+            }))
+        }
+
+        "debug_remotegetpeers" => {
+            let key_str = req
+                .arguments
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'key' argument")?;
+            let key_bytes = hex::decode(key_str)
+                .map_err(|_| "invalid hex key")?;
+            if key_bytes.len() != 32 {
+                return Err("key must be 32 bytes".to_string());
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&key_bytes);
+
+            let peer_keys = core.proto_handler().send_get_peers_request(key).await
+                .map_err(|e| format!("debug_remoteGetPeers failed: {}", e))?;
+
+            let keys_json: Vec<String> = peer_keys.iter()
+                .map(|k| hex::encode(k))
+                .collect();
+
+            let address = addr_for_key(&key);
+            Ok(serde_json::json!({
+                address.to_string(): {
+                    "keys": keys_json
+                }
+            }))
+        }
+
+        "debug_remotegettree" => {
+            let key_str = req
+                .arguments
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'key' argument")?;
+            let key_bytes = hex::decode(key_str)
+                .map_err(|_| "invalid hex key")?;
+            if key_bytes.len() != 32 {
+                return Err("key must be 32 bytes".to_string());
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&key_bytes);
+
+            let tree_keys = core.proto_handler().send_get_tree_request(key).await
+                .map_err(|e| format!("debug_remoteGetTree failed: {}", e))?;
+
+            let keys_json: Vec<String> = tree_keys.iter()
+                .map(|k| hex::encode(k))
+                .collect();
+
+            let address = addr_for_key(&key);
+            Ok(serde_json::json!({
+                address.to_string(): {
+                    "keys": keys_json
+                }
+            }))
+        }
+
         other => Err(format!(
             "unknown action '{}', try 'list' for help",
             other
@@ -254,10 +530,7 @@ async fn handle_request(
     }
 }
 
-async fn write_response(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    resp: &AdminResponse,
-) -> Result<(), std::io::Error> {
+async fn write_response(writer: &mut tokio::net::tcp::OwnedWriteHalf, resp: &AdminResponse) -> Result<(), std::io::Error> {
     let json = serde_json::to_string(resp).unwrap_or_default();
     writer.write_all(json.as_bytes()).await?;
     writer.write_all(b"\n").await?;

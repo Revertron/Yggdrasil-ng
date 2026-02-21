@@ -1,7 +1,5 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
-use crate::types::Addr;
-
 pub(crate) const PUBLIC_KEY_SIZE: usize = 32;
 pub(crate) const SIGNATURE_SIZE: usize = 64;
 
@@ -49,15 +47,6 @@ impl Crypto {
         sig.to_bytes()
     }
 
-    /// Get our public key as an Addr.
-    pub fn addr(&self) -> Addr {
-        Addr(self.public_key)
-    }
-}
-
-/// Compare two public keys (for root election: smallest key wins).
-pub(crate) fn key_less(a: &PublicKey, b: &PublicKey) -> bool {
-    a < b
 }
 
 #[cfg(test)]

@@ -47,6 +47,7 @@ impl TrafficPacket {
     }
 
     /// Copy contents from another traffic packet, reusing existing allocations.
+    #[cfg(test)]
     pub fn copy_from(&mut self, other: &TrafficPacket) {
         self.path.clear();
         self.path.extend_from_slice(&other.path);
@@ -88,8 +89,8 @@ struct PqDest {
 /// Fair packet queue: organizes by destination, then source.
 ///
 /// - `push` adds a packet
-/// - `pop` removes the oldest packet across all flows (min-time at front)
-/// - `drop` removes the oldest packet from the largest flow (back-pressure fairness)
+/// - `pop` removes the oldest packet across all flows (FIFO)
+/// - `drop_largest` removes the oldest packet from the largest flow (back-pressure)
 pub(crate) struct PacketQueue {
     dests: Vec<PqDest>,
     size: u64,
@@ -101,10 +102,6 @@ impl PacketQueue {
             dests: Vec::new(),
             size: 0,
         }
-    }
-
-    pub fn size(&self) -> u64 {
-        self.size
     }
 
     pub fn is_empty(&self) -> bool {
@@ -162,13 +159,13 @@ impl PacketQueue {
         self.size += pkt_size;
     }
 
-    /// Remove and return the oldest packet across all flows.
+    /// Remove and return the oldest packet across all flows (FIFO).
     pub fn pop(&mut self) -> Option<TrafficPacket> {
         if self.is_empty() {
             return None;
         }
 
-        // Find dest with the oldest front packet
+        // Find dest with the oldest front packet.
         let d_idx = self
             .dests
             .iter()
@@ -178,7 +175,7 @@ impl PacketQueue {
 
         let dest = &mut self.dests[d_idx];
 
-        // Find source within that dest with oldest front packet
+        // Find source within that dest with the oldest front packet.
         let s_idx = dest
             .sources
             .iter()
@@ -193,7 +190,7 @@ impl PacketQueue {
         dest.size -= info.size;
         self.size -= info.size;
 
-        // Clean up empty entries
+        // Clean up empty entries.
         if source.infos.is_empty() {
             dest.sources.swap_remove(s_idx);
         }
@@ -247,18 +244,9 @@ impl PacketQueue {
         true
     }
 
-    /// Peek at the oldest packet without removing it.
-    pub fn peek(&self) -> Option<&TrafficPacket> {
-        if self.dests.is_empty() {
-            return None;
-        }
-        // Find the oldest across all dests/sources
-        self.dests
-            .iter()
-            .flat_map(|d| d.sources.iter())
-            .flat_map(|s| s.infos.first())
-            .min_by_key(|info| info.time)
-            .map(|info| &info.packet)
+    /// Get the total queued bytes.
+    pub fn size(&self) -> u64 {
+        self.size
     }
 
     /// Get the age of the oldest packet in the queue.
@@ -321,6 +309,11 @@ impl DeliveryQueue {
 
         queue.push(packet);
         None
+    }
+
+    /// Get the current number of bytes queued (snapshot).
+    pub async fn queue_size(&self) -> u64 {
+        self.queue.lock().await.size()
     }
 
     /// Called by read_from() before waiting on channel. Returns Some(packet)

@@ -11,7 +11,7 @@ use rand::rngs::OsRng;
 use tokio::time::timeout;
 
 use ironwood::{
-    new_encrypted_packet_conn, new_packet_conn, new_signed_packet_conn, Addr, Config, PacketConn,
+    new_encrypted_packet_conn, new_packet_conn, new_signed_packet_conn, Config, PacketConn,
 };
 
 /// Connect two PacketConn nodes via a duplex stream.
@@ -36,28 +36,6 @@ async fn connect_nodes(
     });
 
     (ha, hb)
-}
-
-/// Read the next non-empty packet from a PacketConn, with timeout.
-/// Skips empty packets that result from path lookups.
-async fn read_nonempty(
-    conn: &(dyn PacketConn + Send + Sync),
-    buf: &mut [u8],
-    deadline: Duration,
-) -> ironwood::Result<(usize, Addr)> {
-    let start = tokio::time::Instant::now();
-    loop {
-        let remaining = deadline.checked_sub(start.elapsed()).unwrap_or(Duration::ZERO);
-        if remaining.is_zero() {
-            return Err(ironwood::Error::Timeout);
-        }
-        match timeout(remaining, conn.read_from(buf)).await {
-            Ok(Ok((0, _))) => continue, // skip empty lookup packets
-            Ok(Ok((n, addr))) => return Ok((n, addr)),
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(ironwood::Error::Timeout),
-        }
-    }
 }
 
 /// Diagnostic test: just check basic connectivity and message exchange.

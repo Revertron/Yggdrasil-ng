@@ -14,6 +14,7 @@ use crate::crypto::PublicKey;
 pub const BLOOM_FILTER_BITS: usize = 8192;
 pub const BLOOM_FILTER_K: usize = 8;
 pub const BLOOM_FILTER_U64S: usize = BLOOM_FILTER_BITS / 64; // 128
+#[cfg(test)]
 pub const BLOOM_FILTER_FLAGS: usize = BLOOM_FILTER_U64S / 8; // 16
 
 /// A Bloom filter with fixed 8192 bits and 8 hash functions.
@@ -81,11 +82,6 @@ impl BloomFilter {
     /// Count the number of set bits (for diagnostics).
     pub fn count_ones(&self) -> u32 {
         self.bits.iter().map(|w| w.count_ones()).sum()
-    }
-
-    /// Clear all bits from the filter.
-    pub fn clear(&mut self) {
-        self.bits = [0u64; BLOOM_FILTER_U64S];
     }
 
     fn set_bit(&mut self, bit: usize) {
@@ -299,7 +295,7 @@ impl Blooms {
         tracing::debug!(
             "blooms_maintenance: {} on-tree peers, self_parent={:?}",
             on_tree_keys.len(),
-            hex::encode(&self_parent[..4]),
+            hex::encode(&self_parent[..8]),
         );
 
         for k in on_tree_keys {
@@ -312,7 +308,7 @@ impl Blooms {
             if is_new || pbi.seq >= 3600 {
                 tracing::debug!(
                     "blooms_maintenance: sending bloom to {:?} (is_new={}, seq={}, non_zero_bits={})",
-                    hex::encode(&k[..4]),
+                    hex::encode(&k[..8]),
                     is_new,
                     pbi.seq,
                     bloom.count_ones(),
@@ -348,6 +344,16 @@ impl Blooms {
             targets.push(*k);
         }
         targets
+    }
+
+    /// Count how many on-tree peers' bloom filters match the given already-transformed key.
+    /// Used for diagnostics: distinguishes "0 targets (no peer covers this key)"
+    /// from "targets found but no PathNotify received".
+    pub fn count_on_tree_targets_for_xkey(&self, xformed_key: &PublicKey) -> usize {
+        self.blooms
+            .values()
+            .filter(|pbi| pbi.on_tree && pbi.recv.test(xformed_key))
+            .count()
     }
 }
 
@@ -401,6 +407,7 @@ fn location(h: &[u64; 4], i: usize, m: usize) -> usize {
 /// - [remaining u64s in big-endian]
 ///
 /// This is compatible with the Go library's wire format.
+#[cfg(test)]
 pub fn encode_bloom(data: &[u64; BLOOM_FILTER_U64S]) -> Vec<u8> {
     let mut flags0 = [0u8; BLOOM_FILTER_FLAGS];
     let mut flags1 = [0u8; BLOOM_FILTER_FLAGS];
@@ -428,6 +435,7 @@ pub fn encode_bloom(data: &[u64; BLOOM_FILTER_U64S]) -> Vec<u8> {
 /// Decode a bloom filter from wire format.
 ///
 /// Returns the decoded u64 array or an error if the format is invalid.
+#[cfg(test)]
 pub fn decode_bloom(data: &[u8]) -> Result<[u64; BLOOM_FILTER_U64S], BloomError> {
     if data.len() < BLOOM_FILTER_FLAGS * 2 {
         return Err(BloomError::Decode("Input too short"));
@@ -470,11 +478,13 @@ pub fn decode_bloom(data: &[u8]) -> Result<[u64; BLOOM_FILTER_U64S], BloomError>
 }
 
 /// Error type for bloom filter operations.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BloomError {
     Decode(&'static str),
 }
 
+#[cfg(test)]
 impl std::fmt::Display for BloomError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -483,6 +493,7 @@ impl std::fmt::Display for BloomError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for BloomError {}
 
 #[cfg(test)]

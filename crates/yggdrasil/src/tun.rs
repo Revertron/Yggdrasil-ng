@@ -1,3 +1,7 @@
+// TUN is not supported on Android (handled at the OS/framework level).
+// This module only compiles for non-Android targets.
+#![cfg(not(target_os = "android"))]
+
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 
@@ -100,12 +104,9 @@ impl TunAdapter {
 }
 
 /// Read packets from the TUN device and send them to the network via RWC.
-async fn tun_read_loop(
-    device: Arc<AsyncDevice>,
-    rwc: Arc<ReadWriteCloser>,
-) {
+async fn tun_read_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
+    let mut buf = vec![0u8; 65535];
     loop {
-        let mut buf = vec![0u8; 65535];
         match device.recv(&mut buf).await {
             Ok(n) if n > 0 => {
                 if let Err(e) = rwc.write(&buf[..n]).await {

@@ -24,7 +24,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if matches.opt_present("help") {
         println!("{}", opts.usage("Usage: yggdrasilctl [options] <command> [key=value ...]"));
-        println!("Commands: list, getSelf, getPeers, getTree, addPeer, removePeer");
+        println!("Commands:");
+        println!("  Local queries:");
+        println!("    list, getSelf, getPeers, getTree, getPaths, getSessions, getTUN");
+        println!("  Debug:");
+        println!("    getDebug  (routing stats: tree size, broken paths, queue depth, etc.)");
+        println!("  Peer management:");
+        println!("    addPeer, removePeer");
+        println!("  Remote queries:");
+        println!("    getNodeInfo key=<hex>, debug_remoteGetSelf key=<hex>");
+        println!("    debug_remoteGetPeers key=<hex>, debug_remoteGetTree key=<hex>");
         return Ok(());
     }
 
@@ -41,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(c) => c.clone(),
         None => {
             eprintln!("Usage: yggdrasilctl [options] <command> [key=value ...]");
-            eprintln!("Commands: list, getSelf, getPeers, getTree, addPeer, removePeer");
+            eprintln!("Use -h for full command list");
             std::process::exit(1);
         }
     };
@@ -133,6 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ("Public key", "key"),
                 ("IPv6 address", "address"),
                 ("IPv6 subnet", "subnet"),
+                ("Coordinates", "coordinates"),
                 ("Routing entries", "routing_entries"),
             ]);
         }
@@ -145,8 +155,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut table = Table::new();
                     table.load_preset(presets::NOTHING);
                     table.set_header(vec![
-                        "URI", "State", "Dir", "IP Address", "Uptime", "RX", "TX",
-                        "RX Rate", "TX Rate", "Pr", "Last Error"
+                        "URI", "State", "Dir", "IP Address", "Latency", "Cost",
+                        "Uptime", "RX", "TX", "RX Rate", "TX Rate", "Pr", "Last Error"
                     ]);
 
                     for peer in peers {
@@ -164,6 +174,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let address = peer.get("address")
                             .and_then(|v| v.as_str())
                             .unwrap_or("-");
+                        let latency = peer.get("latency")
+                            .and_then(|v| v.as_f64())
+                            .map(|ms| if ms > 0.0 { format!("{:.1}ms", ms) } else { "-".to_string() })
+                            .unwrap_or_else(|| "-".to_string());
+                        let cost = peer.get("cost")
+                            .and_then(|v| v.as_u64())
+                            .map(|c| if c > 0 { c.to_string() } else { "-".to_string() })
+                            .unwrap_or_else(|| "-".to_string());
                         let uptime = peer.get("uptime")
                             .and_then(|v| v.as_f64())
                             .map(format_uptime)
@@ -194,7 +212,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .unwrap_or("-");
 
                         table.add_row(vec![
-                            uri, state, dir, address, &uptime, &rx_bytes, &tx_bytes,
+                            uri, state, dir, address, &latency, &cost,
+                            &uptime, &rx_bytes, &tx_bytes,
                             &rx_rate, &tx_rate, &priority, last_error
                         ]);
                     }
@@ -232,6 +251,156 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     println!("{}", table);
+                }
+            }
+        }
+
+        "getpaths" => {
+            if let Some(paths) = response.get("paths").and_then(|v| v.as_array()) {
+                if paths.is_empty() {
+                    println!("No cached paths.");
+                } else {
+                    let mut table = Table::new();
+                    table.load_preset(presets::NOTHING);
+                    table.set_header(vec!["Public Key", "IP Address", "Path", "Sequence"]);
+
+                    for entry in paths {
+                        let key = entry.get("key")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let address = entry.get("address")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let path = entry.get("path")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_u64())
+                                    .map(|n| n.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
+                            .unwrap_or_else(|| "-".to_string());
+                        let sequence = entry.get("sequence")
+                            .and_then(|v| v.as_u64())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "-".to_string());
+
+                        table.add_row(vec![key, address, &path, &sequence]);
+                    }
+
+                    println!("{}", table);
+                }
+            }
+        }
+
+        "getsessions" => {
+            if let Some(sessions) = response.get("sessions").and_then(|v| v.as_array()) {
+                if sessions.is_empty() {
+                    println!("No active sessions.");
+                } else {
+                    let mut table = Table::new();
+                    table.load_preset(presets::NOTHING);
+                    table.set_header(vec!["Public Key", "IP Address", "Uptime", "RX", "TX"]);
+
+                    for entry in sessions {
+                        let key = entry.get("key")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let address = entry.get("address")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let uptime = entry.get("uptime")
+                            .and_then(|v| v.as_f64())
+                            .map(format_uptime)
+                            .unwrap_or_else(|| "-".to_string());
+                        let rx_bytes = entry.get("bytes_recvd")
+                            .and_then(|v| v.as_u64())
+                            .map(format_bytes)
+                            .unwrap_or_else(|| "-".to_string());
+                        let tx_bytes = entry.get("bytes_sent")
+                            .and_then(|v| v.as_u64())
+                            .map(format_bytes)
+                            .unwrap_or_else(|| "-".to_string());
+
+                        table.add_row(vec![key, address, &uptime, &rx_bytes, &tx_bytes]);
+                    }
+
+                    println!("{}", table);
+                }
+            }
+        }
+
+        "gettun" => {
+            print_kv(response, &[
+                ("TUN enabled", "enabled"),
+                ("Interface name", "name"),
+                ("Interface MTU", "mtu"),
+            ]);
+        }
+
+        "getdebug" => {
+            // Routing internals summary
+            print_kv(response, &[
+                ("Tree nodes known",      "tree_node_count"),
+                ("Routing peers",         "routing_peer_count"),
+                ("Tree root key",         "tree_root"),
+                ("Our coordinates",       "our_coords"),
+                ("Path cache total",      "path_cache_count"),
+                ("Broken paths",          "broken_path_count"),
+                ("Pending lookups",       "pending_lookup_count"),
+                ("Pending sig requests",  "pending_sig_requests"),
+                ("RX queue bytes",        "delivery_queue_bytes"),
+            ]);
+
+            // Down peers
+            if let Some(down) = response.get("peers_down").and_then(|v| v.as_array()) {
+                if !down.is_empty() {
+                    println!("\n  Down peers:");
+                    for p in down {
+                        let uri = p.get("uri").and_then(|v| v.as_str()).unwrap_or("-");
+                        let err = p.get("last_error").and_then(|v| v.as_str()).unwrap_or("");
+                        println!("    {} ({})", uri, err);
+                    }
+                }
+            }
+
+            // Peer latencies
+            if let Some(lats) = response.get("peer_latencies").and_then(|v| v.as_array()) {
+                if !lats.is_empty() {
+                    println!("\n  Peer latencies:");
+                    let mut table = Table::new();
+                    table.load_preset(presets::NOTHING);
+                    table.set_header(vec!["Key", "IP Address", "Latency"]);
+                    for p in lats {
+                        let key = p.get("key").and_then(|v| v.as_str()).unwrap_or("-");
+                        let addr = p.get("address").and_then(|v| v.as_str()).unwrap_or("-");
+                        let ms = p.get("latency_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let lat_str = if ms > 0.0 { format!("{:.1} ms", ms) } else { "n/a".to_string() };
+                        table.add_row(vec![key, addr, &lat_str]);
+                    }
+                    println!("{}", table);
+                }
+            }
+
+            // Sessions
+            if let Some(sessions) = response.get("sessions").and_then(|v| v.as_array()) {
+                if !sessions.is_empty() {
+                    println!("\n  Active sessions:");
+                    let mut table = Table::new();
+                    table.load_preset(presets::NOTHING);
+                    table.set_header(vec!["Key", "IP Address", "Uptime", "RX", "TX"]);
+                    for s in sessions {
+                        let key = s.get("key").and_then(|v| v.as_str()).unwrap_or("-");
+                        let addr = s.get("address").and_then(|v| v.as_str()).unwrap_or("-");
+                        let uptime = s.get("uptime").and_then(|v| v.as_f64()).map(format_uptime).unwrap_or_else(|| "-".to_string());
+                        let rx = s.get("bytes_recvd").and_then(|v| v.as_u64()).map(format_bytes).unwrap_or_else(|| "-".to_string());
+                        let tx = s.get("bytes_sent").and_then(|v| v.as_u64()).map(format_bytes).unwrap_or_else(|| "-".to_string());
+                        table.add_row(vec![key, addr, &uptime, &rx, &tx]);
+                    }
+                    println!("{}", table);
+                } else {
+                    println!("\n  No active sessions.");
                 }
             }
         }

@@ -1,0 +1,47 @@
+[package]
+name = "ygg_stream"
+version = "0.1.0"
+edition = "2021"
+authors = ["Yggdrasil-ng contributors"]
+description = "Stream multiplexing library for Yggdrasil mesh network"
+license = "LGPL-3.0"
+
+[dependencies]
+ironwood = { path = "../ironwood" }
+yggdrasil = { path = "../yggdrasil" }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt", "codec"] }
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+serde_json = "1"
+hex = "0.4"
+rand = "0.8"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+uniffi = { version = "0.28", features = ["cli"] }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-test = "0.4"
+
+[lib]
+name = "ygg_stream"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+test = false
+
+[[example]]
+name = "echo"
+path = "examples/echo.rs"
+
+[[example]]
+name = "client"
+path = "examples/client.rs"
+
+[[example]]
+name = "full_node"
+path = "examples/full_node.rs"

@@ -235,6 +235,8 @@ pub(crate) struct Router {
 
     // Latency tracking
     pub lags: HashMap<PeerId, Duration>,
+    /// When we last sent a SigReq to each peer (for accurate RTT measurement).
+    pub sig_req_times: HashMap<PeerId, Instant>,
 
     // Signature protocol
     pub requests: HashMap<PublicKey, SigReqState>,
@@ -248,6 +250,7 @@ pub(crate) struct Router {
     pub do_root1: bool,
     pub do_root2: bool,
     pub last_refresh: Instant,
+    pub last_status_log: Instant,
 
     // Config
     pub router_refresh: Duration,
@@ -255,7 +258,6 @@ pub(crate) struct Router {
     pub path_timeout: Duration,
     pub path_throttle: Duration,
     pub bloom_transform: Option<std::sync::Arc<dyn Fn(PublicKey) -> PublicKey + Send + Sync>>,
-    pub path_notify_cb: Option<std::sync::Arc<dyn Fn(PublicKey) + Send + Sync>>,
 }
 
 impl Router {
@@ -273,6 +275,7 @@ impl Router {
             ancs: HashMap::new(),
             cache: HashMap::new(),
             lags: HashMap::new(),
+            sig_req_times: HashMap::new(),
             requests: HashMap::new(),
             responses: HashMap::new(),
             responded: HashSet::new(),
@@ -282,12 +285,12 @@ impl Router {
             do_root1: false,
             do_root2: true,
             last_refresh: Instant::now(),
+            last_status_log: Instant::now(),
             router_refresh: config.router_refresh,
             router_timeout: config.router_timeout,
             path_timeout: config.path_timeout,
             path_throttle: config.path_throttle,
             bloom_transform: config.bloom_transform.clone(),
-            path_notify_cb: config.path_notify.clone(),
         }
     }
 
@@ -300,10 +303,28 @@ impl Router {
     pub fn do_maintenance(&mut self) -> Vec<RouterAction> {
         let mut actions = Vec::new();
 
+        // Periodic status log (every 60 seconds)
+        if self.last_status_log.elapsed() >= Duration::from_secs(60) {
+            self.last_status_log = Instant::now();
+            let self_key = self.crypto.public_key;
+            let (root, coords) = self.get_root_and_path(&self_key);
+            let n_broken = self.pathfinder.paths.values().filter(|p| p.broken).count();
+            let total_peers: usize = self.peers.values().map(|m| m.len()).sum();
+            let unresponded = total_peers.saturating_sub(self.responded.len());
+            tracing::debug!(
+                "STATUS: root={} coords={:?} peers={} tree_nodes={} paths={}/{} broken rumors={} unresponded={}",
+                hex::encode(&root[..8]), coords,
+                self.peers.len(), self.infos.len(),
+                self.pathfinder.paths.len(), n_broken,
+                self.pathfinder.rumors.len(), unresponded
+            );
+        }
+
         // Check if it's time to refresh (send periodic SigReq to all peers)
         // This triggers keepalive timers on Go peers and refreshes routing info
         if self.last_refresh.elapsed() >= self.router_refresh {
-            tracing::debug!("Router refresh timer expired, triggering refresh");
+            tracing::debug!("Router refresh timer fired ({}s elapsed), triggering new SigReq cycle",
+                self.last_refresh.elapsed().as_secs());
             self.refresh = true;
             self.last_refresh = Instant::now();
         }
@@ -412,6 +433,7 @@ impl Router {
         }
         let req = self.requests[&key].clone();
         self.responded.remove(&peer_id);
+        self.sig_req_times.insert(peer_id, Instant::now());
         actions.push(RouterAction::SendSigReq {
             peer_id,
             req: wire::SigReq {
@@ -436,6 +458,7 @@ impl Router {
         let mut actions = Vec::new();
         self.lags.remove(&peer_id);
         self.responded.remove(&peer_id);
+        self.sig_req_times.remove(&peer_id);
 
         if let Some(peers) = self.peers.get_mut(&key) {
             peers.remove(&peer_id);
@@ -478,27 +501,7 @@ impl Router {
             + 1;
         SigReqState { seq, nonce }
     }
-
-    /// Handle an incoming signature request from a peer.
-    pub fn handle_request(&self, peer: &PeerEntry) -> RouterAction {
-        // We always respond with a signature for the requesting peer
-        let req = self.requests.get(&peer.key);
-        let (seq, nonce) = req.map_or((0, 0), |r| (r.seq, r.nonce));
-
-        let res_bytes = Self::sig_res_bytes_for_sig(&peer.key, &self.crypto.public_key, seq, nonce, peer.port);
-        let psig = self.crypto.sign(&res_bytes);
-
-        RouterAction::SendSigRes {
-            peer_id: peer.id,
-            res: wire::SigRes {
-                seq,
-                nonce,
-                port: peer.port,
-                psig,
-            },
-        }
-    }
-
+    
     /// Handle an incoming signature request with explicit req data.
     pub fn handle_request_with_data(&self,peer: &PeerEntry, req: &wire::SigReq) -> RouterAction {
         let res_bytes = Self::sig_res_bytes_for_sig(&peer.key, &self.crypto.public_key, req.seq, req.nonce, peer.port);
@@ -526,11 +529,18 @@ impl Router {
     }
 
     /// Handle a signature response from a peer.
-    pub fn handle_response(&mut self,peer_id: PeerId, key: &PublicKey, res: &wire::SigRes, rtt: Duration) {
+    pub fn handle_response(&mut self, peer_id: PeerId, key: &PublicKey, res: &wire::SigRes) {
         let req_match = self
             .requests
             .get(key)
             .map_or(false, |r| r.seq == res.seq && r.nonce == res.nonce);
+
+        // Compute accurate RTT from stored SigReq send time (matches Go's p.srst/p.srrt).
+        let rtt = self
+            .sig_req_times
+            .get(&peer_id)
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO);
 
         if !self.responses.contains_key(key) && req_match {
             tracing::debug!("SigRes accepted from {:?}, rtt={:?}", hex::encode(&key[..4]), rtt);
@@ -571,13 +581,24 @@ impl Router {
         if let Some(info) = self.infos.get(&ann.key) {
             // CRDT ordering: same logic as Go — DO NOT CHANGE
             match () {
-                _ if info.seq > ann.seq => return false,
+                _ if info.seq > ann.seq => {
+                    tracing::debug!("Announce REJECTED (old seq): key={:02x?} old_seq={} new_seq={}", &ann.key[..8], info.seq, ann.seq);
+                    return false;
+                }
                 _ if info.seq < ann.seq => {}
-                _ if info.parent < ann.parent => return false,
+                _ if info.parent < ann.parent => {
+                    tracing::debug!("Announce REJECTED (parent ordering): key={:02x?} old_parent={:02x?} new_parent={:02x?}", &ann.key[..4], &info.parent[..4], &ann.parent[..8]);
+                    return false;
+                }
                 _ if ann.parent < info.parent => {}
                 _ if ann.nonce < info.nonce => {}
-                _ => return false,
+                _ => {
+                    tracing::debug!("Announce REJECTED (nonce/default): key={:02x?} old_nonce={} new_nonce={}", &ann.key[..8], info.nonce, ann.nonce);
+                    return false;
+                }
             }
+        } else {
+            tracing::debug!("Announce NEW node: key={:02x?} parent={:02x?} seq={}", &ann.key[..4], &ann.parent[..8], ann.seq);
         }
 
         // Clean up sent info
@@ -763,7 +784,9 @@ impl Router {
             let res = self.responses.get(&best_parent).cloned();
             if let Some(res) = res {
                 if best_root != self_key && self.use_response(&best_parent, &res) {
-                    tracing::debug!("Tree: adopted parent {:?}, root {:?}", hex::encode(&best_parent[..8]), hex::encode(&best_root[..8]));
+                    let (_, new_coords) = self.get_root_and_path(&self.crypto.public_key);
+                    tracing::info!("Tree: adopted parent {} root {} coords={:?}",
+                        hex::encode(&best_parent[..8]), hex::encode(&best_root[..8]), new_coords);
                     self.refresh = false;
                     self.do_root1 = false;
                     self.do_root2 = false;
@@ -776,7 +799,7 @@ impl Router {
             }
 
             if self.do_root2 {
-                tracing::debug!("Tree: becoming root (self-rooted)");
+                tracing::warn!("Tree: becoming root (self-rooted, no valid parent response)");
                 self.become_root();
                 self.refresh = false;
                 self.do_root1 = false;
@@ -800,11 +823,13 @@ impl Router {
             .map(|(k, ps)| (*k, ps.keys().copied().collect()))
             .collect();
 
+        let now = Instant::now();
         for (pk, peer_ids) in peer_keys {
             let req = self.new_req();
             self.requests.insert(pk, req.clone());
             for peer_id in peer_ids {
                 self.responded.remove(&peer_id);
+                self.sig_req_times.insert(peer_id, now);
                 actions.push(RouterAction::SendSigReq {
                     peer_id,
                     req: wire::SigReq {
@@ -960,7 +985,7 @@ impl Router {
         dist
     }
 
-    fn get_cost(&self, peer_id: PeerId) -> u64 {
+    pub(crate) fn get_cost(&self, peer_id: PeerId) -> u64 {
         let lag = self.lags.get(&peer_id).copied().unwrap_or(UNKNOWN_LATENCY);
         let c = lag.as_millis() as u64;
         if c == 0 { 1 } else { c }
@@ -969,20 +994,24 @@ impl Router {
     /// Greedy routing lookup: find the best next-hop peer.
     pub fn lookup(&mut self, path: &[PeerPort], watermark: &mut u64) -> Option<PeerId> {
         let self_key = self.crypto.public_key;
+        let (_, self_path) = self.get_root_and_path(&self_key);
         let self_dist = self.get_dist(path, &self_key);
         if self_dist >= *watermark {
+            tracing::debug!("Lookup path {:?} - self too far (dist={} >= watermark={})", path, self_dist, watermark);
             return None;
         }
         let mut best_dist = self_dist;
         *watermark = self_dist;
 
-        tracing::debug!("Lookup path {:?}", path);
+        tracing::debug!("Lookup path {:?} - self_path={:?} self_dist={}", path, self_path, self_dist);
 
         // Collect candidates: peers closer than us
         let mut candidates: Vec<PeerEntry> = Vec::new();
         let peer_keys: Vec<PublicKey> = self.peers.keys().copied().collect();
         for k in &peer_keys {
+            let (_, peer_path) = self.get_root_and_path(k);
             let dist = self.get_dist(path, k);
+            tracing::debug!("  Peer {:02x?} path={:?} dist={} (closer={}) best_dist={}", &k[..8], peer_path, dist, dist < best_dist, best_dist);
             if dist < best_dist {
                 if let Some(peers) = self.peers.get(k) {
                     for (_, entry) in peers {
@@ -1074,9 +1103,13 @@ impl Router {
             let (_, from) = self.get_root_and_path(&self.crypto.public_key);
             tr.from = from;
 
-            // Cache a copy in pathfinder
-            let cached = tr.clone();
-            self.pathfinder.cache_traffic(&tr.dest, cached);
+            // Only cache when the slot is empty (consumed by a path-notify).
+            // For a steady-state stream the path is stable so this runs at most
+            // once per path-notify event rather than once per packet.
+            if self.pathfinder.needs_traffic_cache(&tr.dest) {
+                let cached = tr.clone();
+                self.pathfinder.cache_traffic(&tr.dest, cached);
+            }
 
             return self.route_traffic(tr);
         }
@@ -1088,7 +1121,8 @@ impl Router {
         self.pathfinder.ensure_rumor(xform);
         self.pathfinder.cache_rumor_traffic(&xform, tr);
 
-        if !self.pathfinder.should_throttle_lookup(&dest, self.path_throttle) {
+        if !self.pathfinder.should_throttle_rumor(&xform, self.path_throttle) {
+            self.pathfinder.mark_rumor_sent(&xform);
             return self.do_send_lookup(&dest);
         }
 
@@ -1134,7 +1168,6 @@ impl Router {
             tracing::debug!("Lookup throttled for {:?}", hex::encode(&dest[..8]));
             return Vec::new();
         }
-        tracing::debug!("Sending lookup for {:?}", hex::encode(&dest[..8]));
         self.pathfinder.mark_lookup_sent(dest);
 
         let self_key = self.crypto.public_key;
@@ -1143,10 +1176,25 @@ impl Router {
         let lookup = wire::PathLookup {
             source: self_key,
             dest: *dest,
-            from,
+            from: from.clone(),
         };
 
-        self.handle_lookup_internal(&self_key, &lookup)
+        let actions = self.handle_lookup_internal(&self_key, &lookup);
+        let n_sent = actions.iter().filter(|a| matches!(a, RouterAction::SendPathLookup { .. })).count();
+        tracing::debug!("PathLookup SENT dest={} coords={:?} targets={}", hex::encode(dest), from, n_sent);
+        actions
+    }
+
+    /// Force a path lookup for the given destination, bypassing the rumor throttle.
+    pub fn force_lookup(&mut self, dest: PublicKey) -> Vec<RouterAction> {
+        let xform = self.blooms.x_key(&dest, &self.bloom_transform);
+        // Reset rumor send_time so throttle doesn't suppress the send
+        if let Some(rumor) = self.pathfinder.rumors.get_mut(&xform) {
+            rumor.send_time = None;
+        } else {
+            self.pathfinder.ensure_rumor(xform);
+        }
+        self.do_send_lookup(&dest)
     }
 
     fn handle_lookup_internal(&mut self,from_key: &PublicKey, lookup: &wire::PathLookup) -> Vec<RouterAction> {
@@ -1169,7 +1217,7 @@ impl Router {
         let sx = self
             .blooms
             .x_key(&self.crypto.public_key, &self.bloom_transform);
-        tracing::debug!("Lookup self-check: dx={:?} sx={:?} match={}", hex::encode(&dx[..4]), hex::encode(&sx[..4]), dx == sx);
+        tracing::debug!("Lookup self-check: dx={:?} sx={:?} match={}", hex::encode(&dx[..8]), hex::encode(&sx[..8]), dx == sx);
         if dx == sx {
             let self_key = self.crypto.public_key;
             let (_, path) = self.get_root_and_path(&self_key);
@@ -1209,7 +1257,7 @@ impl Router {
     }
 
     /// Handle incoming lookup from a peer.
-    pub fn handle_lookup(&mut self,peer_key: &PublicKey, lookup: &wire::PathLookup) -> Vec<RouterAction> {
+    pub fn handle_lookup(&mut self, peer_key: &PublicKey, lookup: &wire::PathLookup) -> Vec<RouterAction> {
         tracing::debug!("Received lookup from {:?} for dest {:?} (source={:?})", hex::encode(&peer_key[..8]), hex::encode(&lookup.dest[..8]), hex::encode(&lookup.source[..8]));
         if !self.blooms.is_on_tree(peer_key) {
             tracing::debug!("Dropping lookup from {:?}: peer not on tree", hex::encode(&peer_key[..8]));
@@ -1220,11 +1268,12 @@ impl Router {
 
     fn handle_notify_internal(&mut self,_from_key: &PublicKey, notify: &wire::PathNotify) -> Vec<RouterAction> {
         let mut actions = Vec::new();
-        tracing::debug!("PathNotify: src={:?} dest={:?} path_len={}", hex::encode(&notify.source[..8]), hex::encode(&notify.dest[..8]), notify.path.len());
+        tracing::debug!("PathNotify: src={} dest={} path_len={}", hex::encode(&notify.source[..8]), hex::encode(&notify.dest[..8]), notify.path.len());
 
         // Try to route towards destination
         let mut watermark = notify.watermark;
         if let Some(peer_id) = self.lookup(&notify.path, &mut watermark) {
+            tracing::debug!("PathNotify FWD src={} dest={} to peer={}", hex::encode(&notify.source[..8]), hex::encode(&notify.dest[..8]), peer_id);
             let mut fwd = notify.clone();
             fwd.watermark = watermark;
             actions.push(RouterAction::SendPathNotify {
@@ -1236,10 +1285,10 @@ impl Router {
 
         // Check if it's for us
         if notify.dest != self.crypto.public_key {
-            tracing::debug!("PathNotify not for us, discarding");
+            tracing::debug!("PathNotify not for us (dest={}), discarding", hex::encode(&notify.dest[..8]));
             return actions;
         }
-        tracing::debug!("PathNotify received for us from {:?}", hex::encode(&notify.source[..4]));
+        tracing::debug!("PathNotify RECEIVED from source={} path={:?}", hex::encode(&notify.source[..8]), notify.info.path);
 
         // Verify signature
         let info_bytes = {
@@ -1257,20 +1306,28 @@ impl Router {
             self.blooms
                 .x_key(&notify.source, &self.bloom_transform);
 
-        if let Some(traffic) = self.pathfinder.accept_notify(
+        let (accepted, traffic) = self.pathfinder.accept_notify(
             notify.source,
             xformed_source,
             notify.info.seq,
             notify.info.path.clone(),
             self.path_timeout,
-        ) {
-            // Send the cached traffic
+        );
+
+        if let Some(mut traffic) = traffic {
+            // Update path and from before routing (Go: _handleTraffic does tr.path = info.path).
+            // The cached traffic may have a stale or empty path (e.g. was buffered before any
+            // path was known).  We must set the correct path NOW or route_traffic will call
+            // do_broken immediately, marking the freshly-stored path as broken again.
+            traffic.path = notify.info.path.clone();
+            let (_, from) = self.get_root_and_path(&self.crypto.public_key);
+            traffic.from = from;
             actions.extend(self.route_traffic(traffic));
         }
 
-        // Notify callback
-        if let Some(ref cb) = self.path_notify_cb {
-            cb(notify.source);
+        // Only notify the upper layer when the path was actually updated (matches Go).
+        if accepted {
+            actions.push(RouterAction::PathNotifyCallback { key: notify.source });
         }
 
         actions
@@ -1282,6 +1339,8 @@ impl Router {
     }
 
     fn do_broken(&mut self, tr: &crate::traffic::TrafficPacket) -> Vec<RouterAction> {
+        tracing::debug!("route_traffic: no next-hop for path={:?} to {}, marking broken",
+            tr.path, hex::encode(&tr.dest[..8]));
         let broken = wire::PathBroken {
             path: tr.from.clone(),
             watermark: u64::MAX,
@@ -1296,6 +1355,8 @@ impl Router {
         let mut watermark = broken.watermark;
 
         if let Some(peer_id) = self.lookup(&broken.path, &mut watermark) {
+            tracing::debug!("PathBroken: forwarding source={} dest={} to peer {}",
+                hex::encode(&broken.source[..8]), hex::encode(&broken.dest[..8]), peer_id);
             let mut fwd = broken.clone();
             fwd.watermark = watermark;
             actions.push(RouterAction::SendPathBroken { peer_id, broken: fwd, });
@@ -1303,11 +1364,16 @@ impl Router {
         }
 
         if broken.source != self.crypto.public_key {
+            tracing::debug!("PathBroken: discarding (not for us) source={} dest={} path={:?}",
+                hex::encode(&broken.source[..8]), hex::encode(&broken.dest[..8]), broken.path);
             return actions;
         }
 
+        // PathBroken is for us: mark the path broken and re-initiate lookup.
+        tracing::debug!("PathBroken: our path to {} is broken, re-looking up",
+            hex::encode(&broken.dest[..8]));
+
         self.pathfinder.handle_broken(&broken.dest);
-        // Try to re-lookup
         if !self.pathfinder.should_throttle_lookup(&broken.dest, self.path_throttle) {
             actions.extend(self.do_send_lookup(&broken.dest));
         }
@@ -1317,6 +1383,8 @@ impl Router {
 
     /// Handle incoming path broken from a peer.
     pub fn handle_broken(&mut self, broken: &wire::PathBroken) -> Vec<RouterAction> {
+        tracing::debug!("PathBroken received: source={} dest={} path={:?}",
+            hex::encode(&broken.source[..8]), hex::encode(&broken.dest[..8]), broken.path);
         self.handle_broken_internal(broken)
     }
 
@@ -1353,17 +1421,28 @@ impl Router {
             .map(|(k, _)| *k)
             .collect();
 
+        let mut removed = 0usize;
         for key in expired {
             if key == self_key {
+                tracing::debug!("expire_infos: self info aged out, triggering refresh (router_refresh={}s)",
+                    self.router_refresh.as_secs());
                 self.refresh = true;
             } else {
+                tracing::debug!("expire_infos: evicting node {} (last seen {}s ago)",
+                    hex::encode(&key[..8]),
+                    self.info_times.get(&key).map_or(0, |t| now.duration_since(*t).as_secs()));
                 self.infos.remove(&key);
                 self.info_times.remove(&key);
                 for sent in self.sent.values_mut() {
                     sent.remove(&key);
                 }
                 self.reset_cache();
+                removed += 1;
             }
+        }
+        if removed > 0 {
+            tracing::warn!("expire_infos: evicted {} nodes, tree now has {} entries (timeout={}s)",
+                removed, self.infos.len(), self.router_timeout.as_secs());
         }
     }
 
@@ -1403,9 +1482,6 @@ mod tests {
     fn update_accepts_newer_seq() {
         let mut router = make_router();
         router.become_root();
-        let self_key = router.crypto.public_key;
-
-        let old_seq = router.infos[&self_key].seq;
 
         // Create a new announcement with higher seq
         let key2 = SigningKey::generate(&mut OsRng);

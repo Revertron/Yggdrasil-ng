@@ -20,3 +20,11 @@ async-trait = "0.1"
 sha2 = "0.10"
 tokio-util = { version = "0.7", features = ["rt"] }
 hex = "0.4.3"
+
+[dev-dependencies]
+criterion = "0.5"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bench]]
+name = "logging_overhead"
+harness = false

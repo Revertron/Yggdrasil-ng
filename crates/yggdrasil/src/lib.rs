@@ -4,5 +4,8 @@ pub mod config;
 pub mod core;
 pub mod ipv6rwc;
 pub mod links;
+pub mod proto;
+pub mod tls_support;
+#[cfg(not(target_os = "android"))]
 pub mod tun;
 pub mod version;

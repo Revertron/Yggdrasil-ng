@@ -8,9 +8,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -58,8 +58,7 @@ impl PeerHandle {
 /// Manages all peer connections.
 pub(crate) struct Peers {
     next_id: PeerId,
-    next_port: PeerPort,
-    /// Ports allocated to peer keys.
+    /// Ports allocated to peer keys (port → key).
     used_ports: HashMap<PeerPort, PublicKey>,
     /// Active peer handles, grouped by public key.
     pub handles: HashMap<PublicKey, HashMap<PeerId, PeerHandle>>,
@@ -71,7 +70,6 @@ impl Peers {
     pub fn new() -> Self {
         Self {
             next_id: 1,
-            next_port: 1,
             used_ports: HashMap::new(),
             handles: HashMap::new(),
             order: 0,
@@ -90,17 +88,14 @@ impl Peers {
         let id = self.next_id;
         self.next_id += 1;
 
-        // Reuse port if we already have a peer with this key, else allocate new
+        // Reuse port if we already have a peer with this key.
+        // Otherwise scan from 1 for the lowest free port (matches Go's linear search).
         let port = if let Some(existing) = self.handles.get(&key) {
             existing.values().next().map(|h| h.port).unwrap_or_else(|| {
-                let p = self.next_port;
-                self.next_port += 1;
-                p
+                self.alloc_port()
             })
         } else {
-            let p = self.next_port;
-            self.next_port += 1;
-            p
+            self.alloc_port()
         };
 
         if !self.handles.contains_key(&key) {
@@ -136,6 +131,16 @@ impl Peers {
             });
 
         handle
+    }
+
+    /// Scan from 1 upward and return the lowest port not currently in use.
+    /// Matches Go's linear search behavior: freed ports are reused on reconnection.
+    fn alloc_port(&mut self) -> PeerPort {
+        let mut p: PeerPort = 1; // skip 0 (reserved for root)
+        while self.used_ports.contains_key(&p) {
+            p += 1;
+        }
+        p
     }
 
     /// Remove a peer by ID.
@@ -192,13 +197,15 @@ impl Peers {
 // Peer traffic sending with queuing
 // ---------------------------------------------------------------------------
 
-/// Send traffic to a peer, queuing if the channel is full.
-/// This implements the same backpressure logic as Go's peers.go _push() method.
-async fn send_traffic_to_peer(
-    peers: &Arc<tokio::sync::Mutex<Peers>>,
-    peer_id: PeerId,
-    traffic: TrafficPacket,
-) {
+/// Maximum age for queued packets before applying backpressure (25ms, matches Go).
+const MAX_PACKET_AGE_SEND: Duration = Duration::from_millis(25);
+
+/// Send traffic to a peer with backpressure.
+/// Implements Go's peers.go _push() method:
+/// 1. Try immediate send (if writer is ready)
+/// 2. If busy, check queue age - drop oldest from largest flow if >25ms
+/// 3. Queue the packet
+async fn send_traffic_to_peer(peers: &Arc<tokio::sync::Mutex<Peers>>, peer_id: PeerId, traffic: TrafficPacket) {
     let peers_lock = peers.lock().await;
 
     // Find the peer handle
@@ -210,34 +217,43 @@ async fn send_traffic_to_peer(
         }
     };
 
-    // Encode the traffic frame
-    let wire_traffic = wire::Traffic {
-        path: traffic.path.clone(),
-        from: traffic.from.clone(),
-        source: traffic.source,
-        dest: traffic.dest,
-        watermark: traffic.watermark,
-        payload: traffic.payload.clone(),
-    };
-    let mut payload = Vec::new();
-    wire_traffic.encode(&mut payload);
-    let frame = wire::encode_frame(wire::PacketType::Traffic, &payload);
+    let tx = handle.tx.clone();
+    let traffic_queue = handle.traffic_queue.clone();
+
+    // Encode the traffic frame in one allocation (no intermediate buffer, no clones).
+    let frame = wire::encode_traffic_frame(
+        &traffic.path, &traffic.from,
+        &traffic.source, &traffic.dest,
+        traffic.watermark, &traffic.payload,
+    );
     let msg = PeerMessage::SendFrame(frame);
 
-    // Try non-blocking send first
-    let tx = handle.tx.clone();
+    // Drop peers_lock before channel operations
     drop(peers_lock);
 
+    // Try non-blocking send first (fast path - writer ready)
     match tx.try_send(msg) {
         Ok(_) => {
-            // Fast path: sent immediately
+            // Fast path: sent immediately, writer is ready
         }
-        Err(mpsc::error::TrySendError::Full(msg)) => {
-            // Channel full - spawn background task to wait for space
-            // This prevents blocking dispatch_actions
-            tokio::spawn(async move {
-                let _ = tx.send(msg).await;
-            });
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // Check if oldest packet in queue is too old (>25ms)
+            // If so, drop the oldest packet from the largest flow (backpressure)
+            let mut queue = traffic_queue.lock().await;
+            if let Some(age) = queue.oldest_age() {
+                if age > MAX_PACKET_AGE_SEND {
+                    if queue.drop_largest() {
+                        tracing::warn!(
+                            "send_traffic_to_peer[{}]: dropped oldest packet (age={:?} > 25ms) - backpressure applied",
+                            peer_id,
+                            age
+                        );
+                    }
+                }
+            }
+
+            // Queue the new packet
+            queue.push(traffic);
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             // Peer disconnected, ignore
@@ -282,17 +298,11 @@ pub(crate) fn encode_action_frame(action: &RouterAction) -> Option<(PeerId, Vec<
         }
         RouterAction::SendTraffic { peer_id, traffic } => {
             tracing::debug!("RouterAction::SendTraffic");
-            let wire_traffic = wire::Traffic {
-                path: traffic.path.clone(),
-                from: traffic.from.clone(),
-                source: traffic.source,
-                dest: traffic.dest,
-                watermark: traffic.watermark,
-                payload: traffic.payload.clone(),
-            };
-            let mut payload = Vec::new();
-            wire_traffic.encode(&mut payload);
-            let frame = wire::encode_frame(wire::PacketType::Traffic, &payload);
+            let frame = wire::encode_traffic_frame(
+                &traffic.path, &traffic.from,
+                &traffic.source, &traffic.dest,
+                traffic.watermark, &traffic.payload,
+            );
             Some((*peer_id, frame))
         }
         RouterAction::SendPathLookup { peer_id, lookup } => {
@@ -351,6 +361,11 @@ async fn read_uvarint<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result
 /// The peer reader task. Reads frames from the connection and dispatches
 /// messages to the router via the shared mutex.
 /// Returns Ok(()) for clean shutdown, Err with disconnect reason otherwise.
+/// Shared peer timeout state between writer and reader.
+/// Writer sets the deadline when it sends a non-keepalive frame.
+/// Reader clears it when it receives any frame.
+pub(crate) type ReadDeadline = Arc<std::sync::Mutex<Option<std::time::Instant>>>;
+
 pub(crate) async fn peer_reader(
     peer_id: PeerId,
     peer_key: PublicKey,
@@ -363,21 +378,43 @@ pub(crate) async fn peer_reader(
     writer_tx: mpsc::Sender<PeerMessage>,
     cancel: CancellationToken,
     max_message_size: u64,
-    _peer_timeout: Duration,
+    peer_timeout: Duration,
     _keepalive_delay: Duration,
+    path_notify_cb: Option<Arc<dyn Fn(PublicKey) + Send + Sync>>,
+    read_deadline: ReadDeadline,
 ) -> Result<(), Error> {
-    let mut reader = BufReader::new(conn_read);
-    let sig_req_send_time = Instant::now();
+    // Use a larger BufReader to reduce syscall count on high-throughput connections.
+    let mut reader = BufReader::with_capacity(128 * 1024, conn_read);
     let mut disconnect_reason: Option<Error> = None;
 
+    // Reusable frame buffer: grows to the largest frame seen, then stays.
+    // Eliminates one heap allocation per incoming frame.
+    let mut buf: Vec<u8> = Vec::with_capacity(16384);
+
     loop {
-        // Read frame: length(uvarint) | content
-        // No timeout by default - rely on TCP keepalives
-        // (Go only sets timeout when expecting a response after sending non-keepalive traffic)
+        // Read frame: length(uvarint) | content.
+        // Wake every 1 second to check whether the writer-set deadline has
+        // elapsed (matches Go's SetReadDeadline approach: writer arms 3s
+        // deadline on non-keepalive sends; reader clears on any receive).
         let frame_result = tokio::select! {
             _ = cancel.cancelled() => { break },
             result = read_uvarint(&mut reader) => result,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                let deadline = *read_deadline.lock().unwrap();
+                if let Some(d) = deadline {
+                    if std::time::Instant::now() >= d {
+                        tracing::info!("peer_reader[{}]: peer timeout ({}ms, no reply from {:02x?}), disconnecting",
+                            peer_id, peer_timeout.as_millis(), &peer_key[..8]);
+                        disconnect_reason = Some(Error::Timeout);
+                        break;
+                    }
+                }
+                continue;
+            }
         };
+
+        // Any received frame clears the deadline (peer is alive).
+        *read_deadline.lock().unwrap() = None;
 
         let frame_len = match frame_result {
             Ok(len) => len,
@@ -392,7 +429,7 @@ pub(crate) async fn peer_reader(
             break;
         }
 
-        let mut buf = vec![0u8; frame_len as usize];
+        buf.resize(frame_len as usize, 0);
         let read_result = tokio::select! {
             _ = cancel.cancelled() => { break },
             result = reader.read_exact(&mut buf) => result,
@@ -413,8 +450,8 @@ pub(crate) async fn peer_reader(
         let ptype = match wire::PacketType::try_from(ptype_byte) {
             Ok(t) => t,
             Err(_) => {
-                disconnect_reason = Some(Error::UnrecognizedMessage);
-                break;
+                tracing::warn!("peer_reader[{}]: unknown packet type {}, skipping", peer_id, ptype_byte);
+                continue;
             }
         };
 
@@ -470,9 +507,8 @@ pub(crate) async fn peer_reader(
                     disconnect_reason = Some(Error::BadMessage);
                     break;
                 }
-                let rtt = sig_req_send_time.elapsed();
                 let mut router = router.lock().await;
-                router.handle_response(peer_id, &peer_key, &res, rtt);
+                router.handle_response(peer_id, &peer_key, &res);
             }
             wire::PacketType::ProtoAnnounce => {
                 let ann = match wire::Announce::decode(payload) {
@@ -490,7 +526,7 @@ pub(crate) async fn peer_reader(
                 let mut router = router.lock().await;
                 let actions = router.handle_announce(peer_id, &peer_key, &router_ann);
                 drop(router);
-                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
+                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
             }
             wire::PacketType::ProtoBloomFilter => {
                 let raw = match wire::decode_bloom(payload) {
@@ -515,7 +551,7 @@ pub(crate) async fn peer_reader(
                 let mut router = router.lock().await;
                 let actions = router.handle_lookup(&peer_key, &lookup);
                 drop(router);
-                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
+                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
             }
             wire::PacketType::ProtoPathNotify => {
                 let notify = match wire::PathNotify::decode(payload) {
@@ -528,7 +564,7 @@ pub(crate) async fn peer_reader(
                 let mut router = router.lock().await;
                 let actions = router.handle_notify(&peer_key, &notify);
                 drop(router);
-                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
+                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
             }
             wire::PacketType::ProtoPathBroken => {
                 let broken = match wire::PathBroken::decode(payload) {
@@ -541,7 +577,7 @@ pub(crate) async fn peer_reader(
                 let mut router = router.lock().await;
                 let actions = router.handle_broken(&broken);
                 drop(router);
-                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
+                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
             }
             wire::PacketType::Traffic => {
                 let tr = match wire::Traffic::decode(payload) {
@@ -562,14 +598,16 @@ pub(crate) async fn peer_reader(
                 let mut router = router.lock().await;
                 let actions = router.handle_traffic(traffic);
                 drop(router);
-                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
+                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
             }
         }
 
-        // After processing non-keepalive traffic, schedule a keepalive response
-        // (matches Go's behavior: recv() schedules keepalive for non-dummy/non-keepalive packets)
+        // After processing non-keepalive traffic, schedule a keepalive response.
+        // Use try_send (non-blocking): if the writer channel is full the peer is
+        // already actively receiving frames, so a keepalive isn't urgent, and we
+        // must not stall the reader waiting for channel space.
         if should_schedule_keepalive {
-            let _ = writer_tx.send(PeerMessage::ScheduleKeepalive).await;
+            let _ = writer_tx.try_send(PeerMessage::ScheduleKeepalive);
         }
     }
 
@@ -592,7 +630,7 @@ pub(crate) async fn peer_reader(
         peers_lock.remove_peer(peer_id, &peer_key);
         drop(peers_lock);
 
-        dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx).await;
+        dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
     }
 
     cancel.cancel();
@@ -604,15 +642,36 @@ pub(crate) async fn peer_reader(
     }
 }
 
-/// Drain queued traffic packets and send them.
+/// Write timeout for slow peers (10 seconds).
+/// If a write takes longer than this, the peer is considered stalled.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Size of the BufWriter buffer for each peer writer (128 KB).
+/// Outbound frames accumulate here; a single flush() drains to the OS per burst.
+const WRITE_BUF_SIZE: usize = 128 * 1024;
+
+/// Maximum packets drained from the traffic queue per writer loop iteration.
+/// After this many packets the writer yields back to the event loop, allowing
+/// other channel messages (routing frames, keepalives, other peers) to be
+/// processed before the next drain burst. This limits how long a single heavy
+/// stream can monopolize the writer without starving lighter flows.
+const MAX_DRAIN_PER_ITER: usize = 96;
+
+/// Drain queued traffic packets and send them with timeout.
 /// This is called by peer_writer after successfully writing a frame.
+/// Drains at most MAX_DRAIN_PER_ITER packets per call so the writer yields
+/// back to the event loop periodically, preventing a heavy stream from
+/// blocking other channel messages indefinitely.
+/// Returns false if write failed or timed out, true otherwise.
 async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
     peer_id: PeerId,
     queue: &Arc<tokio::sync::Mutex<PacketQueue>>,
     writer: &mut W,
-) {
+    peer_timeout: Duration,
+    read_deadline: &ReadDeadline,
+) -> bool {
     use tokio::io::AsyncWriteExt;
-    loop {
+    for _ in 0..MAX_DRAIN_PER_ITER {
         // Try to pop a packet from the queue
         let traffic = {
             let mut q = queue.lock().await;
@@ -621,30 +680,39 @@ async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
 
         let traffic = match traffic {
             Some(t) => t,
-            None => break, // Queue is empty
+            None => return true, // Queue is empty, success
         };
 
-        // Encode the traffic frame
-        let wire_traffic = wire::Traffic {
-            path: traffic.path,
-            from: traffic.from,
-            source: traffic.source,
-            dest: traffic.dest,
-            watermark: traffic.watermark,
-            payload: traffic.payload,
-        };
-        let mut payload = Vec::new();
-        wire_traffic.encode(&mut payload);
-        let frame = wire::encode_frame(wire::PacketType::Traffic, &payload);
+        let frame = wire::encode_traffic_frame(
+            &traffic.path, &traffic.from,
+            &traffic.source, &traffic.dest,
+            traffic.watermark, &traffic.payload,
+        );
 
-        // Write the frame
-        if writer.write_all(&frame).await.is_err() {
-            tracing::debug!("peer_writer: failed to write queued traffic for peer {}", peer_id);
-            break;
+        // Write the frame with timeout
+        let write_result = tokio::time::timeout(
+            WRITE_TIMEOUT,
+            writer.write_all(&frame)
+        ).await;
+
+        match write_result {
+            Ok(Ok(_)) => {
+                tracing::debug!("peer_writer[{}]: sent queued traffic", peer_id);
+                // Traffic packets are always non-keepalive — arm read deadline
+                *read_deadline.lock().unwrap() = Some(std::time::Instant::now() + peer_timeout);
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("peer_writer[{}]: write error for queued traffic: {}", peer_id, e);
+                return false;
+            }
+            Err(_) => {
+                tracing::debug!("peer_writer[{}]: write timeout ({:?}) for queued traffic - slow peer detected", peer_id, WRITE_TIMEOUT);
+                return false;
+            }
         }
-
-        tracing::debug!("peer_writer: sent queued traffic for peer {}", peer_id);
     }
+    // Drained MAX_DRAIN_PER_ITER packets; yield back to the event loop.
+    true
 }
 
 /// The peer writer task. Receives frames and writes them to the connection.
@@ -657,13 +725,19 @@ async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
 pub(crate) async fn peer_writer(
     peer_id: PeerId,
     mut rx: mpsc::Receiver<PeerMessage>,
-    mut conn_write: impl tokio::io::AsyncWrite + Unpin + Send,
+    conn_write: impl tokio::io::AsyncWrite + Unpin + Send,
     traffic_queue: Arc<tokio::sync::Mutex<PacketQueue>>,
-    keepalive_delay: Duration,
+    _keepalive_delay: Duration,
+    peer_timeout: Duration,
+    read_deadline: ReadDeadline,
     cancel: CancellationToken,
 ) {
     use crate::wire;
     use tokio::io::AsyncWriteExt;
+
+    // Wrap in BufWriter: individual write_all calls go to memory; flush() issues
+    // one syscall per burst rather than one per frame.
+    let mut conn_write = tokio::io::BufWriter::with_capacity(WRITE_BUF_SIZE, conn_write);
 
     // Pre-encode keepalive frame
     let keepalive_frame = wire::encode_frame(wire::PacketType::KeepAlive, &[]);
@@ -680,10 +754,26 @@ pub(crate) async fn peer_writer(
                 _ = deadline => {
                     // Keepalive timer fired, send keepalive
                     keepalive_deadline = None; // Clear the deadline
-                    if conn_write.write_all(&keepalive_frame).await.is_err() {
+
+                    // Write keepalive with timeout
+                    let write_result = tokio::time::timeout(
+                        WRITE_TIMEOUT,
+                        conn_write.write_all(&keepalive_frame)
+                    ).await;
+
+                    if write_result.is_err() || write_result.unwrap().is_err() {
+                        tracing::debug!("peer_writer[{}]: keepalive write failed or timed out", peer_id);
                         break;
                     }
-                    if conn_write.flush().await.is_err() {
+
+                    // Flush with timeout
+                    let flush_result = tokio::time::timeout(
+                        WRITE_TIMEOUT,
+                        conn_write.flush()
+                    ).await;
+
+                    if flush_result.is_err() || flush_result.unwrap().is_err() {
+                        tracing::debug!("peer_writer[{}]: keepalive flush failed or timed out", peer_id);
                         break;
                     }
                     continue;
@@ -709,25 +799,66 @@ pub(crate) async fn peer_writer(
 
                 // Log outgoing frame type for diagnostics
                 if let Some(ptype) = peek_frame_type(&data) {
-                    tracing::debug!("peer_writer: sending {:?} frame, {} bytes", ptype, data.len());
+                    tracing::debug!("peer_writer[{}]: sending {:?} frame, {} bytes", peer_id, ptype, data.len());
                 }
-                if conn_write.write_all(&data).await.is_err() {
+
+                // Write with timeout to detect slow peers
+                let write_result = tokio::time::timeout(
+                    WRITE_TIMEOUT,
+                    conn_write.write_all(&data)
+                ).await;
+
+                match write_result {
+                    Ok(Ok(_)) => {
+                        // Arm the read deadline for any non-keepalive frame.
+                        // Matches Go's SetReadDeadline(now + peerTimeout) on non-keepalive writes.
+                        if let Some(ptype) = peek_frame_type(&data) {
+                            if !matches!(ptype, wire::PacketType::KeepAlive | wire::PacketType::Dummy) {
+                                *read_deadline.lock().unwrap() = Some(std::time::Instant::now() + peer_timeout);
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!("peer_writer[{}]: write error: {}", peer_id, e);
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::debug!("peer_writer[{}]: write timeout ({:?}) - slow peer detected, disconnecting", peer_id, WRITE_TIMEOUT);
+                        break;
+                    }
+                }
+
+                // After successfully writing, drain queued traffic (with timeout)
+                if !drain_traffic_queue(peer_id, &traffic_queue, &mut conn_write, peer_timeout, &read_deadline).await {
+                    tracing::debug!("peer_writer[{}]: failed to drain traffic queue, disconnecting", peer_id);
                     break;
                 }
 
-                // After successfully writing, drain queued traffic
-                drain_traffic_queue(peer_id, &traffic_queue, &mut conn_write).await;
+                // Flush with timeout
+                let flush_result = tokio::time::timeout(
+                    WRITE_TIMEOUT,
+                    conn_write.flush()
+                ).await;
 
-                // Always flush to ensure data reaches the network immediately
-                if conn_write.flush().await.is_err() {
-                    break;
+                match flush_result {
+                    Ok(Ok(_)) => {
+                        // Flush succeeded
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!("peer_writer[{}]: flush error: {}", peer_id, e);
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::debug!("peer_writer[{}]: flush timeout ({:?}) - slow peer detected, disconnecting", peer_id, WRITE_TIMEOUT);
+                        break;
+                    }
                 }
             }
             PeerMessage::ScheduleKeepalive => {
                 // Schedule a keepalive to be sent after keepalive_delay
                 // (unless we send other traffic first, which will cancel it)
                 if keepalive_deadline.is_none() {
-                    keepalive_deadline = Some(Box::pin(tokio::time::sleep(keepalive_delay)));
+                    keepalive_deadline = Some(Box::pin(tokio::time::sleep(Duration::from_millis(100))));
                 }
             }
         }
@@ -777,6 +908,7 @@ pub(crate) async fn dispatch_actions(
     peers: &Arc<tokio::sync::Mutex<Peers>>,
     delivery_queue: &Arc<crate::traffic::DeliveryQueue>,
     traffic_tx: &mpsc::Sender<TrafficPacket>,
+    path_notify_cb: &Option<Arc<dyn Fn(PublicKey) + Send + Sync>>,
 ) {
     for action in actions {
         match action {
@@ -793,8 +925,9 @@ pub(crate) async fn dispatch_actions(
                 send_traffic_to_peer(peers, peer_id, traffic).await;
             }
             RouterAction::PathNotifyCallback { key } => {
-                // Path notify callback handled by upper layer
-                tracing::trace!("path notify for {:?}", key);
+                if let Some(cb) = path_notify_cb {
+                    cb(key);
+                }
             }
             other => {
                 if let Some((peer_id, frame)) = encode_action_frame(&other) {

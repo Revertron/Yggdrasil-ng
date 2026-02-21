@@ -31,7 +31,7 @@ impl Default for Config {
             router_refresh: Duration::from_secs(4 * 60),
             router_timeout: Duration::from_secs(5 * 60),
             peer_keepalive_delay: Duration::from_secs(1),
-            peer_timeout: Duration::from_secs(10),
+            peer_timeout: Duration::from_secs(3),
             peer_max_message_size: 1024 * 1024,
             bloom_transform: None,
             path_notify: None,

@@ -121,4 +121,59 @@ impl Config {
             })
             .collect()
     }
+
+    /// Get node info as JSON string (for protocol responses).
+    /// Automatically adds build info if node_info_privacy is false.
+    pub fn node_info_json(&self) -> String {
+        // Start with user-provided config
+        let mut json_value = toml_to_json(&self.node_info);
+
+        // Ensure we have an object to work with
+        let map = match json_value {
+            serde_json::Value::Object(ref mut m) => m,
+            _ => {
+                // If user config is not an object, create empty one
+                json_value = serde_json::Value::Object(serde_json::Map::new());
+                if let serde_json::Value::Object(ref mut m) = json_value {
+                    m
+                } else {
+                    unreachable!()
+                }
+            }
+        };
+
+        // If privacy is disabled, add build info automatically
+        if !self.node_info_privacy {
+            map.insert("buildname".to_string(), serde_json::Value::String(env!("CARGO_PKG_NAME").to_string()));
+            map.insert("buildversion".to_string(), serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()));
+            map.insert("buildplatform".to_string(), serde_json::Value::String(std::env::consts::OS.to_string()));
+            map.insert("buildarch".to_string(), serde_json::Value::String(std::env::consts::ARCH.to_string()));
+        }
+
+        serde_json::to_string(&json_value).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+/// Convert TOML value to JSON value.
+fn toml_to_json(toml_val: &toml::Value) -> serde_json::Value {
+    match toml_val {
+        toml::Value::String(s) => serde_json::Value::String(s.clone()),
+        toml::Value::Integer(i) => serde_json::Value::Number((*i).into()),
+        toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
+        toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
+        toml::Value::Array(arr) => {
+            let json_arr: Vec<serde_json::Value> = arr.iter().map(toml_to_json).collect();
+            serde_json::Value::Array(json_arr)
+        }
+        toml::Value::Table(tbl) => {
+            let json_obj: serde_json::Map<String, serde_json::Value> = tbl
+                .iter()
+                .map(|(k, v)| (k.clone(), toml_to_json(v)))
+                .collect();
+            serde_json::Value::Object(json_obj)
+        }
+    }
 }

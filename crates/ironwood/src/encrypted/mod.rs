@@ -30,14 +30,21 @@ struct DecryptedMessage {
     data: Vec<u8>,
 }
 
+/// Public session entry returned by `get_sessions()`.
+#[derive(Clone, Debug)]
+pub struct SessionEntry {
+    pub key: [u8; 32],
+    pub uptime_seconds: f64,
+    pub bytes_sent: u64,
+    pub bytes_recvd: u64,
+}
+
 /// Encrypted PacketConn: wraps a network `PacketConnImpl` with encryption.
 pub struct EncryptedPacketConn {
     /// The underlying network-level PacketConn.
     inner: Arc<PacketConnImpl>,
     /// Our Ed25519 signing key.
     signing_key: SigningKey,
-    /// Our Curve25519 private key (derived from Ed25519).
-    curve_priv: CurvePrivateKey,
     /// Session manager (shared with reader task).
     sessions: Arc<Mutex<SessionManager>>,
     /// Channel for delivering decrypted traffic to read_from.
@@ -90,7 +97,6 @@ impl EncryptedPacketConn {
         Self {
             inner,
             signing_key: secret,
-            curve_priv,
             sessions,
             recv_rx: Mutex::new(recv_rx),
             recv_tx,
@@ -114,6 +120,56 @@ impl EncryptedPacketConn {
     /// Get the number of routing entries.
     pub async fn routing_entries(&self) -> usize {
         self.inner.routing_entries().await
+    }
+
+    /// Get our current tree coordinates (path from root).
+    pub async fn tree_coordinates(&self) -> Vec<crate::wire::PeerPort> {
+        self.inner.tree_coordinates().await
+    }
+
+    /// Get all cached paths (delegates to inner).
+    pub async fn get_paths(&self) -> Vec<crate::core::PathEntry> {
+        self.inner.get_paths().await
+    }
+
+    /// Get all active encrypted sessions.
+    pub async fn get_sessions(&self) -> Vec<SessionEntry> {
+        use std::time::Instant;
+        let sessions = self.sessions.lock().await;
+        let now = Instant::now();
+        let mut result = Vec::new();
+        for (key, info) in &sessions.sessions {
+            result.push(SessionEntry {
+                key: *key,
+                uptime_seconds: now.duration_since(info.since).as_secs_f64(),
+                bytes_sent: info.tx,
+                bytes_recvd: info.rx,
+            });
+        }
+        result.sort_by(|a, b| a.key.cmp(&b.key));
+        result
+    }
+
+    /// Get routing peer keys (direct neighbors in spanning tree).
+    pub async fn get_routing_peer_keys(&self) -> Vec<crate::crypto::PublicKey> {
+        self.inner.get_routing_peer_keys().await
+    }
+
+    /// Get a diagnostic snapshot of internal routing state.
+    pub async fn get_debug_snapshot(&self) -> crate::core::DebugSnapshot {
+        self.inner.get_debug_snapshot().await
+    }
+
+    /// Count how many on-tree peers' bloom filters cover the given destination key.
+    /// Returns (xformed_key, multicast_count).
+    pub async fn count_lookup_targets(&self, dest: crate::crypto::PublicKey) -> (crate::crypto::PublicKey, usize) {
+        self.inner.count_lookup_targets(dest).await
+    }
+
+    /// Force a path lookup for the given destination, bypassing the rumor throttle.
+    /// Returns the number of peers the lookup was multicast to.
+    pub async fn force_lookup(&self, dest: crate::crypto::PublicKey) -> usize {
+        self.inner.force_lookup(dest).await
     }
 }
 

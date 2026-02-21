@@ -36,8 +36,6 @@ This project aims to provide a lightweight, self-arranging, and secure mesh netw
 
 - [Rust](https://rustup.rs/) (latest stable version recommended)
 - Cargo (included with Rust)
-- C compiler toolchain (for some dependencies)
-- `libssl-dev` or equivalent (on Linux, for cryptographic operations)
 
 ### Clone the Repository
 
@@ -170,11 +168,25 @@ yggdrasilctl getPeers
 yggdrasilctl getTree
 ```
 
-**Note**: Currently supported commands are limited compared to the Go version:
-- ✅ `getSelf` - Show node info (address, subnet, public key)
-- ✅ `getPeers` - List active peer connections
-- ✅ `getTree` - Show routing table entries
-- ⏳ Other commands (DHT, sessions, paths) coming in future updates
+**Supported commands:**
+
+*Local queries:*
+- ✅ `getSelf` - Show node info (address, subnet, public key, coordinates)
+- ✅ `getPeers` - List active peer connections with statistics
+- ✅ `getTree` - Show routing table entries (spanning tree)
+- ✅ `getPaths` - Show cached paths to remote destinations
+- ✅ `getSessions` - Show active encrypted sessions
+- ✅ `getTUN` - Show TUN adapter status
+- ✅ `addPeer` / `removePeer` - Manage peer connections
+
+*Remote queries:*
+- ✅ `getNodeInfo key=<hex>` - Query node metadata from remote node
+- ✅ `debug_remoteGetSelf key=<hex>` - Query self info from remote node
+- ✅ `debug_remoteGetPeers key=<hex>` - Query peer list from remote node
+- ✅ `debug_remoteGetTree key=<hex>` - Query tree entries from remote node
+
+*Planned:*
+- ⏳ Multicast interface management
 
 By default, `yggdrasilctl` connects to `tcp://localhost:9001`. You can specify a different address:
 
@@ -272,7 +284,7 @@ Ensure your code follows the project's own style guidelines and passes all tests
 
 ## License
 
-This project is licensed under the same terms as the original Yggdrasil project (typically LGPLv3 or similar). See the repository for the full license text.
+This project is licensed under the **Mozilla Public License 2.0 (MPL-2.0)** as the `ironwood`. See the [LICENSE](LICENSE) file for the full license text.
 
 ## Links
 

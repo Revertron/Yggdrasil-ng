@@ -38,9 +38,9 @@ pub(crate) struct PathInfo {
 pub(crate) struct PathRumor {
     /// Cached traffic packet.
     pub traffic: Option<super::traffic::TrafficPacket>,
-    /// When we last sent a lookup.
-    pub send_time: Instant,
-    /// When this rumor was created.
+    /// When we last sent a lookup (None = never sent).
+    pub send_time: Option<Instant>,
+    /// When this rumor was created (used as expiry fallback if never sent).
     pub created: Instant,
 }
 
@@ -130,13 +130,14 @@ impl Pathfinder {
     }
 
     /// Check if a rumor lookup should be throttled.
+    /// Returns false if never sent (new rumor always eligible for first send).
     pub fn should_throttle_rumor(
         &self,
         xformed_dest: &PublicKey,
         throttle: Duration,
     ) -> bool {
         if let Some(rumor) = self.rumors.get(xformed_dest) {
-            rumor.send_time.elapsed() < throttle
+            rumor.send_time.map_or(false, |t| t.elapsed() < throttle)
         } else {
             false
         }
@@ -144,22 +145,27 @@ impl Pathfinder {
 
     /// Get or create a rumor for a destination.
     /// Returns true if the rumor was just created.
+    /// Does NOT update send_time for existing rumors — use mark_rumor_sent().
     pub fn ensure_rumor(&mut self, xformed_dest: PublicKey) -> bool {
         if self.rumors.contains_key(&xformed_dest) {
-            if let Some(rumor) = self.rumors.get_mut(&xformed_dest) {
-                rumor.send_time = Instant::now();
-            }
             false
         } else {
             self.rumors.insert(
                 xformed_dest,
                 PathRumor {
                     traffic: None,
-                    send_time: Instant::now(),
+                    send_time: None,
                     created: Instant::now(),
                 },
             );
             true
+        }
+    }
+
+    /// Record that a rumor lookup was sent now (resets expiry timer, like Go's timer.Reset).
+    pub fn mark_rumor_sent(&mut self, xformed_dest: &PublicKey) {
+        if let Some(rumor) = self.rumors.get_mut(xformed_dest) {
+            rumor.send_time = Some(Instant::now());
         }
     }
 
@@ -175,7 +181,10 @@ impl Pathfinder {
     }
 
     /// Process a path notification response.
-    /// Returns Some(traffic) if there's a cached packet to send.
+    ///
+    /// Returns `(accepted, traffic)` where:
+    /// - `accepted` is true if the path was updated (matches Go: callback only fires on accept).
+    /// - `traffic` is a cached packet to re-send, if any.
     pub fn accept_notify(
         &mut self,
         source: PublicKey,
@@ -183,27 +192,48 @@ impl Pathfinder {
         notify_seq: u64,
         notify_path: Vec<PeerPort>,
         _path_timeout: Duration,
-    ) -> Option<super::traffic::TrafficPacket> {
+    ) -> (bool, Option<super::traffic::TrafficPacket>) {
         if let Some(info) = self.paths.get_mut(&source) {
-            // Existing path
             if notify_seq <= info.seq {
-                return None; // old seq
+                return (false, None); // seq not strictly greater
             }
-            // Check if path actually changed
-            if info.seq == notify_seq && info.path == notify_path {
-                return None; // same info
+            // Storm prevention: for a *working* path, don't reset if coords are unchanged.
+            // This avoids: working → lookup → same-path notify → reset timer → working …
+            // For a *broken* path we DO accept same coords with higher seq: the destination
+            // is at the same tree position, but routing might now succeed through different
+            // (non-zombie) intermediate peers.
+            if !info.broken && info.path == notify_path {
+                return (false, None); // working path, coords unchanged — nothing to update
             }
+            let was_broken = info.broken;
             info.path = notify_path;
             info.seq = notify_seq;
             info.broken = false;
             info.last_refresh = Instant::now();
-            return info.cached_traffic.take();
+            if was_broken {
+                tracing::info!(
+                    "PathNotify: un-broke path to {:02x?} seq={} path={:?}",
+                    &source[..8], notify_seq, &info.path
+                );
+            }
+            return (true, info.cached_traffic.take());
         }
 
         // New path — must have a rumor for this xformed key
         if !self.rumors.contains_key(&xformed_source) {
-            return None;
+            tracing::warn!(
+                "PathNotify REJECTED (no rumor): source={:02x?} xformed={:02x?}",
+                &source[..8],
+                &xformed_source[..8]
+            );
+            return (false, None);
         }
+        tracing::debug!(
+            "PathNotify ACCEPTED (rumor exists): source={:02x?} seq={} path={:?}",
+            &source[..8],
+            notify_seq,
+            notify_path
+        );
 
         let traffic = self
             .rumors
@@ -232,7 +262,7 @@ impl Pathfinder {
             },
         );
 
-        traffic
+        (true, traffic)
     }
 
     /// Handle a path broken notification for a destination.
@@ -253,10 +283,24 @@ impl Pathfinder {
 
     /// Get the cached path for a destination.
     pub fn get_path(&self, dest: &PublicKey) -> Option<&[PeerPort]> {
-        self.paths
+        let result = self.paths
             .get(dest)
             .filter(|info| !info.broken)
-            .map(|info| info.path.as_slice())
+            .map(|info| info.path.as_slice());
+        if let Some(path) = result {
+            tracing::debug!("get_path for {:02x?}: {:?}", &dest[..8], path);
+        }
+        result
+    }
+
+    /// Returns true if the path-notify cache slot for `dest` is empty.
+    /// Used to avoid cloning a full packet on every send when the cache is
+    /// already populated (path is stable, no path-notify has consumed it).
+    pub fn needs_traffic_cache(&self, dest: &PublicKey) -> bool {
+        self.paths
+            .get(dest)
+            .map(|info| info.cached_traffic.is_none())
+            .unwrap_or(false)
     }
 
     /// Cache a traffic packet for a destination (sent when path is found or refreshed).
@@ -277,7 +321,10 @@ impl Pathfinder {
             now.duration_since(info.last_refresh) < path_timeout
         });
         self.rumors.retain(|_, rumor| {
-            now.duration_since(rumor.created) < path_timeout
+            // Use send_time if set (matches Go's timer.Reset on each send),
+            // otherwise fall back to created time.
+            let expiry_base = rumor.send_time.unwrap_or(rumor.created);
+            now.duration_since(expiry_base) < path_timeout
         });
     }
 }
@@ -347,15 +394,17 @@ mod tests {
         let xformed = [1u8; 32];
 
         // Must have a rumor first
-        assert!(pf
-            .accept_notify(source, xformed, 1, vec![1, 2], Duration::from_secs(60))
-            .is_none());
+        let (accepted, traffic) =
+            pf.accept_notify(source, xformed, 1, vec![1, 2], Duration::from_secs(60));
+        assert!(!accepted);
+        assert!(traffic.is_none());
 
         // Create rumor
         pf.ensure_rumor(xformed);
-        let result =
+        let (accepted, traffic) =
             pf.accept_notify(source, xformed, 1, vec![1, 2], Duration::from_secs(60));
-        assert!(result.is_none()); // no cached traffic
+        assert!(accepted);
+        assert!(traffic.is_none()); // no cached traffic
         assert!(pf.paths.contains_key(&source));
         assert_eq!(pf.paths[&source].path, vec![1, 2]);
     }

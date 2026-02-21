@@ -150,10 +150,6 @@ impl<'a> WireReader<'a> {
         Self { data }
     }
 
-    pub fn remaining(&self) -> usize {
-        self.data.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
@@ -193,14 +189,6 @@ impl<'a> WireReader<'a> {
         Ok(path)
     }
 
-    pub fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if self.data.len() < n {
-            return Err(Error::Decode);
-        }
-        let out = &self.data[..n];
-        self.data = &self.data[n..];
-        Ok(out)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,10 +203,6 @@ pub(crate) struct SigReq {
 }
 
 impl SigReq {
-    pub fn size(&self) -> usize {
-        uvarint_size(self.seq) + uvarint_size(self.nonce)
-    }
-
     pub fn encode(&self, out: &mut Vec<u8>) {
         encode_uvarint(out, self.seq);
         encode_uvarint(out, self.nonce);
@@ -241,10 +225,6 @@ pub(crate) struct SigRes {
 }
 
 impl SigRes {
-    pub fn size(&self) -> usize {
-        uvarint_size(self.seq) + uvarint_size(self.nonce) + uvarint_size(self.port) + SIGNATURE_SIZE
-    }
-
     pub fn encode(&self, out: &mut Vec<u8>) {
         encode_uvarint(out, self.seq);
         encode_uvarint(out, self.nonce);
@@ -276,10 +256,6 @@ pub(crate) struct Announce {
 }
 
 impl Announce {
-    pub fn size(&self) -> usize {
-        PUBLIC_KEY_SIZE + PUBLIC_KEY_SIZE + self.sig_res.size() + SIGNATURE_SIZE
-    }
-
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.key);
         out.extend_from_slice(&self.parent);
@@ -314,10 +290,6 @@ pub(crate) struct PathLookup {
 }
 
 impl PathLookup {
-    pub fn size(&self) -> usize {
-        PUBLIC_KEY_SIZE + PUBLIC_KEY_SIZE + path_size(&self.from)
-    }
-
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.source);
         out.extend_from_slice(&self.dest);
@@ -345,10 +317,6 @@ pub(crate) struct PathNotifyInfo {
 }
 
 impl PathNotifyInfo {
-    pub fn size(&self) -> usize {
-        uvarint_size(self.seq) + path_size(&self.path) + SIGNATURE_SIZE
-    }
-
     pub fn encode(&self, out: &mut Vec<u8>) {
         encode_uvarint(out, self.seq);
         encode_path(out, &self.path);
@@ -374,14 +342,6 @@ pub(crate) struct PathNotify {
 }
 
 impl PathNotify {
-    pub fn size(&self) -> usize {
-        path_size(&self.path)
-            + uvarint_size(self.watermark)
-            + PUBLIC_KEY_SIZE
-            + PUBLIC_KEY_SIZE
-            + self.info.size()
-    }
-
     pub fn encode(&self, out: &mut Vec<u8>) {
         encode_path(out, &self.path);
         encode_uvarint(out, self.watermark);
@@ -420,10 +380,6 @@ pub(crate) struct PathBroken {
 }
 
 impl PathBroken {
-    pub fn size(&self) -> usize {
-        path_size(&self.path) + uvarint_size(self.watermark) + PUBLIC_KEY_SIZE + PUBLIC_KEY_SIZE
-    }
-
     pub fn encode(&self, out: &mut Vec<u8>) {
         encode_path(out, &self.path);
         encode_uvarint(out, self.watermark);
@@ -470,6 +426,7 @@ impl Traffic {
             + self.payload.len()
     }
 
+    #[cfg(test)]
     pub fn encode(&self, out: &mut Vec<u8>) {
         encode_path(out, &self.path);
         encode_path(out, &self.from);
@@ -505,10 +462,6 @@ impl Traffic {
 /// Bloom filter constants matching the Go implementation.
 pub(crate) const BLOOM_FILTER_FLAGS: usize = 16; // bytes for zero/one flags
 pub(crate) const BLOOM_FILTER_U64S: usize = 128; // number of u64s in backing array
-pub(crate) const BLOOM_FILTER_BYTES: usize = 1024; // total bytes
-pub(crate) const BLOOM_FILTER_BITS: usize = 8192; // total bits
-pub(crate) const BLOOM_FILTER_F: usize = 16; // BLOOM_FILTER_U64S / 8
-pub(crate) const BLOOM_FILTER_K: usize = 8; // number of hash functions
 
 /// Encode a bloom filter's backing u64 array with compression.
 /// Format: [16 bytes: flags0 (all-zero chunks)][16 bytes: flags1 (all-one chunks)][remaining u64s in big-endian]
@@ -564,6 +517,7 @@ pub(crate) fn decode_bloom(data: &[u8]) -> Result<[u64; BLOOM_FILTER_U64S], Erro
 }
 
 /// Compute the wire size of a bloom filter.
+#[cfg(test)]
 pub(crate) fn bloom_wire_size(data: &[u64; BLOOM_FILTER_U64S]) -> usize {
     let mut size = BLOOM_FILTER_FLAGS * 2; // flags0 + flags1
     for &u in data.iter() {
@@ -588,8 +542,39 @@ pub(crate) fn encode_frame(packet_type: PacketType, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Encode a traffic packet directly into a single wire frame in one allocation.
+///
+/// The standard path builds a `wire::Traffic` struct (cloning path, from, payload),
+/// serializes it into an intermediate `Vec`, then wraps that in `encode_frame`
+/// (another `Vec` + copy). This collapses all of that into:
+///   - one `Vec::with_capacity` (exact size, no realloc)
+///   - one `extend_from_slice` for the payload (no clone)
+///
+/// Format: `[uvarint: content_len][0x09: Traffic][path][from][source][dest][watermark][payload]`
+#[inline]
+pub(crate) fn encode_traffic_frame(path: &[PeerPort], from: &[PeerPort], source: &PublicKey, dest: &PublicKey, watermark: u64, payload: &[u8]) -> Vec<u8> {
+    let content_len = 1  // type byte
+        + path_size(path)
+        + path_size(from)
+        + PUBLIC_KEY_SIZE
+        + PUBLIC_KEY_SIZE
+        + uvarint_size(watermark)
+        + payload.len();
+    let mut frame = Vec::with_capacity(uvarint_size(content_len as u64) + content_len);
+    encode_uvarint(&mut frame, content_len as u64);
+    frame.push(PacketType::Traffic as u8);
+    encode_path(&mut frame, path);
+    encode_path(&mut frame, from);
+    frame.extend_from_slice(source);
+    frame.extend_from_slice(dest);
+    encode_uvarint(&mut frame, watermark);
+    frame.extend_from_slice(payload);
+    frame
+}
+
 /// Decode a frame header from the front of `data`.
 /// Returns (packet_type, payload_slice, total_frame_bytes_consumed).
+#[cfg(test)]
 pub(crate) fn decode_frame(data: &[u8]) -> Result<(PacketType, &[u8], usize), Error> {
     let (length, len_bytes) = decode_uvarint(data).ok_or(Error::Decode)?;
     let length = length as usize;
@@ -653,7 +638,6 @@ mod tests {
         };
         let mut buf = Vec::new();
         req.encode(&mut buf);
-        assert_eq!(buf.len(), req.size());
         let mut r = WireReader::new(&buf);
         let decoded = SigReq::decode(&mut r).unwrap();
         assert_eq!(decoded.seq, 42);
@@ -671,7 +655,6 @@ mod tests {
         };
         let mut buf = Vec::new();
         res.encode(&mut buf);
-        assert_eq!(buf.len(), res.size());
         let mut r = WireReader::new(&buf);
         let decoded = SigRes::decode(&mut r).unwrap();
         assert_eq!(decoded.seq, 1);
@@ -696,7 +679,6 @@ mod tests {
         };
         let mut buf = Vec::new();
         ann.encode(&mut buf);
-        assert_eq!(buf.len(), ann.size());
         let decoded = Announce::decode(&buf).unwrap();
         assert_eq!(decoded.key, [1u8; 32]);
         assert_eq!(decoded.parent, [2u8; 32]);
@@ -735,7 +717,6 @@ mod tests {
         };
         let mut buf = Vec::new();
         lookup.encode(&mut buf);
-        assert_eq!(buf.len(), lookup.size());
         let decoded = PathLookup::decode(&buf).unwrap();
         assert_eq!(decoded.source, [0xAA; 32]);
         assert_eq!(decoded.dest, [0xBB; 32]);
@@ -757,7 +738,6 @@ mod tests {
         };
         let mut buf = Vec::new();
         notify.encode(&mut buf);
-        assert_eq!(buf.len(), notify.size());
         let decoded = PathNotify::decode(&buf).unwrap();
         assert_eq!(decoded.path, vec![1, 2]);
         assert_eq!(decoded.watermark, 7);
@@ -775,7 +755,6 @@ mod tests {
         };
         let mut buf = Vec::new();
         broken.encode(&mut buf);
-        assert_eq!(buf.len(), broken.size());
         let decoded = PathBroken::decode(&buf).unwrap();
         assert_eq!(decoded.path, vec![1]);
         assert_eq!(decoded.source, [0x33; 32]);
