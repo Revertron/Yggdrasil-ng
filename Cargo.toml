@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ironwood", "crates/yggdrasil", "crates/ygg_stream"]
+members = ["crates/ironwood", "crates/yggdrasil"]
 
 [profile.release]
 opt-level = 2       # Optimize for speed
