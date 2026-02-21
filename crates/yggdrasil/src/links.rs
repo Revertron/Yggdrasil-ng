@@ -529,7 +529,6 @@ impl Links {
                     result = listener.accept() => {
                         match result {
                             Ok((stream, remote)) => {
-                                apply_tcp_socket_options(&stream);
                                 // Try to acquire permit for new connection
                                 let permit = match connection_limiter.clone().try_acquire_owned() {
                                     Ok(permit) => permit,
@@ -666,7 +665,7 @@ impl Links {
 
                 match result {
                     Ok(Ok(stream)) => {
-                        apply_tcp_socket_options(&stream);
+                        stream.set_nodelay(true).ok();
 
                         // Perform TLS handshake if needed
                         let wrapped_stream = if let Some(ref connector) = tls_connector {
@@ -961,22 +960,6 @@ async fn handle_connection(
     }
 
     result
-}
-
-/// Apply TCP socket options that keep connections alive through NAT devices.
-///
-/// Sets SO_KEEPALIVE with a 30-second idle time so NAT entries (typically
-/// killed after 3–5 minutes of silence) are refreshed well before expiry.
-fn apply_tcp_socket_options(stream: &TcpStream) {
-    stream.set_nodelay(true).ok();
-
-    let sock = socket2::SockRef::from(stream);
-    let ka = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(30))
-        .with_interval(Duration::from_secs(5));
-    if let Err(e) = sock.set_tcp_keepalive(&ka) {
-        tracing::debug!("Failed to set TCP keepalive: {}", e);
-    }
 }
 
 /// Parse link options from a URL's query parameters.

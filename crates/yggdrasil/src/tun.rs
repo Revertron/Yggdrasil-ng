@@ -57,12 +57,15 @@ impl TunAdapter {
             .ipv6(ip, 7u8)
             .mtu(mtu);
 
-        // Only call device_guid on Windows
-        if cfg!(windows) {
-            #[cfg(windows)]
-            {
-                builder = builder.device_guid(0x8f59971a78724aa6b2eb061fc4e9d0a7);
-            }
+        #[cfg(windows)]
+        {
+            // Only call device_guid on Windows
+            builder = builder.device_guid(0x8f59971a78724aa6b2eb061fc4e9d0a7);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Offload is supported only on Linux
+            builder = builder.offload(true);
         }
 
         let device = builder
