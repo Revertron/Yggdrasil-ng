@@ -403,7 +403,7 @@ pub(crate) async fn peer_reader(
                 let deadline = *read_deadline.lock().unwrap();
                 if let Some(d) = deadline {
                     if std::time::Instant::now() >= d {
-                        tracing::info!("peer_reader[{}]: peer timeout ({}ms, no reply from {:02x?}), disconnecting",
+                        tracing::debug!("peer_reader[{}]: peer timeout ({}ms, no reply from {:02x?}), disconnecting",
                             peer_id, peer_timeout.as_millis(), &peer_key[..8]);
                         disconnect_reason = Some(Error::Timeout);
                         break;

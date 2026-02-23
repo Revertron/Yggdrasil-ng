@@ -211,7 +211,7 @@ impl Pathfinder {
             info.broken = false;
             info.last_refresh = Instant::now();
             if was_broken {
-                tracing::info!(
+                tracing::debug!(
                     "PathNotify: un-broke path to {:02x?} seq={} path={:?}",
                     &source[..8], notify_seq, &info.path
                 );
@@ -221,7 +221,7 @@ impl Pathfinder {
 
         // New path — must have a rumor for this xformed key
         if !self.rumors.contains_key(&xformed_source) {
-            tracing::warn!(
+            tracing::debug!(
                 "PathNotify REJECTED (no rumor): source={:02x?} xformed={:02x?}",
                 &source[..8],
                 &xformed_source[..8]

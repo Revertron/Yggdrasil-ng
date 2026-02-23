@@ -785,7 +785,7 @@ impl Router {
             if let Some(res) = res {
                 if best_root != self_key && self.use_response(&best_parent, &res) {
                     let (_, new_coords) = self.get_root_and_path(&self.crypto.public_key);
-                    tracing::info!("Tree: adopted parent {} root {} coords={:?}",
+                    tracing::debug!("Tree: adopted parent {} root {} coords={:?}",
                         hex::encode(&best_parent[..8]), hex::encode(&best_root[..8]), new_coords);
                     self.refresh = false;
                     self.do_root1 = false;
@@ -799,7 +799,7 @@ impl Router {
             }
 
             if self.do_root2 {
-                tracing::warn!("Tree: becoming root (self-rooted, no valid parent response)");
+                tracing::debug!("Tree: becoming root (self-rooted, no valid parent response)");
                 self.become_root();
                 self.refresh = false;
                 self.do_root1 = false;
