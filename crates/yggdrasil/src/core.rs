@@ -257,12 +257,7 @@ impl Core {
     }
 
     /// Handle a new peer connection (delegate to ironwood).
-    pub async fn handle_conn(
-        &self,
-        key: [u8; 32],
-        conn: Box<dyn ironwood::types::AsyncConn>,
-        priority: u8,
-    ) -> Result<(), ironwood::Error> {
+    pub async fn handle_conn(&self, key: [u8; 32], conn: Box<dyn ironwood::types::AsyncConn>, priority: u8) -> Result<(), ironwood::Error> {
         self.inner.handle_conn(Addr(key), conn, priority).await
     }
 
@@ -357,6 +352,11 @@ impl Core {
         }
         peers.sort_by(|a, b| a.uri.cmp(&b.uri));
         peers
+    }
+
+    /// Subscribe to peer connect/disconnect events.
+    pub fn subscribe_peer_events(&self) -> tokio::sync::broadcast::Receiver<crate::links::PeerEvent> {
+        self.active_links.subscribe()
     }
 
     /// Get spanning tree entries (from ironwood).

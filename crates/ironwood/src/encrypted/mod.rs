@@ -300,7 +300,7 @@ impl crate::types::PacketConn for EncryptedPacketConn {
         Ok(buf.len())
     }
 
-    async fn handle_conn(&self,key: Addr, conn: Box<dyn crate::types::AsyncConn>, prio: u8) -> Result<()> {
+    async fn handle_conn(&self, key: Addr, conn: Box<dyn crate::types::AsyncConn>, prio: u8) -> Result<()> {
         self.inner.handle_conn(key, conn, prio).await
     }
 

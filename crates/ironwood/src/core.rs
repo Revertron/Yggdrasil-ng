@@ -188,12 +188,7 @@ impl crate::types::PacketConn for PacketConnImpl {
         Ok(buf.len())
     }
 
-    async fn handle_conn(
-        &self,
-        key: Addr,
-        conn: Box<dyn AsyncConn>,
-        prio: u8,
-    ) -> Result<()> {
+    async fn handle_conn(&self, key: Addr, conn: Box<dyn AsyncConn>, prio: u8,) -> Result<()> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }

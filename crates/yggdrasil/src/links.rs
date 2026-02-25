@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{broadcast, Mutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -308,12 +308,20 @@ pub struct LinkPeerInfo {
     pub last_error: Option<String>,
 }
 
+/// Fired when a peer connection is established or lost.
+#[derive(Debug, Clone)]
+pub enum PeerEvent {
+    Connected    { key: [u8; 32], uri: String, inbound: bool },
+    Disconnected { key: [u8; 32] },
+}
+
 /// Shared registry of active link connections.
 /// This is separate from `Links` so spawned tasks can update it.
 #[derive(Clone)]
 pub struct ActiveLinks {
     inner: Arc<Mutex<ActiveLinksInner>>,
     pub ban_list: BanList,
+    peer_tx: broadcast::Sender<PeerEvent>,
 }
 
 pub struct ActiveLinksInner {
@@ -337,12 +345,14 @@ struct ActiveConn {
 
 impl ActiveLinks {
     pub fn new() -> Self {
+        let (peer_tx, _) = broadcast::channel(16);
         Self {
             inner: Arc::new(Mutex::new(ActiveLinksInner {
                 next_id: 0,
                 connections: HashMap::new(),
             })),
             ban_list: BanList::new(),
+            peer_tx,
         }
     }
 
@@ -355,7 +365,7 @@ impl ActiveLinks {
         inner.connections.insert(
             id,
             ActiveConn {
-                uri,
+                uri: uri.clone(),
                 inbound,
                 key,
                 priority,
@@ -368,12 +378,23 @@ impl ActiveLinks {
                 up: Instant::now(),
             },
         );
+        drop(inner);
+        let _ = self.peer_tx.send(PeerEvent::Connected { key, uri, inbound });
         (id, rx, tx)
     }
 
     async fn unregister(&self, id: u64) {
-        let mut inner = self.inner.lock().await;
-        inner.connections.remove(&id);
+        let key = {
+            let inner = self.inner.lock().await;
+            inner.connections.get(&id).map(|c| c.key)
+        };
+        {
+            let mut inner = self.inner.lock().await;
+            inner.connections.remove(&id);
+        }
+        if let Some(key) = key {
+            let _ = self.peer_tx.send(PeerEvent::Disconnected { key });
+        }
     }
 
     /// Update rate counters for all connections (call every ~1 second).
@@ -387,6 +408,11 @@ impl ActiveLinks {
             conn.last_rx = rx;
             conn.last_tx = tx;
         }
+    }
+
+    /// Subscribe to peer connect/disconnect events.
+    pub fn subscribe(&self) -> broadcast::Receiver<PeerEvent> {
+        self.peer_tx.subscribe()
     }
 
     /// Get a snapshot of all active connections for the admin API.
