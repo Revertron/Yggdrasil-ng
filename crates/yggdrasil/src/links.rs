@@ -1,87 +1,25 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{ AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use ironwood::types::AsyncConn;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 use url::Url;
 
 use crate::core::Core;
+use crate::transport::Transport;
 use crate::version::Metadata;
-
-/// Enum to handle both TCP and TLS streams uniformly.
-enum Stream {
-    Tcp(TcpStream),
-    Tls(tokio_rustls::server::TlsStream<TcpStream>),
-    TlsClient(tokio_rustls::client::TlsStream<TcpStream>),
-}
-
-impl Stream {
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        match self {
-            Stream::Tcp(s) => s.peer_addr(),
-            Stream::Tls(s) => s.get_ref().0.peer_addr(),
-            Stream::TlsClient(s) => s.get_ref().0.peer_addr(),
-        }
-    }
-}
-
-impl AsyncRead for Stream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match &mut *self {
-            Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
-            Stream::Tls(s) => Pin::new(s).poll_read(cx, buf),
-            Stream::TlsClient(s) => Pin::new(s).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for Stream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match &mut *self {
-            Stream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
-            Stream::Tls(s) => Pin::new(s).poll_write(cx, buf),
-            Stream::TlsClient(s) => Pin::new(s).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match &mut *self {
-            Stream::Tcp(s) => Pin::new(s).poll_flush(cx),
-            Stream::Tls(s) => Pin::new(s).poll_flush(cx),
-            Stream::TlsClient(s) => Pin::new(s).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match &mut *self {
-            Stream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
-            Stream::Tls(s) => Pin::new(s).poll_shutdown(cx),
-            Stream::TlsClient(s) => Pin::new(s).poll_shutdown(cx),
-        }
-    }
-}
 
 const DEFAULT_BACKOFF_LIMIT: Duration = Duration::from_secs(4096);
 const MINIMUM_BACKOFF_LIMIT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
-const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Maximum concurrent incoming connections being processed
 const MAX_CONCURRENT_INCOMING: usize = 350;
@@ -205,7 +143,7 @@ impl BanList {
 /// Wrapper that counts bytes read/written from a stream.
 /// Uses local buffering to minimize atomic operations.
 struct CountingStream {
-    inner: Stream,
+    inner: Box<dyn AsyncConn>,
     rx_counter: Arc<AtomicUsize>,
     tx_counter: Arc<AtomicUsize>,
     rx_buffer: usize,
@@ -215,7 +153,7 @@ struct CountingStream {
 const FLUSH_THRESHOLD: usize = 65536; // Flush to atomic counters every 64KB
 
 impl CountingStream {
-    fn new(stream: Stream, rx_counter: Arc<AtomicUsize>, tx_counter: Arc<AtomicUsize>) -> Self {
+    fn new(stream: Box<dyn AsyncConn>, rx_counter: Arc<AtomicUsize>, tx_counter: Arc<AtomicUsize>) -> Self {
         Self {
             inner: stream,
             rx_counter,
@@ -241,7 +179,7 @@ impl CountingStream {
 }
 
 impl AsyncRead for CountingStream {
-    fn poll_read(mut self: Pin<&mut Self>,cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let before = buf.filled().len();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &result {
@@ -256,7 +194,7 @@ impl AsyncRead for CountingStream {
 }
 
 impl AsyncWrite for CountingStream {
-    fn poll_write(mut self: Pin<&mut Self>,cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &result {
             self.tx_buffer += *n;
@@ -356,7 +294,7 @@ impl ActiveLinks {
         }
     }
 
-    async fn register(&self,uri: String, inbound: bool, key: [u8; 32], priority: u8) -> (u64, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    async fn register(&self, uri: String, inbound: bool, key: [u8; 32], priority: u8) -> (u64, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let mut inner = self.inner.lock().await;
         let id = inner.next_id;
         inner.next_id += 1;
@@ -445,7 +383,7 @@ struct PeerEntry {
     handle: JoinHandle<()>,
 }
 
-/// Manages TCP peer connections and listeners.
+/// Manages peer connections and listeners using pluggable transports.
 pub struct Links {
     core: Option<Arc<Core>>,
     active: ActiveLinks,
@@ -460,6 +398,8 @@ pub struct Links {
     connection_limiter: Arc<Semaphore>,
     /// Last error per configured peer URI (shared with reconnect tasks).
     peer_errors: Arc<Mutex<HashMap<String, Option<String>>>>,
+    /// Registered transports by scheme.
+    transports: HashMap<String, Arc<dyn Transport>>,
 }
 
 impl Links {
@@ -474,7 +414,43 @@ impl Links {
             retry_notify: Arc::new(Notify::new()),
             connection_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_INCOMING)),
             peer_errors: Arc::new(Mutex::new(HashMap::new())),
+            transports: HashMap::new(),
         }
+    }
+
+    /// Register a transport for its scheme.
+    pub fn register_transport(&mut self, transport: Arc<dyn Transport>) {
+        self.transports.insert(transport.scheme().to_string(), transport);
+    }
+
+    /// Get supported scheme list (for error messages).
+    fn supported_schemes(&self) -> String {
+        let mut schemes: Vec<&str> = self.transports.keys().map(|s| s.as_str()).collect();
+        schemes.sort();
+        schemes.join(", ")
+    }
+
+    /// Look up transport for a scheme, with a helpful error for disabled features.
+    fn get_transport(&self, scheme: &str) -> Result<Arc<dyn Transport>, String> {
+        if let Some(t) = self.transports.get(scheme) {
+            return Ok(t.clone());
+        }
+
+        // Provide helpful error for known-but-disabled transports
+        let hint = match scheme {
+            #[cfg(not(feature = "quic"))]
+            "quic" => " — unavailable, built without --features quic",
+            #[cfg(not(feature = "websocket"))]
+            "ws" | "wss" => " — unavailable built without --features websocket",
+            _ => "",
+        };
+
+        Err(format!(
+            "unsupported scheme '{}'{} (available: {})",
+            scheme,
+            hint,
+            self.supported_schemes()
+        ))
     }
 
     /// Wake all sleeping peer reconnect loops so they retry immediately.
@@ -494,9 +470,32 @@ impl Links {
             .collect()
     }
 
-    /// Set the core reference. Must be called before listen/add_peer.
+    /// Set the core reference and register transports. Must be called before listen/add_peer.
     pub fn set_core(&mut self, core: Arc<Core>) {
-        self.core = Some(core);
+        // Register built-in transports
+        self.register_transport(Arc::new(crate::transport::tcp::TcpTransport::new()));
+        self.register_transport(Arc::new(crate::transport::tls::TlsTransport::new(
+            core.tls_server_config.clone(),
+            core.tls_client_config.clone(),
+        )));
+
+        #[cfg(feature = "quic")]
+        self.register_transport(Arc::new(crate::transport::quic::QuicTransport::new(
+            core.tls_server_config.clone(),
+            core.tls_client_config.clone(),
+        )));
+
+        #[cfg(feature = "websocket")]
+        {
+            self.register_transport(Arc::new(crate::transport::ws::WsTransport::new()));
+            self.register_transport(Arc::new(crate::transport::wss::WssTransport::new(
+                core.tls_server_config.clone(),
+                core.tls_client_config.clone(),
+            )));
+        }
+
+        self.core = Some(core.clone());
+
         // Start rate update and ban list cleanup tasks
         let active = self.active.clone();
         self.rate_handle = Some(tokio::spawn(async move {
@@ -520,22 +519,11 @@ impl Links {
         self.core.clone().ok_or_else(|| "core not initialized".to_string())
     }
 
-    /// Start listening on an address (e.g. "tcp://0.0.0.0:1234" or "tls://0.0.0.0:2345").
+    /// Start listening on an address (e.g. "tcp://0.0.0.0:1234", "quic://[::]:4321").
     pub async fn listen(&mut self, addr: &str) -> Result<(), String> {
         let url = Url::parse(addr).map_err(|e| format!("invalid URL: {}", e))?;
-        let scheme = url.scheme();
-        let use_tls = match scheme {
-            "tcp" => false,
-            "tls" => true,
-            _ => return Err(format!("unsupported scheme: {}", scheme)),
-        };
-
-        let host_port = url
-            .socket_addrs(|| Some(0))
-            .map_err(|e| format!("invalid address: {}", e))?
-            .first()
-            .ok_or("no address resolved")?
-            .to_string();
+        let scheme = url.scheme().to_string();
+        let transport = self.get_transport(&scheme)?;
 
         let options = parse_link_options(&url)?;
         let core = self.core()?;
@@ -544,24 +532,16 @@ impl Links {
         let cancel_clone = cancel.clone();
         let addr_str = addr.to_string();
 
-        let listener = TcpListener::bind(&host_port)
-            .await
-            .map_err(|e| format!("bind failed: {}", e))?;
+        let listener = transport.listen(&url).await?;
 
         let actual_addr = listener
             .local_addr()
             .map_err(|e| format!("local_addr failed: {}", e))?;
         tracing::info!("Listening on {}://{}", scheme, actual_addr);
 
-        let tls_acceptor = if use_tls {
-            let server_config = core.tls_server_config.read().await.clone();
-            Some(TlsAcceptor::from(server_config))
-        } else {
-            None
-        };
-
         // Shared semaphore — global limit across all listeners
         let connection_limiter = self.connection_limiter.clone();
+        let scheme_clone = scheme.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -569,65 +549,45 @@ impl Links {
                     _ = cancel_clone.cancelled() => break,
                     result = listener.accept() => {
                         match result {
-                            Ok((stream, remote)) => {
+                            Ok(ts) => {
                                 // Try to acquire permit for new connection
                                 let permit = match connection_limiter.clone().try_acquire_owned() {
                                     Ok(permit) => permit,
                                     Err(_) => {
-                                        // Too many concurrent connections, reject immediately
                                         tracing::warn!(
                                             "Rejected connection from {} (too many concurrent connections: {}/{})",
-                                            remote,
+                                            ts.remote_addr,
                                             MAX_CONCURRENT_INCOMING,
                                             MAX_CONCURRENT_INCOMING
                                         );
-                                        drop(stream);  // Explicit close
                                         continue;
                                     }
                                 };
 
-                                tracing::debug!("Accepted connection from {}", remote);
+                                tracing::debug!("Accepted {} connection from {}", scheme_clone, ts.remote_addr);
                                 let core = core.clone();
                                 let opts = options.clone();
                                 let active = active.clone();
-                                let acceptor = tls_acceptor.clone();
-                                let remote_str = if acceptor.is_some() {
-                                    format!("tls://{}", remote)
-                                } else {
-                                    format!("tcp://{}", remote)
-                                };
+                                let remote_str = format!("{}://{}", scheme_clone, ts.remote_addr);
 
                                 tokio::spawn(async move {
-                                    // Permit is held for the duration of this task
-
-                                    // Perform TLS handshake if needed
-                                    let wrapped_stream = if let Some(acceptor) = acceptor {
-                                        match acceptor.accept(stream).await {
-                                            Ok(tls_stream) => Stream::Tls(tls_stream),
-                                            Err(e) => {
-                                                tracing::debug!("TLS handshake failed from {}: {}", remote, e);
-                                                drop(permit);
-                                                return;
-                                            }
-                                        }
-                                    } else {
-                                        Stream::Tcp(stream)
-                                    };
-
                                     let _ = handle_connection(
                                         LinkType::Incoming,
                                         opts,
-                                        wrapped_stream,
+                                        ts.stream,
+                                        ts.remote_addr,
                                         &core,
                                         &active,
                                         &remote_str,
                                     ).await;
-                                    // Permit automatically released when dropped
                                     drop(permit);
                                 });
                             }
                             Err(e) => {
-                                tracing::error!("Accept error: {}", e);
+                                if cancel_clone.is_cancelled() {
+                                    break;
+                                }
+                                tracing::error!("Accept error on {}: {}", scheme_clone, e);
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         }
@@ -647,10 +607,8 @@ impl Links {
         }
 
         let url = Url::parse(uri).map_err(|e| format!("invalid URI: {}", e))?;
-        let scheme = url.scheme();
-        if scheme != "tcp" && scheme != "tls" {
-            return Err(format!("unsupported scheme: {}", scheme));
-        }
+        let scheme = url.scheme().to_string();
+        let transport = self.get_transport(&scheme)?;
 
         let host = url.host_str().ok_or("missing host")?.to_string();
         let port = url.port().ok_or("missing port")?;
@@ -683,14 +641,6 @@ impl Links {
         let uri_str = uri.to_string();
         let retry_notify = self.retry_notify.clone();
 
-        let use_tls = scheme == "tls";
-        let tls_connector = if use_tls {
-            let client_config = core.tls_client_config.read().await.clone();
-            Some(TlsConnector::from(client_config))
-        } else {
-            None
-        };
-
         let peer_errors = self.peer_errors.clone();
         // Initialize error entry for this peer
         peer_errors.lock().await.insert(uri.to_string(), None);
@@ -702,54 +652,20 @@ impl Links {
                     break;
                 }
 
-                let result = tokio::time::timeout(
-                    DIAL_TIMEOUT,
-                    TcpStream::connect(&target),
-                )
-                .await;
-
-                match result {
-                    Ok(Ok(stream)) => {
-                        stream.set_nodelay(true).ok();
-
-                        // Perform TLS handshake if needed
-                        let wrapped_stream = if let Some(ref connector) = tls_connector {
-                            // Use the hostname from the URI for SNI
-                            let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-                                .unwrap_or_else(|_| {
-                                    // Fallback to using IP address as server name if hostname parsing fails
-                                    rustls::pki_types::ServerName::IpAddress(
-                                        rustls::pki_types::IpAddr::try_from(host.as_str())
-                                            .expect("invalid hostname")
-                                    )
-                                });
-
-                            match connector.connect(server_name, stream).await {
-                                Ok(tls_stream) => Stream::TlsClient(tls_stream),
-                                Err(e) => {
-                                    let err_msg = format!("TLS handshake failed: {}", e);
-                                    tracing::debug!("{} to {}", err_msg, target);
-                                    peer_errors.lock().await.insert(uri_str.clone(), Some(err_msg));
-                                    // Continue to backoff logic below
-                                    backoff = (backoff + 1).min(7);
-                                    let wait = Duration::from_secs(1u64 << backoff.min(7))
-                                        .min(options.max_backoff);
-                                    tokio::select! {
-                                        _ = cancel_clone.cancelled() => break,
-                                        _ = tokio::time::sleep(wait) => {}
-                                        _ = retry_notify.notified() => {}
-                                    }
-                                    continue;
-                                }
-                            }
-                        } else {
-                            Stream::Tcp(stream)
-                        };
-
+                match transport.dial(&url, &options).await {
+                    Ok(ts) => {
                         // Connected successfully — clear error
                         peer_errors.lock().await.insert(uri_str.clone(), None);
 
-                        match handle_connection(LinkType::Persistent, options.clone(), wrapped_stream, &core, &active, &uri_str).await {
+                        match handle_connection(
+                            LinkType::Persistent,
+                            options.clone(),
+                            ts.stream,
+                            ts.remote_addr,
+                            &core,
+                            &active,
+                            &uri_str,
+                        ).await {
                             Ok(()) => {
                                 // Clean disconnection - reset backoff
                                 peer_errors.lock().await.insert(uri_str.clone(), None);
@@ -760,15 +676,9 @@ impl Links {
                             }
                         }
                     }
-                    Ok(Err(e)) => {
-                        let err_msg = format!("Failed to connect: {}", e);
-                        tracing::debug!("{} to {}", err_msg, target);
-                        peer_errors.lock().await.insert(uri_str.clone(), Some(err_msg));
-                    }
-                    Err(_) => {
-                        let err_msg = "Connection timed out".to_string();
-                        tracing::debug!("{}: {}", err_msg, target);
-                        peer_errors.lock().await.insert(uri_str.clone(), Some(err_msg));
+                    Err(e) => {
+                        tracing::debug!("Failed to connect to {}: {}", uri_str, e);
+                        peer_errors.lock().await.insert(uri_str.clone(), Some(e));
                     }
                 }
 
@@ -825,26 +735,21 @@ impl Links {
     }
 }
 
-/// Perform the Yggdrasil handshake over a stream (TCP or TLS), then hand off to ironwood.
+/// Perform the Yggdrasil handshake over a stream, then hand off to ironwood.
 async fn handle_connection(
     link_type: LinkType,
     options: LinkOptions,
-    mut stream: Stream,
+    mut stream: Box<dyn AsyncConn>,
+    peer_addr: SocketAddr,
     core: &Arc<Core>,
     active: &ActiveLinks,
     uri: &str,
 ) -> Result<(), String> {
-    // Get peer IP address for ban checking
-    let peer_ip = match stream.peer_addr() {
-        Ok(addr) => Some(addr.ip()),
-        Err(_) => None,
-    };
+    let peer_ip = peer_addr.ip();
 
     // Check if IP is banned
-    if let Some(ip) = peer_ip {
-        if active.ban_list.is_banned(ip).await {
-            return Err(format!("IP {} is temporarily banned", ip));
-        }
+    if active.ban_list.is_banned(peer_ip).await {
+        return Err(format!("IP {} is temporarily banned", peer_ip));
     }
 
     // 6 second handshake timeout
@@ -903,14 +808,8 @@ async fn handle_connection(
             crate::version::PROTOCOL_VERSION_MINOR
         );
 
-        // Log incompatible version
-        if let Some(ip) = peer_ip {
-            tracing::info!("Rejected connection from {}: {}", ip, err_msg);
-            // Record failure and potentially ban this IP
-            active.ban_list.record_failure(ip, "incompatible version").await;
-        } else {
-            tracing::info!("Rejected connection: {}", err_msg);
-        }
+        tracing::info!("Rejected connection from {}: {}", peer_ip, err_msg);
+        active.ban_list.record_failure(peer_ip, "incompatible version").await;
 
         return Err(err_msg);
     }
@@ -927,29 +826,20 @@ async fn handle_connection(
     }
 
     if remote_meta.public_key == core.public_key {
-        if let Some(ip) = peer_ip {
-            tracing::debug!("Rejected connection from {}: connected to self", ip);
-            // Don't ban for self-connection, it's usually a configuration issue
-        }
+        tracing::debug!("Rejected connection from {}: connected to self", peer_ip);
         return Err("connected to self".to_string());
     }
 
     if !options.pinned_keys.is_empty()
         && !options.pinned_keys.contains(&remote_meta.public_key)
     {
-        if let Some(ip) = peer_ip {
-            tracing::debug!("Rejected connection from {}: key not in pinned keys", ip);
-            // Don't ban for wrong pinned key - could be legitimate peering config mismatch
-        }
+        tracing::debug!("Rejected connection from {}: key not in pinned keys", peer_ip);
         return Err("remote key not in pinned keys".to_string());
     }
 
     if link_type == LinkType::Incoming && !core.is_key_allowed(&remote_meta.public_key) {
-        if let Some(ip) = peer_ip {
-            tracing::debug!("Rejected connection from {}: key not in allowed list", ip);
-            // Record failure for unauthorized keys
-            active.ban_list.record_failure(ip, "key not allowed").await;
-        }
+        tracing::debug!("Rejected connection from {}: key not in allowed list", peer_ip);
+        active.ban_list.record_failure(peer_ip, "key not allowed").await;
         return Err("remote key not allowed".to_string());
     }
 
@@ -961,7 +851,6 @@ async fn handle_connection(
     } else {
         "outbound"
     };
-    let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     tracing::info!(
         "Connected {}: {} @ {} (v{}.{})",
         direction,

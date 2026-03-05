@@ -17,6 +17,12 @@ path = "src/yggdrasilctl.rs"
 name = "yggdrasil"
 path = "src/lib.rs"
 
+[features]
+default = []                          # TCP + TLS only (no extra deps)
+quic = ["dep:quinn"]                  # QUIC transport
+websocket = ["dep:tokio-tungstenite", "dep:futures-util"] # WS/WSS transport
+all-transports = ["quic", "websocket"]
+
 [dependencies]
 ironwood = { path = "../ironwood" }
 tokio = { version = "1", features = ["full"] }
@@ -38,6 +44,14 @@ comfy-table = "7"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 rcgen = "0.14.7"
+async-trait = "0.1"
+
+# Optional: QUIC transport
+quinn = { version = "0.11", optional = true }
+
+# Optional: WebSocket transport
+tokio-tungstenite = { version = "0.26", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 # tun-rs is not available on Android; TUN is handled at the OS/framework level there.
 [target.'cfg(not(target_os = "android"))'.dependencies]
