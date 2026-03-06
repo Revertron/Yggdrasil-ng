@@ -161,7 +161,7 @@ async fn handle_admin_conn(stream: tokio::net::TcpStream, core: Arc<Core>) {
 async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_json::Value, String> {
     match req.request.to_lowercase().as_str() {
         "list" => Ok(serde_json::json!({
-            "list": ["list", "getself", "getpeers", "gettree", "getpaths", "getsessions", "gettun", "addpeer", "removepeer", "getdebug", "getlookup", "forcelookup", "getnodeinfo", "debug_remotegetself", "debug_remotegetpeers", "debug_remotegettree"],
+            "list": ["list", "getself", "getpeers", "gettree", "getpaths", "getsessions", "gettun", "getmulticastinterfaces", "addpeer", "removepeer", "getdebug", "getlookup", "forcelookup", "getnodeinfo", "debug_remotegetself", "debug_remotegetpeers", "debug_remotegettree"],
         })),
 
         "getself" => {
@@ -521,6 +521,15 @@ async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_js
                     "keys": keys_json
                 }
             }))
+        }
+
+        "getmulticastinterfaces" => {
+            match core.get_multicast_interfaces().await {
+                Some(value) => Ok(value),
+                None => Ok(serde_json::json!({
+                    "multicast_interfaces": [],
+                })),
+            }
         }
 
         other => Err(format!(

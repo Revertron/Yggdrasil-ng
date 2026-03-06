@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::links::LinkOptions;
-use super::{bare_host, Transport, TransportListener, TransportStream};
+use super::{apply_scope_id, bare_host, Transport, TransportListener, TransportStream};
 
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -36,12 +36,15 @@ impl Transport for TlsTransport {
     async fn dial(
         &self,
         url: &Url,
-        _options: &LinkOptions,
+        options: &LinkOptions,
     ) -> Result<TransportStream, String> {
         let host = bare_host(url)?;
-        let addrs = url
+        let mut addrs = url
             .socket_addrs(|| None)
             .map_err(|e| format!("address resolution failed: {}", e))?;
+
+        // Fix up scope_id for link-local IPv6 addresses (multicast discovery)
+        apply_scope_id(&mut addrs, options.scope_id);
 
         let stream = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addrs.as_slice()))
             .await

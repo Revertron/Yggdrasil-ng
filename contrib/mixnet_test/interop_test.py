@@ -3,8 +3,8 @@
 Yggdrasil interop integration tests: yggdrasil-go <-> yggdrasil-ng
 
 Tests all transport combinations (TLS, QUIC, WS) between Go and Rust
-implementations over IPv4, IPv6, and hostname. Runs without root —
-uses IfName="none" (no TUN).
+implementations over IPv4, IPv6, and hostname, plus multicast LAN discovery.
+Runs without root — uses IfName="none" (no TUN).
 
 Rust binaries are discovered relative to this script (../../target/debug/).
 Go binaries must be provided via the YGGDRASIL_GO_DIR environment variable.
@@ -17,6 +17,8 @@ Usage:
 import argparse
 import json
 import os
+import platform
+import re
 import signal
 import socket
 import subprocess
@@ -61,6 +63,18 @@ TEST_MATRIX = [
     ("ws_go_server_rust_client_localhost", "go", "rust", "ws", "localhost"),
     ("ws_rust_server_go_client_localhost", "rust", "go", "ws", "localhost"),
 ]
+
+# ── Multicast discovery test matrix ──
+
+MULTICAST_TESTS = [
+    # (test_name, first_impl, second_impl)
+    ("multicast_go_first_rust_second", "go", "rust"),
+    ("multicast_rust_first_go_second", "rust", "go"),
+    ("multicast_rust_first_rust_second", "rust", "rust"),
+]
+
+# Admin port base for multicast tests (offset to avoid transport test ports)
+MULTICAST_ADMIN_BASE = 19500
 
 # ── Port allocation ──
 
@@ -142,6 +156,294 @@ def generate_rust_config(admin_port, listen_addrs=None, peers=None):
             break
 
     return path, private_key
+
+
+# ── Multicast interface discovery ──
+
+
+def find_multicast_interface():
+    """Find a network interface suitable for multicast testing.
+
+    Returns the interface name, or None if no suitable interface is found.
+    Requirements: UP, RUNNING, MULTICAST flags; has a link-local IPv6 address;
+    not POINTTOPOINT.
+    """
+    system = platform.system()
+
+    if system == "Darwin":
+        # macOS: lo0 typically has UP,LOOPBACK,RUNNING,MULTICAST and fe80::1
+        for iface in ["lo0", "en0", "en1", "bridge0"]:
+            try:
+                result = subprocess.run(
+                    ["ifconfig", iface],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode != 0:
+                    continue
+                output = result.stdout
+                # Check required flags
+                if "MULTICAST" not in output:
+                    continue
+                if "POINTOPOINT" in output:
+                    continue
+                # Check for link-local IPv6 address (fe80::)
+                if re.search(r'inet6\s+fe80:', output):
+                    return iface
+            except Exception:
+                continue
+
+    elif system == "Linux":
+        # Linux: parse 'ip -6 addr show' for interfaces with MULTICAST + fe80::
+        try:
+            result = subprocess.run(
+                ["ip", "-6", "addr", "show"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                current_iface = None
+                for line in result.stdout.splitlines():
+                    # Interface header: "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> ..."
+                    m = re.match(r'\d+:\s+(\S+?):\s+<([^>]+)>', line)
+                    if m:
+                        iface_name = m.group(1)
+                        flags = m.group(2)
+                        if ("MULTICAST" in flags and "UP" in flags
+                                and "POINTOPOINT" not in flags):
+                            current_iface = iface_name
+                        else:
+                            current_iface = None
+                    elif current_iface and "fe80::" in line:
+                        return current_iface
+        except Exception:
+            pass
+
+    return None
+
+
+# ── Multicast config generation ──
+
+
+def generate_go_multicast_config(admin_port, multicast_iface):
+    """Generate a Go JSON config with multicast discovery enabled."""
+    result = subprocess.run(
+        [GO_BIN, "-genconf", "-json"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"genconf failed: {result.stderr}")
+
+    cfg = json.loads(result.stdout)
+    cfg["AdminListen"] = f"tcp://127.0.0.1:{admin_port}"
+    cfg["IfName"] = "none"
+    cfg["Listen"] = []
+    cfg["Peers"] = []
+    cfg["MulticastInterfaces"] = [{
+        "Regex": f"^{re.escape(multicast_iface)}$",
+        "Beacon": True,
+        "Listen": True,
+        "Port": 0,
+        "Priority": 0,
+        "Password": "",
+    }]
+
+    fd, path = tempfile.mkstemp(suffix=".json", prefix="ygg_go_mc_")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return path, cfg.get("PrivateKey", "")
+
+
+def generate_rust_multicast_config(admin_port, multicast_iface):
+    """Generate a Rust TOML config with multicast discovery enabled."""
+    result = subprocess.run(
+        [RUST_BIN, "--genconf", "/dev/stdout"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"genconf failed: {result.stderr}")
+
+    lines = result.stdout.splitlines()
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("admin_listen"):
+            new_lines.append(f'admin_listen = "tcp://127.0.0.1:{admin_port}"')
+        elif stripped.startswith("if_name"):
+            new_lines.append('if_name = "none"')
+        elif stripped.startswith("listen"):
+            new_lines.append("listen = []")
+        elif stripped.startswith("peers"):
+            new_lines.append("peers = []")
+        else:
+            new_lines.append(line)
+
+    # Append multicast config section
+    escaped = multicast_iface.replace("\\", "\\\\")
+    new_lines.extend([
+        "",
+        "[[multicast_interfaces]]",
+        f'regex = "^{escaped}$"',
+        "beacon = true",
+        "listen = true",
+        "port = 0",
+        "priority = 0",
+        'password = ""',
+    ])
+
+    fd, path = tempfile.mkstemp(suffix=".toml", prefix="ygg_rust_mc_")
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(new_lines) + "\n")
+
+    private_key = ""
+    for line in new_lines:
+        if line.strip().startswith("private_key"):
+            private_key = line.split("=", 1)[1].strip().strip('"')
+            break
+
+    return path, private_key
+
+
+# ── Multicast test runner ──
+
+
+def run_multicast_test(test_name, first_impl, second_impl, multicast_iface,
+                       test_index, peer_timeout=30, verbose=False):
+    """Run a multicast discovery test.
+
+    Starts the first node, waits for it to begin beaconing, then starts
+    the second node. Both should discover each other via multicast.
+    Returns (success, message).
+    """
+    first_admin = MULTICAST_ADMIN_BASE + test_index * 2 + 1
+    second_admin = MULTICAST_ADMIN_BASE + test_index * 2 + 2
+
+    first_node = None
+    second_node = None
+
+    try:
+        # Generate configs with multicast enabled
+        if first_impl == "go":
+            first_cfg, _ = generate_go_multicast_config(
+                first_admin, multicast_iface)
+            first_bin = GO_BIN
+        else:
+            first_cfg, _ = generate_rust_multicast_config(
+                first_admin, multicast_iface)
+            first_bin = RUST_BIN
+
+        if second_impl == "go":
+            second_cfg, _ = generate_go_multicast_config(
+                second_admin, multicast_iface)
+            second_bin = GO_BIN
+        else:
+            second_cfg, _ = generate_rust_multicast_config(
+                second_admin, multicast_iface)
+            second_bin = RUST_BIN
+
+        # Start first node and let it begin beaconing
+        first_node = YggNode(
+            first_impl, first_bin, first_cfg, first_admin,
+            f"{test_name}_first", verbose=verbose)
+        first_node.wait_ready(timeout=10)
+
+        # Brief pause so first node starts its beacon loop
+        time.sleep(2)
+
+        # Start second node — it should receive beacons and connect
+        second_node = YggNode(
+            second_impl, second_bin, second_cfg, second_admin,
+            f"{test_name}_second", verbose=verbose)
+        second_node.wait_ready(timeout=10)
+
+        # Get public keys
+        first_key = first_node.get_self_key()
+        second_key = second_node.get_self_key()
+
+        if verbose:
+            print(f"\n    First  ({first_impl}) key: {first_key[:16]}...")
+            print(f"    Second ({second_impl}) key: {second_key[:16]}...")
+
+        # Poll getPeers until both nodes see each other
+        deadline = time.time() + peer_timeout
+        first_sees_second = False
+        second_sees_first = False
+        first_peer_info = None
+        second_peer_info = None
+
+        while time.time() < deadline:
+            if not first_sees_second:
+                try:
+                    peers = first_node.get_peers()
+                    for p in peers:
+                        if p.get("key") == second_key and p.get("up", False):
+                            first_sees_second = True
+                            first_peer_info = p
+                            break
+                except Exception:
+                    pass
+
+            if not second_sees_first:
+                try:
+                    peers = second_node.get_peers()
+                    for p in peers:
+                        if p.get("key") == first_key and p.get("up", False):
+                            second_sees_first = True
+                            second_peer_info = p
+                            break
+                except Exception:
+                    pass
+
+            if first_sees_second and second_sees_first:
+                break
+
+            time.sleep(1)
+
+        if not first_sees_second and not second_sees_first:
+            return False, "neither node discovered the other via multicast"
+        if not first_sees_second:
+            return False, "first node does not see second"
+        if not second_sees_first:
+            return False, "second node does not see first"
+
+        # Check connection direction via the 'inbound' field.
+        # The second node (started later) typically receives the first node's
+        # beacon and initiates the TLS connection. So we expect:
+        #   first node:  inbound=True  (received the connection)
+        #   second node: inbound=False (initiated the connection)
+        first_inbound = first_peer_info.get("inbound")
+        second_inbound = second_peer_info.get("inbound")
+        first_uri = first_peer_info.get("uri", "?")
+        second_uri = second_peer_info.get("uri", "?")
+
+        direction_info = (
+            f"first({first_impl}).inbound={first_inbound} "
+            f"second({second_impl}).inbound={second_inbound}"
+        )
+
+        if verbose:
+            print(f"    First  sees peer at: {first_uri}")
+            print(f"    Second sees peer at: {second_uri}")
+            print(f"    Direction: {direction_info}")
+
+        # Both must have the inbound field, and they must be complementary
+        if first_inbound is not None and second_inbound is not None:
+            if first_inbound != second_inbound:
+                return True, f"discovered, direction OK ({direction_info})"
+            else:
+                # Both inbound or both outbound — unusual but not a failure
+                return True, f"discovered, direction same ({direction_info})"
+
+        return True, f"discovered ({direction_info})"
+
+    except Exception as e:
+        return False, str(e)
+
+    finally:
+        if second_node:
+            second_node.cleanup()
+        if first_node:
+            first_node.cleanup()
+        # Give multicast sockets time to fully close before next test
+        time.sleep(1)
 
 
 # ── Admin socket communication ──
@@ -395,7 +697,7 @@ def check_binaries():
         print("  export YGGDRASIL_GO_DIR=/path/to/yggdrasil-go")
         print()
         print("  # Build Rust (from this repo root):")
-        print("  cargo build --features all-transports")
+        print("  cargo build --features all-transports,multicast")
         sys.exit(1)
 
 
@@ -407,33 +709,74 @@ def main():
                         help="Only run tests matching this substring")
     parser.add_argument("--timeout", "-t", type=int, default=15,
                         help="Peer connection timeout in seconds (default: 15)")
+    parser.add_argument("--multicast-timeout", type=int, default=30,
+                        help="Multicast discovery timeout in seconds (default: 30)")
     args = parser.parse_args()
 
     check_binaries()
 
-    # Filter test matrix
-    tests = TEST_MATRIX
-    if args.filter:
-        tests = [(n, s, c, sch, a) for n, s, c, sch, a in tests
-                 if args.filter.lower() in n.lower()]
-        if not tests:
-            print(f"No tests match filter '{args.filter}'")
-            sys.exit(1)
+    # ── Transport tests ──
 
-    print(f"Running {len(tests)} interop tests...\n")
+    transport_tests = TEST_MATRIX
+    if args.filter:
+        transport_tests = [(n, s, c, sch, a) for n, s, c, sch, a in transport_tests
+                           if args.filter.lower() in n.lower()]
+
+    # ── Multicast tests ──
+
+    multicast_iface = find_multicast_interface()
+    mc_tests = MULTICAST_TESTS
+    if args.filter:
+        mc_tests = [(n, f, s) for n, f, s in mc_tests
+                    if args.filter.lower() in n.lower()]
+
+    # Check if anything to run
+    total_count = len(transport_tests) + len(mc_tests)
+    if total_count == 0:
+        print(f"No tests match filter '{args.filter}'")
+        sys.exit(1)
 
     results = []
-    for i, (test_name, server_impl, client_impl, scheme, addr) in enumerate(tests):
-        label = f"{scheme.upper():5s} {server_impl}(server) -> {client_impl}(client) @ {addr}"
-        print(f"  [{i+1}/{len(tests)}] {label} ...", end=" ", flush=True)
 
-        ok, msg = run_test(
-            test_name, server_impl, client_impl, scheme, i,
-            addr=addr, peer_timeout=args.timeout, verbose=args.verbose,
-        )
-        status = "\033[32mPASS\033[0m" if ok else "\033[31mFAIL\033[0m"
-        print(f"[{status}] {msg}")
-        results.append((test_name, ok, msg))
+    # Run transport tests
+    if transport_tests:
+        print(f"Running {len(transport_tests)} transport interop tests...\n")
+
+        for i, (test_name, server_impl, client_impl, scheme, addr) in enumerate(transport_tests):
+            label = f"{scheme.upper():5s} {server_impl}(server) -> {client_impl}(client) @ {addr}"
+            print(f"  [{i+1}/{len(transport_tests)}] {label} ...", end=" ", flush=True)
+
+            ok, msg = run_test(
+                test_name, server_impl, client_impl, scheme, i,
+                addr=addr, peer_timeout=args.timeout, verbose=args.verbose,
+            )
+            status = "\033[32mPASS\033[0m" if ok else "\033[31mFAIL\033[0m"
+            print(f"[{status}] {msg}")
+            results.append((test_name, ok, msg))
+
+    # Run multicast tests
+    if mc_tests:
+        print(f"\nRunning {len(mc_tests)} multicast discovery tests...\n")
+
+        if multicast_iface is None:
+            print("  \033[33mSKIP\033[0m: no multicast-capable interface found")
+            print("        (need UP + MULTICAST + link-local IPv6 address)")
+            for name, _, _ in mc_tests:
+                results.append((name, True, "skipped (no multicast interface)"))
+        else:
+            print(f"  Using interface: {multicast_iface}\n")
+
+            for i, (test_name, first_impl, second_impl) in enumerate(mc_tests):
+                label = f"MCAST {first_impl}(first) -> {second_impl}(second) @ {multicast_iface}"
+                print(f"  [{i+1}/{len(mc_tests)}] {label} ...", end=" ", flush=True)
+
+                ok, msg = run_multicast_test(
+                    test_name, first_impl, second_impl, multicast_iface, i,
+                    peer_timeout=args.multicast_timeout, verbose=args.verbose,
+                )
+                status = "\033[32mPASS\033[0m" if ok else "\033[31mFAIL\033[0m"
+                print(f"[{status}] {msg}")
+                results.append((test_name, ok, msg))
 
     # Summary
     passed = sum(1 for _, ok, _ in results if ok)

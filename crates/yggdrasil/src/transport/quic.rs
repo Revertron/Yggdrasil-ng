@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::links::LinkOptions;
-use super::{bare_host, Transport, TransportListener, TransportStream};
+use super::{apply_scope_id, bare_host, Transport, TransportListener, TransportStream};
 
 /// QUIC transport matching yggdrasil-go's link_quic.go behavior.
 ///
@@ -58,7 +58,7 @@ impl Transport for QuicTransport {
     async fn dial(
         &self,
         url: &Url,
-        _options: &LinkOptions,
+        options: &LinkOptions,
     ) -> Result<TransportStream, String> {
         let host = bare_host(url)?;
         let port = url
@@ -77,9 +77,12 @@ impl Transport for QuicTransport {
         addrs.sort_unstable();
         addrs.dedup();
 
-        let (v6_addrs, v4_addrs): (Vec<_>, Vec<_>) = addrs.into_iter().partition(|a| a.is_ipv6());
+        let (v6_addrs, v4_addrs): (Vec<_>, Vec<_>) = addrs.clone().into_iter().partition(|a| a.is_ipv6());
         let mut attempt_addrs = v6_addrs.clone();
         attempt_addrs.extend(v4_addrs.clone());
+
+        // Fix up scope_id for link-local IPv6 addresses (multicast discovery)
+        apply_scope_id(&mut addrs, options.scope_id);
 
         // Build client config (shared across attempts)
         let rustls_config = self.client_config.read().await.clone();

@@ -13,6 +13,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use crate::transport::{format_socket_addr_for_uri, parse_url_with_zone_id};
+
 use crate::core::Core;
 use crate::transport::Transport;
 use crate::version::Metadata;
@@ -44,6 +46,10 @@ pub struct LinkOptions {
     pub priority: u8,
     pub password: Vec<u8>,
     pub max_backoff: Duration,
+    /// IPv6 scope ID for link-local addresses. When non-zero, transports will
+    /// set this on resolved `SocketAddrV6` addresses before connecting. This is
+    /// needed because the `url` crate doesn't support IPv6 zone IDs (`%25`).
+    pub scope_id: u32,
 }
 
 impl Default for LinkOptions {
@@ -53,6 +59,7 @@ impl Default for LinkOptions {
             priority: 0,
             password: Vec::new(),
             max_backoff: DEFAULT_BACKOFF_LIMIT,
+            scope_id: 0,
         }
     }
 }
@@ -520,12 +527,16 @@ impl Links {
     }
 
     /// Start listening on an address (e.g. "tcp://0.0.0.0:1234", "quic://[::]:4321").
-    pub async fn listen(&mut self, addr: &str) -> Result<(), String> {
-        let url = Url::parse(addr).map_err(|e| format!("invalid URL: {}", e))?;
+    /// Returns the actual bound socket address (useful when port 0 is requested).
+    pub async fn listen(&mut self, addr: &str) -> Result<SocketAddr, String> {
+        let (url, zone_scope_id) = parse_url_with_zone_id(addr)?;
         let scheme = url.scheme().to_string();
         let transport = self.get_transport(&scheme)?;
 
-        let options = parse_link_options(&url)?;
+        let mut options = parse_link_options(&url)?;
+        if zone_scope_id != 0 {
+            options.scope_id = zone_scope_id;
+        }
         let core = self.core()?;
         let active = self.active.clone();
         let cancel = CancellationToken::new();
@@ -568,7 +579,7 @@ impl Links {
                                 let core = core.clone();
                                 let opts = options.clone();
                                 let active = active.clone();
-                                let remote_str = format!("{}://{}", scheme_clone, ts.remote_addr);
+                                let remote_str = format!("{}://{}", scheme_clone, format_socket_addr_for_uri(&ts.remote_addr));
 
                                 tokio::spawn(async move {
                                     let _ = handle_connection(
@@ -597,7 +608,7 @@ impl Links {
         });
 
         self.listeners.insert(addr_str, (cancel, handle));
-        Ok(())
+        Ok(actual_addr)
     }
 
     /// Add a persistent peer to connect to.
@@ -606,7 +617,7 @@ impl Links {
             return Err("peer already exists".to_string());
         }
 
-        let url = Url::parse(uri).map_err(|e| format!("invalid URI: {}", e))?;
+        let (url, zone_scope_id) = parse_url_with_zone_id(uri)?;
         let scheme = url.scheme().to_string();
         let transport = self.get_transport(&scheme)?;
 
@@ -633,7 +644,10 @@ impl Links {
         let primary_addr = resolved_addrs.first().ok_or("failed to resolve address")?;
         let addr_key = primary_addr.to_string();
 
-        let options = parse_link_options(&url)?;
+        let mut options = parse_link_options(&url)?;
+        if zone_scope_id != 0 {
+            options.scope_id = zone_scope_id;
+        }
         let core = self.core()?;
         let active = self.active.clone();
         let cancel = CancellationToken::new();
@@ -698,6 +712,47 @@ impl Links {
 
         self.peers.insert(uri.to_string(), PeerEntry { cancel, handle });
         self.peer_addrs.insert(addr_key, uri.to_string());
+        Ok(())
+    }
+
+    /// Call a peer once (ephemeral connection, no reconnect on disconnect).
+    /// Used by multicast discovery — the connection is one-shot and exits when
+    /// the peer disconnects or the dial fails.
+    pub async fn call_peer(&mut self, uri: &str, _sintf: &str) -> Result<(), String> {
+        let (url, zone_scope_id) = parse_url_with_zone_id(uri)?;
+        let scheme = url.scheme().to_string();
+        let transport = self.get_transport(&scheme)?;
+        let mut options = parse_link_options(&url)?;
+        if zone_scope_id != 0 {
+            options.scope_id = zone_scope_id;
+        }
+        let core = self.core()?;
+        let active = self.active.clone();
+        let uri_owned = uri.to_string();
+
+        // One-shot connection attempt — no retry loop
+        tokio::spawn(async move {
+            match transport.dial(&url, &options).await {
+                Ok(ts) => {
+                    let uri_ref: &str = &uri_owned;
+                    if let Err(e) = handle_connection(
+                        LinkType::Ephemeral,
+                        options,
+                        ts.stream,
+                        ts.remote_addr,
+                        &core,
+                        &active,
+                        uri_ref,
+                    ).await {
+                        tracing::debug!("Ephemeral connection to {} ended: {}", uri_owned, e);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Ephemeral call to {} failed: {}", uri_owned, e);
+                }
+            }
+        });
+
         Ok(())
     }
 
@@ -946,6 +1001,11 @@ fn parse_link_options(url: &Url) -> Result<LinkOptions, String> {
                     ));
                 }
                 opts.max_backoff = dur;
+            }
+            "scope_id" => {
+                opts.scope_id = value
+                    .parse()
+                    .map_err(|e| format!("invalid scope_id: {}", e))?;
             }
             _ => {}
         }

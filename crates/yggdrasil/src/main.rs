@@ -175,6 +175,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Start multicast discovery (if compiled with the feature and configured)
+    #[cfg(feature = "multicast")]
+    let _multicast = {
+        if config.multicast_interfaces.is_empty() {
+            tracing::debug!("Multicast discovery disabled (no interfaces configured)");
+            None
+        } else {
+            match yggdrasil::multicast::Multicast::new(
+                core.clone(),
+                config.multicast_interfaces.clone(),
+            ).await {
+                Ok(mc) => {
+                    mc.start().await;
+                    // Register admin handler for getMulticastInterfaces
+                    let mc_clone = mc.clone();
+                    core.set_multicast_admin(Box::new(move || {
+                        let mc = mc_clone.clone();
+                        Box::pin(async move {
+                            let ifaces = mc.get_interfaces().await;
+                            let json: Vec<serde_json::Value> = ifaces.iter().map(|i| {
+                                serde_json::json!({
+                                    "name": i.name,
+                                    "address": i.address,
+                                    "beacon": i.beacon,
+                                    "listen": i.listen,
+                                    "password": i.password,
+                                })
+                            }).collect();
+                            serde_json::json!({ "multicast_interfaces": json })
+                        })
+                    }));
+                    tracing::info!("Multicast discovery started");
+                    Some(mc)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to start multicast discovery: {}", e);
+                    None
+                }
+            }
+        }
+    };
+
     // Start admin socket
     let _admin = match AdminSocket::new(&config.admin_listen, core.clone()).await {
         Ok(admin) => Some(admin),
@@ -190,6 +232,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Shutting down...");
 
     // Cleanup
+    #[cfg(feature = "multicast")]
+    if let Some(mc) = &_multicast {
+        mc.stop().await;
+    }
     if let Some(admin) = &_admin {
         admin.close();
     }
