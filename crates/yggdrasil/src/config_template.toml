@@ -9,16 +9,15 @@
 private_key = "{{PRIVATE_KEY}}"
 
 # List of connection strings for outbound peer connections in URI format,
-# e.g. tcp://a.b.c.d:e, tls://a.b.c.d:e, quic://a.b.c.d:e, etc.
-# NOTE: Now Yggdrasil-ng supports only TCP connections.
+# e.g. tcp://a.b.c.d:e, tls://a.b.c.d:e, quic://a.b.c.d:e,
+#      ws://a.b.c.d:e/path, wss://a.b.c.d:e/path
 # You can find public peers at https://publicpeers.neilalexander.dev/
 peers = []
 
 # Listen addresses for inbound connections. You'll need to add port
 # forwarding for these ports if you are behind a NAT/firewall.
-# e.g. tcp://[::]:12345, tls://[::]:12345
-# NOTE: Now Yggdrasil-ng supports only TCP connections.
-listen = ["tcp://0.0.0.0:0"]
+# e.g. tls://[::]:12345, tcp://[::]:12345, quic://[::]:12345
+listen = ["tls://[::]:0"]
 
 # Listen address for the admin socket.
 # This is used by yggdrasilctl to query and control the node.
@@ -26,8 +25,9 @@ listen = ["tcp://0.0.0.0:0"]
 admin_listen = "tcp://localhost:9001"
 
 # Name of the TUN interface to use.
-# "auto" = automatically assign a name.
+# "auto" = automatically assign a name (ygg0 on Linux/macOS, tun0 on FreeBSD).
 # "none" = disable the TUN interface (useful for router-only nodes).
+# On FreeBSD, the name must start with "tun" (e.g. "tun0", "tun2").
 if_name = "auto"
 
 # Maximum Transmission Unit (MTU) for the TUN interface.
@@ -43,3 +43,31 @@ if_mtu = 65535
 # List of allowed public keys (hex-encoded). If non-empty, only peers with
 # these public keys will be allowed to connect. Leave empty to allow all peers.
 # allowed_public_keys = []
+
+# Multicast interface patterns for automatic local peer discovery.
+# Peers on the same LAN segment will find each other via IPv6 multicast
+# beacons without needing manual peering configuration.
+#
+# If omitted, platform-specific defaults are used:
+#   macOS:           en.*, bridge.*
+#   Linux/FreeBSD:   .*
+#
+# Each entry can have the following fields:
+#   regex    - regex pattern to match interface names (default: ".*")
+#   beacon   - send multicast beacons on matching interfaces (default: true)
+#   listen   - listen for multicast beacons on matching interfaces (default: true)
+#   port     - override TLS listen port for this interface, 0 = auto (default: 0)
+#   priority - link priority for peers discovered on this interface (default: 0)
+#   password - shared password for beacon authentication (default: "")
+#
+# Example:
+# [[multicast_interfaces]]
+# regex = "en.*"
+# beacon = true
+# listen = true
+#
+# [[multicast_interfaces]]
+# regex = "wg.*"
+# beacon = false
+# listen = true
+# priority = 2

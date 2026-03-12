@@ -38,6 +38,8 @@ impl TunAdapter {
         let tun_name = if name == "auto" {
             if cfg!(windows) {
                 "Yggdrasil"
+            } else if cfg!(target_os = "freebsd") || cfg!(target_os = "openbsd") {
+                "tun0"
             } else {
                 "ygg0"
             }

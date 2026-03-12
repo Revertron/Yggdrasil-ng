@@ -22,6 +22,9 @@ pub type PathNotifySlot = Arc<std::sync::Mutex<Option<Arc<ReadWriteCloser>>>>;
 
 /// Core wraps an ironwood EncryptedPacketConn with session type handling
 /// and TCP link management.
+/// Callback type for multicast admin queries (set by multicast module if enabled).
+pub type MulticastAdminFn = Box<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = serde_json::Value> + Send>> + Send + Sync>;
+
 pub struct Core {
     pub(crate) inner: Arc<EncryptedPacketConn>,
     pub(crate) links: Mutex<Links>,
@@ -38,6 +41,8 @@ pub struct Core {
     pub(crate) tls_client_config: Arc<RwLock<Arc<rustls::ClientConfig>>>,
     pub(crate) tls_cert_expiry: Arc<RwLock<time::OffsetDateTime>>,
     proto_tx: mpsc::Sender<(Addr, Vec<u8>)>,
+    /// Optional callback for multicast admin queries (set by multicast module).
+    pub(crate) multicast_admin: std::sync::Mutex<Option<MulticastAdminFn>>,
 }
 
 impl Core {
@@ -122,6 +127,7 @@ impl Core {
             tls_client_config,
             tls_cert_expiry,
             proto_tx,
+            multicast_admin: std::sync::Mutex::new(None),
         });
 
         // Spawn TLS certificate renewal task
@@ -267,6 +273,24 @@ impl Core {
         links.set_core(self.clone());
     }
 
+    /// Register a callback for multicast admin queries.
+    pub fn set_multicast_admin(&self, handler: MulticastAdminFn) {
+        let mut slot = self.multicast_admin.lock().unwrap();
+        *slot = Some(handler);
+    }
+
+    /// Query multicast interface state (returns None if multicast is not enabled).
+    pub async fn get_multicast_interfaces(&self) -> Option<serde_json::Value> {
+        let handler = {
+            let slot = self.multicast_admin.lock().unwrap();
+            slot.as_ref().map(|h| h())
+        };
+        match handler {
+            Some(fut) => Some(fut.await),
+            None => None,
+        }
+    }
+
     /// Close the core and all links.
     pub async fn close(&self) -> Result<(), ironwood::Error> {
         {
@@ -281,8 +305,9 @@ impl Core {
         let config = self.config.clone();
 
         for addr in &config.listen {
-            if let Err(e) = self.listen(addr).await {
-                tracing::error!("Failed to listen on {}: {}", addr, e);
+            match self.listen(addr).await {
+                Ok(bound) => tracing::debug!("Listener {} bound to {}", addr, bound),
+                Err(e) => tracing::error!("Failed to listen on {}: {}", addr, e),
             }
         }
 
@@ -294,7 +319,8 @@ impl Core {
     }
 
     /// Start listening on the given address.
-    pub async fn listen(&self, addr: &str) -> Result<(), String> {
+    /// Returns the actual bound socket address.
+    pub async fn listen(&self, addr: &str) -> Result<std::net::SocketAddr, String> {
         let mut links = self.links.lock().await;
         links.listen(addr).await
     }
@@ -309,6 +335,19 @@ impl Core {
     pub async fn remove_peer(&self, uri: &str) -> Result<(), String> {
         let mut links = self.links.lock().await;
         links.remove_peer(uri).await
+    }
+
+    /// Call a peer once (ephemeral, no reconnect). Used by multicast discovery.
+    pub async fn call_peer(&self, uri: &str, sintf: &str) -> Result<(), String> {
+        let mut links = self.links.lock().await;
+        links.call_peer(uri, sintf).await
+    }
+
+    /// Start listening on a local address and return the actual bound socket address.
+    /// Used by multicast to create per-interface TLS listeners.
+    pub async fn listen_local(&self, addr: &str) -> Result<std::net::SocketAddr, String> {
+        let mut links = self.links.lock().await;
+        links.listen(addr).await
     }
 
     /// Wake all sleeping peer reconnect loops so they retry immediately.

@@ -22,10 +22,10 @@ This project aims to provide a lightweight, self-arranging, and secure mesh netw
 - Admin socket API (getSelf, getPeers, getTree)
 - Session cleanup and timeout handling
 - Optimized Ed25519→Curve25519 key conversion
+- Additional transports: TLS, QUIC, WebSocket (features websocket and quic or all-transports)
+- Multicast peer discovery on local networks (feature multicast)
 
 **⏳ Planned Features:**
-- Additional transports: TLS, QUIC, WebSocket
-- Multicast peer discovery on local networks
 - More admin API endpoints (DHT, sessions, detailed stats)
 - Mobile platform support (Android, iOS)
 - Performance optimizations and protocol improvements
@@ -260,14 +260,13 @@ location = "datacenter-1"
   - `node_info` instead of `NodeInfo`
   - `node_info_privacy` instead of `NodeInfoPrivacy`
   - `allowed_public_keys` instead of `AllowedPublicKeys`
-- **Transport support**: Currently only TCP (TLS, QUIC, WebSocket coming later)
+- **Transport support**: Currently TCP, TLS, QUIC, WebSocket
 - **Admin socket**: Defaults to TCP `localhost:9001` instead of Unix socket
 
 **Migration from Go config:**
 1. Convert HJSON/JSON to TOML format
 2. Rename all fields from PascalCase to snake_case
-3. Change transport URIs to TCP-only (remove `tls://`, `quic://`, etc.)
-4. Update admin socket to TCP format if using Unix socket
+3. Update admin socket to TCP format if using Unix socket
 
 ## Development
 
