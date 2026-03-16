@@ -206,6 +206,11 @@ impl crate::types::PacketConn for PacketConnImpl {
         // Create writer channel and cancellation token for this peer
         let (writer_tx, writer_rx) = mpsc::channel(PEER_WRITER_CHANNEL_SIZE);
         let peer_cancel = CancellationToken::new();
+        // Ensure peer_cancel is canceled if this future is dropped. Without this,
+        // peer_writer keeps the old TCP write-half alive indefinitely — the stale peer
+        // is never removed from the router, poisoning bloom-filter path lookups for
+        // minutes or hours after a peer switch.
+        let _cancel_on_drop = peer_cancel.clone().drop_guard();
 
         // Allocate the peer in the peers manager
         let handle = {
@@ -215,6 +220,7 @@ impl crate::types::PacketConn for PacketConnImpl {
 
         let peer_id = handle.id;
         let entry = handle.to_entry();
+        let port = handle.port;
         let traffic_queue = handle.traffic_queue.clone();
 
         // Register with router and get initial actions
@@ -242,9 +248,16 @@ impl crate::types::PacketConn for PacketConnImpl {
         let writer_cancel = peer_cancel.clone();
         let _writer_handle = tokio::spawn(peer_writer(
             peer_id,
+            peer_key,
+            port,
             writer_rx,
             write_half,
             traffic_queue,
+            self.router.clone(),
+            self.peers.clone(),
+            self.delivery_queue.clone(),
+            self.traffic_tx.clone(),
+            self.path_notify_cb.clone(),
             self.config.peer_keepalive_delay,
             self.config.peer_timeout,
             read_deadline.clone(),

@@ -397,6 +397,28 @@ impl ActiveLinks {
         }
     }
 
+    /// Remove all active connections whose URI matches `uri`.
+    /// Called by `remove_peer` to clean up entries that the aborted reconnect
+    /// task can no longer clean up itself (task abort skips the `unregister` call).
+    pub async fn unregister_by_uri(&self, uri: &str) {
+        let ids_and_keys: Vec<(u64, [u8; 32])> = {
+            let inner = self.inner.lock().await;
+            inner.connections.iter()
+                .filter(|(_, c)| c.uri == uri)
+                .map(|(id, c)| (*id, c.key))
+                .collect()
+        };
+        {
+            let mut inner = self.inner.lock().await;
+            for (id, _) in &ids_and_keys {
+                inner.connections.remove(id);
+            }
+        }
+        for (_, key) in ids_and_keys {
+            let _ = self.peer_tx.send(PeerEvent::Disconnected { key });
+        }
+    }
+
     /// Update rate counters for all connections (call every ~1 second).
     pub async fn update_rates(&self) {
         let mut inner = self.inner.lock().await;
@@ -796,6 +818,11 @@ impl Links {
         if let Some(entry) = self.peers.remove(uri) {
             entry.cancel.cancel();
             entry.handle.abort();
+
+            // The reconnect task is cancelled at `handle_conn().await`, which means
+            // the `active.unregister(conn_id)` line after it never runs.  Clean up
+            // the active_links entry here so the peer disappears from get_peers_json.
+            self.active.unregister_by_uri(uri).await;
 
             // Also remove from peer_addrs map
             self.peer_addrs.retain(|_, v| v != uri);

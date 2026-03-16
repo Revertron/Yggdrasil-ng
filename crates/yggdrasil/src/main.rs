@@ -176,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Start admin socket
-    let _admin = match AdminSocket::new(&config.admin_listen, core.clone()).await {
+    let admin = match AdminSocket::new(&config.admin_listen, core.clone()).await {
         Ok(admin) => Some(admin),
         Err(e) => {
             tracing::warn!("Failed to start admin socket: {}", e);
@@ -190,7 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Shutting down...");
 
     // Cleanup
-    if let Some(admin) = &_admin {
+    if let Some(admin) = &admin {
         admin.close();
     }
     core.close().await.ok();

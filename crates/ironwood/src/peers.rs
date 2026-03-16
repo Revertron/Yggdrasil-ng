@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bloom::BloomFilter;
 use crate::crypto::{Crypto, PublicKey};
 use crate::router::{PeerId, PeerEntry, Router, RouterAction, RouterAnnounce};
-use crate::traffic::{PacketQueue, TrafficPacket};
+use crate::traffic::{DeliveryQueue, PacketQueue, TrafficPacket};
 use crate::types::Error;
 use crate::wire::{self, PeerPort};
 
@@ -724,9 +724,16 @@ async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
 /// - Cancel keepalive timer when sending any frame
 pub(crate) async fn peer_writer(
     peer_id: PeerId,
+    peer_key: PublicKey,
+    port: PeerPort,
     mut rx: mpsc::Receiver<PeerMessage>,
     conn_write: impl tokio::io::AsyncWrite + Unpin + Send,
     traffic_queue: Arc<tokio::sync::Mutex<PacketQueue>>,
+    router: Arc<tokio::sync::Mutex<Router>>,
+    peers: Arc<tokio::sync::Mutex<Peers>>,
+    delivery_queue: Arc<DeliveryQueue>,
+    traffic_tx: mpsc::Sender<TrafficPacket>,
+    path_notify_cb: Option<Arc<dyn Fn(PublicKey) + Send + Sync>>,
     _keepalive_delay: Duration,
     peer_timeout: Duration,
     read_deadline: ReadDeadline,
@@ -865,6 +872,21 @@ pub(crate) async fn peer_writer(
     }
 
     cancel.cancel();
+
+    // Remove the stale peer from the router and peer manager.
+    {
+        let mut router_guard = router.lock().await;
+        let actions = router_guard.remove_peer(peer_id, peer_key, port);
+        drop(router_guard);
+
+        let mut peers_guard = peers.lock().await;
+        peers_guard.remove_peer(peer_id, &peer_key);
+        drop(peers_guard);
+
+        if !actions.is_empty() {
+            dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
+        }
+    }
 }
 
 /// Peek at the packet type of an encoded frame (uvarint length + type byte).

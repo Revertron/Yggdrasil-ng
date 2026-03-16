@@ -22,7 +22,10 @@ use self::crypto::{ed25519_private_to_curve25519, CurvePrivateKey};
 use self::session::{OutAction, SessionManager, SESSION_TRAFFIC_OVERHEAD};
 
 /// Channel capacity for delivering decrypted traffic to readers.
-const RECV_CHANNEL_SIZE: usize = 64;
+/// Must be large enough to absorb bursts without blocking the decrypt loop,
+/// otherwise backpressure propagates to ironwood's delivery queue which drops
+/// packets older than 25 ms.
+const RECV_CHANNEL_SIZE: usize = 512;
 
 /// Decrypted incoming message.
 struct DecryptedMessage {
@@ -288,7 +291,7 @@ impl crate::types::PacketConn for EncryptedPacketConn {
         for action in actions {
             match action {
                 OutAction::SendToInner { dest, data } => {
-                    let _ = self.inner.write_to(&data, &Addr(dest)).await;
+                    self.inner.write_to(&data, &Addr(dest)).await?;
                 }
                 OutAction::Deliver { source, data } => {
                     let msg = DecryptedMessage { source, data };
