@@ -613,7 +613,7 @@ mod tests {
         // Print raw bitset
         let raw = filter.as_raw();
         let non_zero: Vec<_> = raw.iter().enumerate()
-            .filter(|(_, &v)| v != 0)
+            .filter(|&(_, v)| *v != 0)
             .map(|(i, v)| (i, *v))
             .collect();
         println!("Non-zero chunks: {:?}", non_zero);
