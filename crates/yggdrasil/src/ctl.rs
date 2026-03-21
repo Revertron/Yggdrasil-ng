@@ -1,4 +1,3 @@
-use comfy_table::{presets, Table};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -96,73 +95,55 @@ pub async fn run_ctl(
                 if peers.is_empty() {
                     println!("No peers connected.");
                 } else {
-                    let mut table = Table::new();
-                    table.load_preset(presets::NOTHING);
-                    table.set_header(vec![
+                    let header = vec![
                         "URI", "State", "Dir", "IP Address", "Latency", "Cost",
-                        "Uptime", "RX", "TX", "RX Rate", "TX Rate", "Pr", "Last Error"
-                    ]);
-
-                    for peer in peers {
-                        let uri = peer.get("uri")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("-");
-                        let up = peer.get("up")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let state = if up { "Up" } else { "Down" };
-                        let inbound = peer.get("inbound")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let dir = if inbound { "In" } else { "Out" };
-                        let address = peer.get("address")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("-");
+                        "Uptime", "RX", "TX", "RX Rate", "TX Rate", "Pr", "Last Error",
+                    ];
+                    let rows: Vec<Vec<String>> = peers.iter().map(|peer| {
+                        let uri = json_str(peer, "uri");
+                        let up = peer.get("up").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let state = if up { "Up" } else { "Down" }.into();
+                        let inbound = peer.get("inbound").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let dir: String = if inbound { "In" } else { "Out" }.into();
+                        let address = json_str(peer, "address");
                         let latency = peer.get("latency")
                             .and_then(|v| v.as_f64())
-                            .map(|ms| if ms > 0.0 { format!("{:.1}ms", ms) } else { "-".to_string() })
-                            .unwrap_or_else(|| "-".to_string());
+                            .map(|ms| if ms > 0.0 { format!("{:.1}ms", ms) } else { "-".into() })
+                            .unwrap_or_else(|| "-".into());
                         let cost = peer.get("cost")
                             .and_then(|v| v.as_u64())
-                            .map(|c| if c > 0 { c.to_string() } else { "-".to_string() })
-                            .unwrap_or_else(|| "-".to_string());
+                            .map(|c| if c > 0 { c.to_string() } else { "-".into() })
+                            .unwrap_or_else(|| "-".into());
                         let uptime = peer.get("uptime")
                             .and_then(|v| v.as_f64())
                             .map(format_uptime)
-                            .unwrap_or_else(|| "-".to_string());
+                            .unwrap_or_else(|| "-".into());
                         let rx_bytes = peer.get("bytes_recvd")
                             .and_then(|v| v.as_u64())
                             .map(format_bytes)
-                            .unwrap_or_else(|| "-".to_string());
+                            .unwrap_or_else(|| "-".into());
                         let tx_bytes = peer.get("bytes_sent")
                             .and_then(|v| v.as_u64())
                             .map(format_bytes)
-                            .unwrap_or_else(|| "-".to_string());
+                            .unwrap_or_else(|| "-".into());
                         let rx_rate = peer.get("rx_rate")
                             .and_then(|v| v.as_u64())
-                            .map(|r| if r > 0 { format!("{}/s", format_bytes(r)) } else { "-".to_string() })
-                            .unwrap_or_else(|| "-".to_string());
+                            .map(|r| if r > 0 { format!("{}/s", format_bytes(r)) } else { "-".into() })
+                            .unwrap_or_else(|| "-".into());
                         let tx_rate = peer.get("tx_rate")
                             .and_then(|v| v.as_u64())
-                            .map(|r| if r > 0 { format!("{}/s", format_bytes(r)) } else { "-".to_string() })
-                            .unwrap_or_else(|| "-".to_string());
+                            .map(|r| if r > 0 { format!("{}/s", format_bytes(r)) } else { "-".into() })
+                            .unwrap_or_else(|| "-".into());
                         let priority = peer.get("priority")
                             .and_then(|v| v.as_u64())
                             .map(|p| p.to_string())
-                            .unwrap_or_else(|| "-".to_string());
-                        let last_error = peer.get("last_error")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or("-");
-
-                        table.add_row(vec![
-                            uri, state, dir, address, &latency, &cost,
-                            &uptime, &rx_bytes, &tx_bytes,
-                            &rx_rate, &tx_rate, &priority, last_error
-                        ]);
-                    }
-
-                    println!("{}", table);
+                            .unwrap_or_else(|| "-".into());
+                        let last_error = json_str(peer, "last_error");
+                        let last_error = if last_error.is_empty() { "-".into() } else { last_error };
+                        vec![uri, state, dir, address, latency, cost, uptime,
+                             rx_bytes, tx_bytes, rx_rate, tx_rate, priority, last_error]
+                    }).collect();
+                    print_table(&header, &rows);
                 }
             }
         }
@@ -172,29 +153,16 @@ pub async fn run_ctl(
                 if tree.is_empty() {
                     println!("No tree entries.");
                 } else {
-                    let mut table = Table::new();
-                    table.load_preset(presets::NOTHING);
-                    table.set_header(vec!["Public Key", "IP Address", "Parent", "Sequence"]);
-
-                    for entry in tree {
-                        let key = entry.get("key")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("-");
-                        let address = entry.get("address")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("-");
-                        let parent = entry.get("parent")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("-");
-                        let sequence = entry.get("sequence")
-                            .and_then(|v| v.as_u64())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| "-".to_string());
-
-                        table.add_row(vec![key, address, parent, &sequence]);
-                    }
-
-                    println!("{}", table);
+                    let header = vec!["Public Key", "IP Address", "Parent", "Sequence"];
+                    let rows: Vec<Vec<String>> = tree.iter().map(|entry| {
+                        vec![
+                            json_str(entry, "key"),
+                            json_str(entry, "address"),
+                            json_str(entry, "parent"),
+                            json_u64(entry, "sequence"),
+                        ]
+                    }).collect();
+                    print_table(&header, &rows);
                 }
             }
         }
@@ -204,17 +172,8 @@ pub async fn run_ctl(
                 if paths.is_empty() {
                     println!("No cached paths.");
                 } else {
-                    let mut table = Table::new();
-                    table.load_preset(presets::NOTHING);
-                    table.set_header(vec!["Public Key", "IP Address", "Path", "Sequence"]);
-
-                    for entry in paths {
-                        let key = entry.get("key")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("-");
-                        let address = entry.get("address")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("-");
+                    let header = vec!["Public Key", "IP Address", "Path", "Sequence"];
+                    let rows: Vec<Vec<String>> = paths.iter().map(|entry| {
                         let path = entry.get("path")
                             .and_then(|v| v.as_array())
                             .map(|arr| {
@@ -224,16 +183,15 @@ pub async fn run_ctl(
                                     .collect::<Vec<_>>()
                                     .join(",")
                             })
-                            .unwrap_or_else(|| "-".to_string());
-                        let sequence = entry.get("sequence")
-                            .and_then(|v| v.as_u64())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| "-".to_string());
-
-                        table.add_row(vec![key, address, &path, &sequence]);
-                    }
-
-                    println!("{}", table);
+                            .unwrap_or_else(|| "-".into());
+                        vec![
+                            json_str(entry, "key"),
+                            json_str(entry, "address"),
+                            path,
+                            json_u64(entry, "sequence"),
+                        ]
+                    }).collect();
+                    print_table(&header, &rows);
                 }
             }
         }
@@ -243,34 +201,8 @@ pub async fn run_ctl(
                 if sessions.is_empty() {
                     println!("No active sessions.");
                 } else {
-                    let mut table = Table::new();
-                    table.load_preset(presets::NOTHING);
-                    table.set_header(vec!["Public Key", "IP Address", "Uptime", "RX", "TX"]);
-
-                    for entry in sessions {
-                        let key = entry.get("key")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("-");
-                        let address = entry.get("address")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("-");
-                        let uptime = entry.get("uptime")
-                            .and_then(|v| v.as_f64())
-                            .map(format_uptime)
-                            .unwrap_or_else(|| "-".to_string());
-                        let rx_bytes = entry.get("bytes_recvd")
-                            .and_then(|v| v.as_u64())
-                            .map(format_bytes)
-                            .unwrap_or_else(|| "-".to_string());
-                        let tx_bytes = entry.get("bytes_sent")
-                            .and_then(|v| v.as_u64())
-                            .map(format_bytes)
-                            .unwrap_or_else(|| "-".to_string());
-
-                        table.add_row(vec![key, address, &uptime, &rx_bytes, &tx_bytes]);
-                    }
-
-                    println!("{}", table);
+                    let header = vec!["Public Key", "IP Address", "Uptime", "RX", "TX"];
+                    print_table(&header, &session_rows(sessions));
                 }
             }
         }
@@ -284,7 +216,6 @@ pub async fn run_ctl(
         }
 
         "getdebug" => {
-            // Routing internals summary
             print_kv(response, &[
                 ("Tree nodes known",      "tree_node_count"),
                 ("Routing peers",         "routing_peer_count"),
@@ -297,52 +228,35 @@ pub async fn run_ctl(
                 ("RX queue bytes",        "delivery_queue_bytes"),
             ]);
 
-            // Down peers
             if let Some(down) = response.get("peers_down").and_then(|v| v.as_array()) {
                 if !down.is_empty() {
                     println!("\n  Down peers:");
                     for p in down {
-                        let uri = p.get("uri").and_then(|v| v.as_str()).unwrap_or("-");
-                        let err = p.get("last_error").and_then(|v| v.as_str()).unwrap_or("");
+                        let uri = json_str(p, "uri");
+                        let err = json_str(p, "last_error");
                         println!("    {} ({})", uri, err);
                     }
                 }
             }
 
-            // Peer latencies
             if let Some(lats) = response.get("peer_latencies").and_then(|v| v.as_array()) {
                 if !lats.is_empty() {
                     println!("\n  Peer latencies:");
-                    let mut table = Table::new();
-                    table.load_preset(presets::NOTHING);
-                    table.set_header(vec!["Key", "IP Address", "Latency"]);
-                    for p in lats {
-                        let key = p.get("key").and_then(|v| v.as_str()).unwrap_or("-");
-                        let addr = p.get("address").and_then(|v| v.as_str()).unwrap_or("-");
+                    let header = vec!["Key", "IP Address", "Latency"];
+                    let rows: Vec<Vec<String>> = lats.iter().map(|p| {
                         let ms = p.get("latency_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        let lat_str = if ms > 0.0 { format!("{:.1} ms", ms) } else { "n/a".to_string() };
-                        table.add_row(vec![key, addr, &lat_str]);
-                    }
-                    println!("{}", table);
+                        let lat = if ms > 0.0 { format!("{:.1} ms", ms) } else { "n/a".into() };
+                        vec![json_str(p, "key"), json_str(p, "address"), lat]
+                    }).collect();
+                    print_table(&header, &rows);
                 }
             }
 
-            // Sessions
             if let Some(sessions) = response.get("sessions").and_then(|v| v.as_array()) {
                 if !sessions.is_empty() {
                     println!("\n  Active sessions:");
-                    let mut table = Table::new();
-                    table.load_preset(presets::NOTHING);
-                    table.set_header(vec!["Key", "IP Address", "Uptime", "RX", "TX"]);
-                    for s in sessions {
-                        let key = s.get("key").and_then(|v| v.as_str()).unwrap_or("-");
-                        let addr = s.get("address").and_then(|v| v.as_str()).unwrap_or("-");
-                        let uptime = s.get("uptime").and_then(|v| v.as_f64()).map(format_uptime).unwrap_or_else(|| "-".to_string());
-                        let rx = s.get("bytes_recvd").and_then(|v| v.as_u64()).map(format_bytes).unwrap_or_else(|| "-".to_string());
-                        let tx = s.get("bytes_sent").and_then(|v| v.as_u64()).map(format_bytes).unwrap_or_else(|| "-".to_string());
-                        table.add_row(vec![key, addr, &uptime, &rx, &tx]);
-                    }
-                    println!("{}", table);
+                    let header = vec!["Key", "IP Address", "Uptime", "RX", "TX"];
+                    print_table(&header, &session_rows(sessions));
                 } else {
                     println!("\n  No active sessions.");
                 }
@@ -350,12 +264,82 @@ pub async fn run_ctl(
         }
 
         _ => {
-            // Generic: print the response as pretty JSON
             println!("{}", serde_json::to_string_pretty(response)?);
         }
     }
 
     Ok(())
+}
+
+fn session_rows(sessions: &[serde_json::Value]) -> Vec<Vec<String>> {
+    sessions.iter().map(|s| {
+        let uptime = s.get("uptime").and_then(|v| v.as_f64())
+            .map(format_uptime).unwrap_or_else(|| "-".into());
+        let rx = s.get("bytes_recvd").and_then(|v| v.as_u64())
+            .map(format_bytes).unwrap_or_else(|| "-".into());
+        let tx = s.get("bytes_sent").and_then(|v| v.as_u64())
+            .map(format_bytes).unwrap_or_else(|| "-".into());
+        vec![json_str(s, "key"), json_str(s, "address"), uptime, rx, tx]
+    }).collect()
+}
+
+/// Print rows as space-aligned columns with no borders or padding.
+fn print_table(header: &[&str], rows: &[Vec<String>]) {
+    let cols = header.len();
+    // Compute max width per column
+    let mut widths = vec![0usize; cols];
+    for (i, h) in header.iter().enumerate() {
+        widths[i] = h.len();
+    }
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < cols {
+                widths[i] = widths[i].max(cell.len());
+            }
+        }
+    }
+    // Print header
+    let mut line = String::new();
+    for (i, h) in header.iter().enumerate() {
+        if i > 0 {
+            line.push_str("  ");
+        }
+        if i < cols - 1 {
+            line.push_str(&format!("{:<width$}", h, width = widths[i]));
+        } else {
+            line.push_str(h); // last column: no trailing spaces
+        }
+    }
+    println!("{}", line);
+    // Print rows
+    for row in rows {
+        let mut line = String::new();
+        for (i, cell) in row.iter().enumerate() {
+            if i > 0 {
+                line.push_str("  ");
+            }
+            if i < cols - 1 {
+                line.push_str(&format!("{:<width$}", cell, width = widths[i]));
+            } else {
+                line.push_str(cell);
+            }
+        }
+        println!("{}", line);
+    }
+}
+
+fn json_str(obj: &serde_json::Value, key: &str) -> String {
+    obj.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn json_u64(obj: &serde_json::Value, key: &str) -> String {
+    obj.get(key)
+        .and_then(|v| v.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "-".into())
 }
 
 fn print_kv(obj: &serde_json::Value, fields: &[(&str, &str)]) {
@@ -378,15 +362,12 @@ fn format_bytes(bytes: u64) -> String {
     if bytes == 0 {
         return "0 B".to_string();
     }
-
     let mut size = bytes as f64;
     let mut unit_idx = 0;
-
     while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
         size /= 1024.0;
         unit_idx += 1;
     }
-
     if unit_idx == 0 {
         format!("{} {}", bytes, UNITS[0])
     } else {
@@ -400,7 +381,6 @@ fn format_uptime(seconds: f64) -> String {
     let hours = total_secs / 3600;
     let minutes = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
-
     if hours > 0 {
         format!("{}h{}m{}s", hours, minutes, secs)
     } else if minutes > 0 {
