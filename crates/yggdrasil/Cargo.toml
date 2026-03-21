@@ -9,10 +9,6 @@ license = "MPL-2.0"
 name = "yggdrasil"
 path = "src/main.rs"
 
-[[bin]]
-name = "yggdrasilctl"
-path = "src/yggdrasilctl.rs"
-
 [lib]
 name = "yggdrasil"
 path = "src/lib.rs"
@@ -34,10 +30,14 @@ toml = "0.8"
 hex = "0.4"
 url = "2"
 tokio-util = { version = "0.7", features = ["rt"] }
-comfy-table = "7"
+comfy-table = { version = "7", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 rcgen = "0.14.7"
+
+[features]
+default = ["ctl"]
+ctl = ["comfy-table"]
 
 # tun-rs is not available on Android; TUN is handled at the OS/framework level there.
 [target.'cfg(not(target_os = "android"))'.dependencies]

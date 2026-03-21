@@ -23,6 +23,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opts.optflag("s", "subnet", "Print the IPv6 subnet for the given config and exit");
     opts.optopt("l", "loglevel", "Log level: error, warn, info, debug, trace (default: info)", "LEVEL");
     opts.optflag("n", "no-replace", "With --genconf FILE, skip if the file already exists");
+    #[cfg(feature = "ctl")]
+    opts.optopt("e", "endpoint", "Admin socket address (default: tcp://localhost:9001)", "URI");
+    #[cfg(feature = "ctl")]
+    opts.optflag("j", "json", "Output control command results as raw JSON");
     opts.optflag("h", "help", "Print this help");
     opts.optflag("v", "version", "Print version");
 
@@ -30,19 +34,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Error: {}", e);
-            eprintln!("{}", opts.usage("Usage: yggdrasil [options]"));
+            eprintln!("{}", opts.usage(&usage_string()));
             std::process::exit(1);
         }
     };
 
     if matches.opt_present("help") {
-        println!("{}", opts.usage("Usage: yggdrasil [options]"));
+        println!("{}", opts.usage(&usage_string()));
+        #[cfg(feature = "ctl")]
+        print_ctl_commands();
         return Ok(());
     }
 
     if matches.opt_present("version") {
         println!("yggdrasil {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+
+    // If there are free (positional) arguments, treat as a control command
+    #[cfg(feature = "ctl")]
+    if !matches.free.is_empty() {
+        let endpoint = matches.opt_str("endpoint")
+            .unwrap_or_else(|| "tcp://localhost:9001".to_string());
+        let json_output = matches.opt_present("json");
+        let command = matches.free[0].clone();
+
+        // Parse key=value arguments
+        let mut arguments = serde_json::Map::new();
+        for arg in &matches.free[1..] {
+            if let Some((k, v)) = arg.split_once('=') {
+                arguments.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+            }
+        }
+
+        return yggdrasil::ctl::run_ctl(&endpoint, json_output, &command, arguments).await;
     }
 
     let config_path = matches.opt_str("config").unwrap_or_else(|| "yggdrasil.toml".to_string());
@@ -197,4 +222,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Goodbye!");
     Ok(())
+}
+
+fn usage_string() -> String {
+    #[cfg(feature = "ctl")]
+    return "Usage: yggdrasil [options] [command [key=value ...]]".to_string();
+    #[cfg(not(feature = "ctl"))]
+    return "Usage: yggdrasil [options]".to_string();
+}
+
+#[cfg(feature = "ctl")]
+fn print_ctl_commands() {
+    println!("Commands (control mode):");
+    println!("  Local queries:");
+    println!("    list, getSelf, getPeers, getTree, getPaths, getSessions, getTUN");
+    println!("  Debug:");
+    println!("    getDebug  (routing stats: tree size, broken paths, queue depth, etc.)");
+    println!("  Peer management:");
+    println!("    addPeer uri=<URI>, removePeer uri=<URI>");
+    println!("  Remote queries:");
+    println!("    getNodeInfo key=<hex>, debug_remoteGetSelf key=<hex>");
+    println!("    debug_remoteGetPeers key=<hex>, debug_remoteGetTree key=<hex>");
+    println!("  Path diagnostics:");
+    println!("    getLookup key=<hex>, forceLookup key=<hex>");
 }

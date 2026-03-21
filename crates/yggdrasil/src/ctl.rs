@@ -1,77 +1,21 @@
 use comfy_table::{presets, Table};
-use getopts::Options;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
-
-    let mut opts = Options::new();
-    opts.optopt("e", "endpoint", "Admin socket address (default: tcp://localhost:9001)", "URI");
-    opts.optflag("j", "json", "Output as raw JSON");
-    opts.optflag("h", "help", "Print this help");
-    opts.optflag("v", "version", "Print version");
-
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            eprintln!("{}", opts.usage("Usage: yggdrasilctl [options] <command> [key=value ...]"));
-            std::process::exit(1);
-        }
-    };
-
-    if matches.opt_present("help") {
-        println!("{}", opts.usage("Usage: yggdrasilctl [options] <command> [key=value ...]"));
-        println!("Commands:");
-        println!("  Local queries:");
-        println!("    list, getSelf, getPeers, getTree, getPaths, getSessions, getTUN");
-        println!("  Debug:");
-        println!("    getDebug  (routing stats: tree size, broken paths, queue depth, etc.)");
-        println!("  Peer management:");
-        println!("    addPeer, removePeer");
-        println!("  Remote queries:");
-        println!("    getNodeInfo key=<hex>, debug_remoteGetSelf key=<hex>");
-        println!("    debug_remoteGetPeers key=<hex>, debug_remoteGetTree key=<hex>");
-        return Ok(());
-    }
-
-    if matches.opt_present("version") {
-        println!("yggdrasilctl {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-
-    let endpoint = matches.opt_str("endpoint").unwrap_or_else(|| "tcp://localhost:9001".to_string());
-    let json_output = matches.opt_present("json");
-
-    let free = matches.free.clone();
-    let command = match free.first() {
-        Some(c) => c.clone(),
-        None => {
-            eprintln!("Usage: yggdrasilctl [options] <command> [key=value ...]");
-            eprintln!("Use -h for full command list");
-            std::process::exit(1);
-        }
-    };
-
-    // Parse key=value arguments into a JSON object
-    let mut arguments = serde_json::Map::new();
-    for arg in &free[1..] {
-        if let Some((k, v)) = arg.split_once('=') {
-            arguments.insert(k.to_string(), serde_json::Value::String(v.to_string()));
-        }
-    }
-
+/// Run a control command against the admin socket.
+pub async fn run_ctl(
+    endpoint: &str,
+    json_output: bool,
+    command: &str,
+    arguments: serde_json::Map<String, serde_json::Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let request = serde_json::json!({
         "request": command,
         "arguments": arguments,
         "keepalive": false,
     });
 
-    let addr = endpoint
-        .strip_prefix("tcp://")
-        .unwrap_or(&endpoint);
+    let addr = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
 
     let stream = TcpStream::connect(addr).await.map_err(|e| {
         format!(

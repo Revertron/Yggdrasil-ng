@@ -2,6 +2,8 @@ pub mod address;
 pub mod admin;
 pub mod config;
 pub mod core;
+#[cfg(feature = "ctl")]
+pub mod ctl;
 pub mod ipv6rwc;
 pub mod links;
 pub mod proto;
