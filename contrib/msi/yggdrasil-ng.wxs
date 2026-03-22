@@ -89,9 +89,7 @@
       Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="GenerateConfig" Before="StartServices">
-        NOT Installed
-      </Custom>
+      <Custom Action="GenerateConfig" Before="StartServices" Condition="NOT Installed" />
     </InstallExecuteSequence>
 
     <!-- Feature tree -->
