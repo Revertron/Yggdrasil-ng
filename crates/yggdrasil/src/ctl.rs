@@ -17,10 +17,7 @@ pub async fn run_ctl(
     let addr = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
 
     let stream = TcpStream::connect(addr).await.map_err(|e| {
-        format!(
-            "Failed to connect to admin socket at {}: {}",
-            endpoint, e
-        )
+        format!("Failed to connect to admin socket at {}: {}", endpoint, e)
     })?;
 
     let (reader, mut writer) = stream.into_split();
