@@ -105,6 +105,7 @@ yggdrasil [options]
 | `-s, --subnet` | Print the IPv6 subnet for the given config and exit |
 | `-l, --loglevel LEVEL` | Log level: error, warn, info, debug, trace (default: info) |
 | `-n, --no-replace` | With `--genconf FILE`, skip if the file already exists |
+| `--logto FILE` | Log to a file instead of stderr (appends) |
 | `--service` | Run as a Windows service (Windows only) |
 | `-h, --help` | Print help message |
 | `-v, --version` | Print version |

@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use ed25519_dalek::SigningKey;
 use getopts::Options;
 use time::macros::format_description;
@@ -26,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opts.optflag("s", "subnet", "Print the IPv6 subnet for the given config and exit");
     opts.optopt("l", "loglevel", "Log level: error, warn, info, debug, trace (default: info)", "LEVEL");
     opts.optflag("n", "no-replace", "With --genconf FILE, skip if the file already exists");
+    opts.optopt("", "logto", "Log to a file instead of stderr", "FILE");
     #[cfg(feature = "ctl")]
     opts.optopt("e", "endpoint", "Admin socket address (default: tcp://localhost:9001)", "URI");
     #[cfg(feature = "ctl")]
@@ -86,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = matches.opt_present("address");
     let subnet = matches.opt_present("subnet");
     let loglevel = matches.opt_str("loglevel").unwrap_or_else(|| "info".to_string());
+    let logto = matches.opt_str("logto");
 
     // --genconf [FILE]: generate config, save to file or print to stdout
     if matches.opt_present("genconf") {
@@ -104,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize logging
-    init_logging(&loglevel);
+    init_logging(&loglevel, logto.as_deref());
 
     // Load config
     let config = if autoconf {
@@ -175,6 +177,7 @@ async fn run_node(
     opts.optopt("c", "config", "", "FILE");
     opts.optflag("", "autoconf", "");
     opts.optopt("l", "loglevel", "", "LEVEL");
+    opts.optopt("", "logto", "", "FILE");
     // Accept (and ignore) the rest so parsing doesn't fail
     opts.optflagopt("g", "genconf", "", "FILE");
     opts.optflag("a", "address", "");
@@ -197,9 +200,10 @@ async fn run_node(
     let config_path = matches.opt_str("config").unwrap_or_else(|| "yggdrasil.toml".to_string());
     let autoconf = matches.opt_present("autoconf");
     let loglevel = matches.opt_str("loglevel").unwrap_or_else(|| "info".to_string());
+    let logto = matches.opt_str("logto");
 
     // Initialize logging (idempotent — if already initialized in console mode, this is a no-op)
-    init_logging(&loglevel);
+    init_logging(&loglevel, logto.as_deref());
 
     // Load config
     let config = if autoconf {
@@ -302,7 +306,7 @@ async fn run_node(
     Ok(())
 }
 
-fn init_logging(loglevel: &str) {
+fn init_logging(loglevel: &str, logto: Option<&str>) {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -310,13 +314,46 @@ fn init_logging(loglevel: &str) {
             .unwrap_or_else(|_| EnvFilter::new("info"));
         let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]");
         let timer = fmt::time::LocalTime::new(format);
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .with_target(true)
-            .with_level(true)
-            .with_timer(timer)
-            .init();
+
+        // When running under systemd, the journal already provides timestamps.
+        let under_systemd = std::env::var_os("JOURNAL_STREAM").is_some();
+
+        if let Some(path) = logto {
+            // Log files always get timestamps
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to open log file {}: {}", path, e);
+                    std::process::exit(1);
+                });
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_target(true)
+                .with_level(true)
+                .with_timer(timer)
+                .with_writer(file)
+                .init();
+        } else if under_systemd {
+            // Under systemd: skip timestamps, journal adds them
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_target(true)
+                .with_level(true)
+                .without_time()
+                .init();
+        } else {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_target(true)
+                .with_level(true)
+                .with_timer(timer)
+                .init();
+        }
     });
 }
 
