@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+# Create system group if sysusers.d didn't handle it
+if ! getent group yggdrasil >/dev/null 2>&1; then
+    groupadd --system yggdrasil
+fi
+
+# Create config directory
+mkdir -p /etc/yggdrasil
+chmod 0750 /etc/yggdrasil
+
+# Generate default config if not present
+if [ ! -f /etc/yggdrasil/yggdrasil.toml ]; then
+    /usr/bin/yggdrasil --genconf=/etc/yggdrasil/yggdrasil.toml
+    chmod 0640 /etc/yggdrasil/yggdrasil.toml
+    chgrp yggdrasil /etc/yggdrasil/yggdrasil.toml
+    echo ""
+    echo "A fresh config has been generated at /etc/yggdrasil/yggdrasil.toml"
+    echo "Edit it to add peers, then enable and start the service:"
+    echo "  sudo systemctl enable --now yggdrasil"
+    echo ""
+fi
+
+# Reload systemd
+systemctl daemon-reload || true
+
+#DEBHELPER#

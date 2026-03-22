@@ -41,3 +41,16 @@ ctl = []
 # tun-rs is not available on Android; TUN is handled at the OS/framework level there.
 [target.'cfg(not(target_os = "android"))'.dependencies]
 tun-rs = { version = "2.8", features = ["async_tokio"] }
+
+[package.metadata.deb]
+maintainer = "Revertron"
+section = "net"
+priority = "optional"
+depends = "$auto, systemd"
+conf-files = ["/etc/yggdrasil/yggdrasil.toml"]
+maintainer-scripts = "../../contrib/deb"
+assets = [
+    ["target/release/yggdrasil", "usr/bin/yggdrasil", "755"],
+    ["../../contrib/systemd/yggdrasil.service", "lib/systemd/system/yggdrasil.service", "644"],
+    ["../../contrib/systemd/yggdrasil.sysusers", "usr/lib/sysusers.d/yggdrasil.conf", "644"],
+]
