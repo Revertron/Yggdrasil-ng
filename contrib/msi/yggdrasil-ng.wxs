@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+  Yggdrasil NG - Windows Installer (WiX v4)
+
+  Installs:
+    - yggdrasil.exe   -> Program Files\Yggdrasil-ng\
+    - wintun.dll      -> Program Files\Yggdrasil-ng\
+    - Registers "yggdrasil-ng" Windows service
+    - Creates config at %ALLUSERSPROFILE%\Yggdrasil-ng\yggdrasil.toml (first install only)
+-->
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Package
+    Name="Yggdrasil NG"
+    Manufacturer="Yggdrasil-ng contributors"
+    Version="$(var.Version)"
+    UpgradeCode="779e0ec9-6262-4266-a9e5-26b92a0b0326"
+    Scope="perMachine">
+
+    <MajorUpgrade
+      AllowDowngrades="yes" />
+
+    <Media Id="1" Cabinet="yggdrasil.cab" EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Directory layout -->
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLDIR" Name="Yggdrasil-ng">
+
+        <Component Id="MainExecutable" Guid="7455364f-c5cb-4cd2-923e-ef8b746c0b54">
+          <File Id="YggdrasilExe" Source="$(var.BinDir)\yggdrasil.exe" KeyPath="yes" />
+
+          <ServiceInstall
+            Id="ServiceInstall"
+            Name="yggdrasil-ng"
+            DisplayName="Yggdrasil NG"
+            Description="Yggdrasil NG end-to-end encrypted IPv6 mesh network"
+            Type="ownProcess"
+            Start="auto"
+            ErrorControl="normal"
+            Arguments="--service -c &quot;[CommonAppDataFolder]Yggdrasil-ng\yggdrasil.toml&quot; --logto &quot;[CommonAppDataFolder]Yggdrasil-ng\yggdrasil.log&quot;" />
+
+          <ServiceControl
+            Id="ServiceControl"
+            Name="yggdrasil-ng"
+            Stop="both"
+            Remove="uninstall"
+            Wait="yes" />
+
+          <Environment
+            Id="PATH"
+            Name="PATH"
+            Value="[INSTALLDIR]"
+            Permanent="no"
+            Part="last"
+            Action="set"
+            System="yes" />
+        </Component>
+
+        <Component Id="WintunDll" Guid="ced5b4be-1431-46a1-a6bb-4db320f6391b">
+          <File Id="WintunDll" Source="$(var.BinDir)\wintun.dll" KeyPath="yes" />
+        </Component>
+
+        <Component Id="ConfigScript" Guid="926d554b-af25-43c3-bcf3-07401f9e85f5">
+          <File Id="UpdateConfigBat" Source="$(var.SrcDir)\updateconfig.bat" KeyPath="yes" />
+        </Component>
+
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Config data directory: %ALLUSERSPROFILE%\Yggdrasil-ng\ -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="CONFIGDIR" Name="Yggdrasil-ng">
+        <Component Id="ConfigDir" Guid="cd882698-79d1-440d-939e-be8b23fb7ff5">
+          <CreateFolder />
+          <RemoveFolder Id="RemoveConfigDir" On="uninstall" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Custom action: generate config if missing -->
+    <CustomAction
+      Id="GenerateConfig"
+      Directory="INSTALLDIR"
+      ExeCommand="[INSTALLDIR]updateconfig.bat &quot;[INSTALLDIR]yggdrasil.exe&quot; &quot;[CommonAppDataFolder]Yggdrasil-ng\yggdrasil.toml&quot;"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="GenerateConfig" Before="StartServices">
+        NOT Installed
+      </Custom>
+    </InstallExecuteSequence>
+
+    <!-- Feature tree -->
+    <Feature Id="Complete" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="WintunDll" />
+      <ComponentRef Id="ConfigScript" />
+      <ComponentRef Id="ConfigDir" />
+    </Feature>
+
+  </Package>
+
+</Wix>

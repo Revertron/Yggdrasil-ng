@@ -1,0 +1,86 @@
+name: Build .msi package
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-msi:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+            wintun_arch: amd64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} -p yggdrasil
+
+      - name: Download wintun
+        shell: pwsh
+        run: |
+          $wintunUrl = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          $wintunSha256 = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+          $zipPath = "$env:TEMP\wintun.zip"
+
+          Invoke-WebRequest -Uri $wintunUrl -OutFile $zipPath
+
+          $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $wintunSha256) {
+            Write-Error "Wintun SHA256 mismatch: expected $wintunSha256, got $hash"
+            exit 1
+          }
+
+          Expand-Archive -Path $zipPath -DestinationPath "$env:TEMP\wintun"
+
+          $dllSrc = "$env:TEMP\wintun\wintun\bin\${{ matrix.wintun_arch }}\wintun.dll"
+          $binDir = "target\${{ matrix.target }}\release"
+          Copy-Item $dllSrc -Destination $binDir
+
+      - name: Install WiX toolset
+        run: dotnet tool install --global wix
+
+      - name: Get version from Cargo.toml
+        id: version
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path crates\yggdrasil\Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          $binDir = (Resolve-Path "target\${{ matrix.target }}\release").Path
+          $srcDir = (Resolve-Path "contrib\msi").Path
+          $outMsi = "yggdrasil-ng-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}.msi"
+
+          wix build contrib\msi\yggdrasil-ng.wxs `
+            -d Version=${{ steps.version.outputs.VERSION }} `
+            -d BinDir=$binDir `
+            -d SrcDir=$srcDir `
+            -arch ${{ matrix.arch }} `
+            -o $outMsi
+
+      - name: Upload .msi artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yggdrasil-ng-msi-${{ matrix.arch }}
+          path: "*.msi"
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.msi"
