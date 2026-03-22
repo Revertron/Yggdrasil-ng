@@ -42,6 +42,9 @@ ctl = []
 [target.'cfg(not(target_os = "android"))'.dependencies]
 tun-rs = { version = "2.8", features = ["async_tokio"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+
 [package.metadata.deb]
 maintainer = "Revertron"
 section = "net"

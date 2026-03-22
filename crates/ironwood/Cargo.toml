@@ -9,7 +9,6 @@ license = "MPL-2.0"
 tokio = { version = "1", features = ["full"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 curve25519-dalek = "4"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
 crypto_box = "0.9"
 murmur3 = "0.5"
 rand = "0.8"
@@ -20,11 +19,3 @@ async-trait = "0.1"
 sha2 = "0.10"
 tokio-util = { version = "0.7", features = ["rt"] }
 hex = "0.4.3"
-
-[dev-dependencies]
-criterion = "0.8"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[[bench]]
-name = "logging_overhead"
-harness = false

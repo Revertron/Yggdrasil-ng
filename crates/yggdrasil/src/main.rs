@@ -11,6 +11,9 @@ use yggdrasil::core::Core;
 use yggdrasil::ipv6rwc::ReadWriteCloser;
 use yggdrasil::tun::TunAdapter;
 
+#[cfg(windows)]
+mod service;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -27,6 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opts.optopt("e", "endpoint", "Admin socket address (default: tcp://localhost:9001)", "URI");
     #[cfg(feature = "ctl")]
     opts.optflag("j", "json", "Output control command results as raw JSON");
+    #[cfg(windows)]
+    opts.optflag("", "service", "Run as a Windows service (launched by the Service Control Manager)");
     opts.optflag("h", "help", "Print this help");
     opts.optflag("v", "version", "Print version");
 
@@ -70,6 +75,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return yggdrasil::ctl::run_ctl(&endpoint, json_output, &command, arguments).await;
     }
 
+    // --service: run as Windows service
+    #[cfg(windows)]
+    if matches.opt_present("service") {
+        return service::run_as_service();
+    }
+
     let config_path = matches.opt_str("config").unwrap_or_else(|| "yggdrasil.toml".to_string());
     let autoconf = matches.opt_present("autoconf");
     let address = matches.opt_present("address");
@@ -93,17 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize logging
-    let filter = EnvFilter::try_new(&loglevel)
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]");
-    let timer = fmt::time::LocalTime::new(format);
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(false) // disables ANSI escape codes
-        .with_target(true)
-        .with_level(true)
-        .with_timer(timer)
-        .init();
+    init_logging(&loglevel);
 
     // Load config
     let config = if autoconf {
@@ -151,6 +152,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", subnet);
         return Ok(());
     }
+
+    // Console mode: Ctrl+C triggers shutdown
+    let (watch_tx, watch_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = watch_tx.send(true);
+    });
+
+    run_node(watch_rx).await
+}
+
+/// Run the Yggdrasil node, blocking until the shutdown signal fires.
+/// Called from both console mode (Ctrl+C) and Windows service mode (SCM stop).
+async fn run_node(
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // When called from service mode, logging + config aren't set up yet.
+    // Re-read CLI args to get config path / autoconf / loglevel.
+    let args: Vec<String> = std::env::args().collect();
+    let mut opts = Options::new();
+    opts.optopt("c", "config", "", "FILE");
+    opts.optflag("", "autoconf", "");
+    opts.optopt("l", "loglevel", "", "LEVEL");
+    // Accept (and ignore) the rest so parsing doesn't fail
+    opts.optflagopt("g", "genconf", "", "FILE");
+    opts.optflag("a", "address", "");
+    opts.optflag("s", "subnet", "");
+    opts.optflag("n", "no-replace", "");
+    opts.optflag("h", "help", "");
+    opts.optflag("v", "version", "");
+    #[cfg(feature = "ctl")]
+    opts.optopt("e", "endpoint", "", "URI");
+    #[cfg(feature = "ctl")]
+    opts.optflag("j", "json", "");
+    #[cfg(windows)]
+    opts.optflag("", "service", "");
+
+    let matches = opts.parse(&args[1..]).unwrap_or_else(|_| {
+        // Fallback: empty matches
+        opts.parse(Vec::<String>::new()).unwrap()
+    });
+
+    let config_path = matches.opt_str("config").unwrap_or_else(|| "yggdrasil.toml".to_string());
+    let autoconf = matches.opt_present("autoconf");
+    let loglevel = matches.opt_str("loglevel").unwrap_or_else(|| "info".to_string());
+
+    // Initialize logging (idempotent — if already initialized in console mode, this is a no-op)
+    init_logging(&loglevel);
+
+    // Load config
+    let config = if autoconf {
+        Config::default()
+    } else if !config_path.is_empty() {
+        let file = File::open(&config_path)?;
+        let text = std::io::read_to_string(file)?;
+        toml::from_str::<Config>(&text)?
+    } else {
+        return Err("No configuration: specify --config or --autoconf".into());
+    };
+
+    // Parse or generate signing key
+    let signing_key = if !config.private_key.is_empty() {
+        config
+            .signing_key()
+            .map_err(|e| format!("invalid private key: {}", e))?
+    } else if let Ok(env_key) = std::env::var("YGGDRASIL_PRIVATE_KEY") {
+        tracing::info!("Using private key from YGGDRASIL_PRIVATE_KEY environment variable");
+        let bytes = hex::decode(&env_key)
+            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY hex: {}", e))?;
+        let key_bytes: [u8; 64] = bytes.try_into()
+            .map_err(|v: Vec<u8>| format!("YGGDRASIL_PRIVATE_KEY should be 64 bytes, got {}", v.len()))?;
+        SigningKey::from_keypair_bytes(&key_bytes)
+            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?
+    } else {
+        tracing::warn!("No private key configured, generating ephemeral key");
+        SigningKey::generate(&mut rand::rngs::OsRng)
+    };
 
     // Create core
     let core = Core::new(signing_key, config.clone());
@@ -210,8 +288,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Wait for shutdown signal
-    tracing::info!("Yggdrasil started. Press Ctrl+C to stop.");
-    tokio::signal::ctrl_c().await?;
+    tracing::info!("Yggdrasil NG started");
+    shutdown_rx.changed().await.ok();
     tracing::info!("Shutting down...");
 
     // Cleanup
@@ -222,6 +300,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Goodbye!");
     Ok(())
+}
+
+fn init_logging(loglevel: &str) {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let filter = EnvFilter::try_new(loglevel)
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+        let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]");
+        let timer = fmt::time::LocalTime::new(format);
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_target(true)
+            .with_level(true)
+            .with_timer(timer)
+            .init();
+    });
 }
 
 fn usage_string() -> String {
