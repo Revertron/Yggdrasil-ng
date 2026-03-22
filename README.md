@@ -17,17 +17,18 @@ This project aims to provide a lightweight, self-arranging, and secure mesh netw
 **✅ Fully Implemented:**
 - Core routing protocol (spanning tree, path discovery, bloom filters)
 - End-to-end encryption with forward secrecy (session key ratcheting)
-- TCP transport with automatic reconnection and exponential backoff
+- TCP and TLS transports with automatic reconnection and exponential backoff
 - TUN/TAP interface for IPv6 traffic
-- Admin socket API (getSelf, getPeers, getTree)
+- Admin socket API (getSelf, getPeers, getTree, getPaths, getSessions, addPeer, removePeer, etc.)
 - Session cleanup and timeout handling
 - Optimized Ed25519→Curve25519 key conversion
+- Single binary for daemon and control commands (no separate `yggdrasilctl`)
+- Windows service support (runs as `yggdrasil-ng` service via SCM)
+- UniFFI bindings for Android
 
 **⏳ Planned Features:**
-- Additional transports: TLS, QUIC, WebSocket
+- Additional transports: QUIC, WebSocket
 - Multicast peer discovery on local networks
-- More admin API endpoints (DHT, sessions, detailed stats)
-- Mobile platform support (Android, iOS)
 - Performance optimizations and protocol improvements
 
 ## Building from Source
@@ -52,21 +53,8 @@ cd Yggdrasil-ng
 cargo build --release
 ```
 
-This will produce two binaries in `./target/release/`:
-- `yggdrasil` — The main network daemon
-- `yggdrasilctl` — Administrative control utility
-
-#### Build Individual Binaries
-
-**Build only the daemon:**
-```bash
-cargo build --release --bin yggdrasil
-```
-
-**Build only the control utility:**
-```bash
-cargo build --release --bin yggdrasilctl
-```
+This will produce a single binary in `./target/release/`:
+- `yggdrasil` — The network daemon and control tool (combined)
 
 #### Development/Debug Builds
 
@@ -88,15 +76,14 @@ cargo build --release --target aarch64-unknown-linux-gnu
 
 ## Installation
 
-After building, you can install the binaries system-wide:
+After building, you can install the binary system-wide:
 
 ```bash
-# Copy binaries to system PATH
+# Copy binary to system PATH
 sudo cp target/release/yggdrasil /usr/local/bin/
-sudo cp target/release/yggdrasilctl /usr/local/bin/
 
 # Or use cargo install for local user installation
-cargo install --path .
+cargo install --path crates/yggdrasil
 ```
 
 ## Usage
@@ -118,6 +105,7 @@ yggdrasil [options]
 | `-s, --subnet` | Print the IPv6 subnet for the given config and exit |
 | `-l, --loglevel LEVEL` | Log level: error, warn, info, debug, trace (default: info) |
 | `-n, --no-replace` | With `--genconf FILE`, skip if the file already exists |
+| `--service` | Run as a Windows service (Windows only) |
 | `-h, --help` | Print help message |
 | `-v, --version` | Print version |
 
@@ -153,46 +141,49 @@ Print your address without starting the daemon:
 yggdrasil --config yggdrasil.toml --address
 ```
 
-### Using yggdrasilctl
+### Control Commands
 
-The `yggdrasilctl` utility connects to the running daemon's admin socket:
+The `yggdrasil` binary doubles as a control tool. Pass commands as positional arguments to query or manage a running daemon:
 
 ```bash
 # Get your node's info
-yggdrasilctl getSelf
+yggdrasil getSelf
 
 # List connected peers
-yggdrasilctl getPeers
+yggdrasil getPeers
 
 # View routing table (spanning tree)
-yggdrasilctl getTree
+yggdrasil getTree
 ```
 
 **Supported commands:**
 
 *Local queries:*
-- ✅ `getSelf` - Show node info (address, subnet, public key, coordinates)
-- ✅ `getPeers` - List active peer connections with statistics
-- ✅ `getTree` - Show routing table entries (spanning tree)
-- ✅ `getPaths` - Show cached paths to remote destinations
-- ✅ `getSessions` - Show active encrypted sessions
-- ✅ `getTUN` - Show TUN adapter status
-- ✅ `addPeer` / `removePeer` - Manage peer connections
+- `getSelf` - Show node info (address, subnet, public key, coordinates)
+- `getPeers` - List active peer connections with statistics
+- `getTree` - Show routing table entries (spanning tree)
+- `getPaths` - Show cached paths to remote destinations
+- `getSessions` - Show active encrypted sessions
+- `getTUN` - Show TUN adapter status
+- `addPeer uri=<URI>` / `removePeer uri=<URI>` - Manage peer connections
 
 *Remote queries:*
-- ✅ `getNodeInfo key=<hex>` - Query node metadata from remote node
-- ✅ `debug_remoteGetSelf key=<hex>` - Query self info from remote node
-- ✅ `debug_remoteGetPeers key=<hex>` - Query peer list from remote node
-- ✅ `debug_remoteGetTree key=<hex>` - Query tree entries from remote node
+- `getNodeInfo key=<hex>` - Query node metadata from remote node
+- `debug_remoteGetSelf key=<hex>` - Query self info from remote node
+- `debug_remoteGetPeers key=<hex>` - Query peer list from remote node
+- `debug_remoteGetTree key=<hex>` - Query tree entries from remote node
 
-*Planned:*
-- ⏳ Multicast interface management
+*Path diagnostics:*
+- `getLookup key=<hex>` - Show cached lookup for a key
+- `forceLookup key=<hex>` - Force a new path lookup
 
-By default, `yggdrasilctl` connects to `tcp://localhost:9001`. You can specify a different address:
+By default, control commands connect to `tcp://localhost:9001`. You can specify a different address:
 
 ```bash
-yggdrasilctl -endpoint tcp://127.0.0.1:9001 getPeers
+yggdrasil -e tcp://127.0.0.1:9001 getPeers
 ```
+
+Use `-j` / `--json` to get raw JSON output instead of formatted tables.
 
 ## Configuration
 
@@ -260,7 +251,8 @@ location = "datacenter-1"
   - `node_info` instead of `NodeInfo`
   - `node_info_privacy` instead of `NodeInfoPrivacy`
   - `allowed_public_keys` instead of `AllowedPublicKeys`
-- **Transport support**: Currently only TCP (TLS, QUIC, WebSocket coming later)
+- **Single binary**: Daemon and control tool are combined (no separate `yggdrasilctl`)
+- **Transport support**: TCP and TLS (QUIC, WebSocket coming later)
 - **Admin socket**: Defaults to TCP `localhost:9001` instead of Unix socket
 
 **Migration from Go config:**
@@ -268,6 +260,41 @@ location = "datacenter-1"
 2. Rename all fields from PascalCase to snake_case
 3. Change transport URIs to TCP-only (remove `tls://`, `quic://`, etc.)
 4. Update admin socket to TCP format if using Unix socket
+
+## Running as a Windows Service
+
+On Windows, Yggdrasil-ng can run as a system service managed by the Service Control Manager (SCM).
+The service is registered under the name `yggdrasil-ng` (display name "Yggdrasil NG") to avoid conflicts with the Go version.
+
+### Register the service
+
+Open an elevated (Administrator) command prompt:
+
+```cmd
+sc create yggdrasil-ng binPath= "C:\path\to\yggdrasil.exe --service -c C:\path\to\yggdrasil.toml" start= auto DisplayName= "Yggdrasil NG"
+```
+
+> **Note:** The spaces after `binPath=`, `start=`, and `DisplayName=` are required by `sc`.
+
+### Start / Stop
+
+```cmd
+sc start yggdrasil-ng
+sc stop yggdrasil-ng
+```
+
+Or use the Services GUI (`services.msc`).
+
+### Remove the service
+
+```cmd
+sc delete yggdrasil-ng
+```
+
+### Running in console mode
+
+Without the `--service` flag, the binary runs as a normal console application and shuts down on Ctrl+C.
+This is the default and recommended mode for development and testing.
 
 ## Development
 
@@ -313,4 +340,7 @@ Yggdrasil-ng is designed to be **wire-compatible** with the original Go implemen
 
 ---
 
-**Note**: This is an experimental implementation under active development. While core functionality is stable and tested, some features are still being implemented. The network protocol is compatible with the Go version, but configuration format and CLI options differ. Suitable for testing and development; use in production at your own discretion.
+**Note**: This is an experimental implementation under active development.
+While core functionality is stable and tested, some features are still being implemented.
+The network protocol is compatible with the Go version, but configuration format and CLI options differ.
+Suitable for testing and development; use in production at your own discretion.
