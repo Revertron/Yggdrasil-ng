@@ -48,6 +48,48 @@ jobs:
         with:
           files: target/${{ matrix.target }}/debian/*.deb
 
+  build-mips:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: mips-unknown-linux-musl
+            arch: mips
+          - target: mipsel-unknown-linux-musl
+            arch: mipsel
+          - target: mips64-unknown-linux-muslabi64
+            arch: mips64
+          - target: mips64el-unknown-linux-muslabi64
+            arch: mips64el
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Build with cross
+        run: cross +nightly build --release --target ${{ matrix.target }} -p yggdrasil
+
+      - name: Rename binary
+        run: cp target/${{ matrix.target }}/release/yggdrasil yggdrasil-${{ matrix.arch }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yggdrasil-ng-${{ matrix.arch }}
+          path: yggdrasil-${{ matrix.arch }}
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: yggdrasil-${{ matrix.arch }}
+
   build-msi:
     runs-on: windows-latest
     strategy:

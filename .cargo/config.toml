@@ -1,0 +1,15 @@
+[target.mips-unknown-linux-musl]
+linker = "gcc-crt-wrapper"
+rustflags = ["-Ctarget-feature=+crt-static", "-Clink-arg=-s", "-Zunstable-options", "-Cpanic=immediate-abort"]
+
+[target.mipsel-unknown-linux-musl]
+linker = "gcc-crt-wrapper"
+rustflags = ["-Ctarget-feature=+crt-static", "-Clink-arg=-s", "-Zunstable-options", "-Cpanic=immediate-abort"]
+
+[target.mips64-unknown-linux-muslabi64]
+linker = "gcc-crt-wrapper"
+rustflags = ["-Ctarget-feature=+crt-static", "-Clink-arg=-s", "-Zunstable-options", "-Cpanic=immediate-abort"]
+
+[target.mips64el-unknown-linux-muslabi64]
+linker = "gcc-crt-wrapper"
+rustflags = ["-Ctarget-feature=+crt-static", "-Clink-arg=-s", "-Zunstable-options", "-Cpanic=immediate-abort"]

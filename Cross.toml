@@ -1,0 +1,15 @@
+[target.mips-unknown-linux-musl]
+build-std = true
+dockerfile = "contrib/cross/Dockerfile.mips-musl"
+
+[target.mipsel-unknown-linux-musl]
+build-std = true
+dockerfile = "contrib/cross/Dockerfile.mips-musl"
+
+[target.mips64-unknown-linux-muslabi64]
+build-std = true
+dockerfile = "contrib/cross/Dockerfile.mips-musl"
+
+[target.mips64el-unknown-linux-muslabi64]
+build-std = true
+dockerfile = "contrib/cross/Dockerfile.mips-musl"
