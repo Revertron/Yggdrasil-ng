@@ -680,7 +680,11 @@ async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
             Ok(Ok(_)) => {
                 tracing::debug!("peer_writer[{}]: sent queued traffic", peer_id);
                 // Traffic packets are always non-keepalive — arm read deadline
-                *read_deadline.lock().unwrap() = Some(std::time::Instant::now() + peer_timeout);
+                // (only if not already armed, matching Go's deadlined flag)
+                let mut dl = read_deadline.lock().unwrap();
+                if dl.is_none() {
+                    *dl = Some(std::time::Instant::now() + peer_timeout);
+                }
             }
             Ok(Err(e)) => {
                 tracing::debug!("peer_writer[{}]: write error for queued traffic: {}", peer_id, e);
@@ -795,11 +799,18 @@ pub(crate) async fn peer_writer(
 
                 match write_result {
                     Ok(Ok(_)) => {
-                        // Arm the read deadline for any non-keepalive frame.
-                        // Matches Go's SetReadDeadline(now + peerTimeout) on non-keepalive writes.
+                        // Arm the read deadline for non-keepalive frames, but only
+                        // if not already armed. Matches Go's `if m.deadlined { return }`
+                        // check — once armed, the deadline stays until the reader clears
+                        // it on receiving any frame. Without this, a burst of outgoing
+                        // frames (e.g. announce storm) would keep pushing the deadline
+                        // forward, masking the fact that the peer hasn't responded.
                         if let Some(ptype) = peek_frame_type(&data) {
                             if !matches!(ptype, wire::PacketType::KeepAlive | wire::PacketType::Dummy) {
-                                *read_deadline.lock().unwrap() = Some(std::time::Instant::now() + peer_timeout);
+                                let mut dl = read_deadline.lock().unwrap();
+                                if dl.is_none() {
+                                    *dl = Some(std::time::Instant::now() + peer_timeout);
+                                }
                             }
                         }
                     }
