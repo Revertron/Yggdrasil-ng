@@ -627,6 +627,9 @@ pub(crate) async fn peer_reader(
 /// If a write takes longer than this, the peer is considered stalled.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Interval between proactive keepalives on idle connections.
+const IDLE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Size of the BufWriter buffer for each peer writer (128 KB).
 /// Outbound frames accumulate here; a single flush() drains to the OS per burst.
 const WRITE_BUF_SIZE: usize = 128 * 1024;
@@ -769,10 +772,30 @@ pub(crate) async fn peer_writer(
                 },
             }
         } else {
-            // No keepalive scheduled, just wait for messages
+            // No keepalive scheduled - wait for messages, but send a proactive keepalive if idle for too long.
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 msg = rx.recv() => msg,
+                _ = tokio::time::sleep(IDLE_KEEPALIVE_INTERVAL) => {
+                    // Idle timeout — send a keepalive to keep the connection alive
+                    let write_result = tokio::time::timeout(
+                        WRITE_TIMEOUT,
+                        conn_write.write_all(&keepalive_frame),
+                    ).await;
+                    if write_result.is_err() || write_result.unwrap().is_err() {
+                        tracing::debug!("peer_writer[{}]: idle keepalive write failed, disconnecting", peer_id);
+                        break;
+                    }
+                    let flush_result = tokio::time::timeout(
+                        WRITE_TIMEOUT,
+                        conn_write.flush(),
+                    ).await;
+                    if flush_result.is_err() || flush_result.unwrap().is_err() {
+                        tracing::debug!("peer_writer[{}]: idle keepalive flush failed, disconnecting", peer_id);
+                        break;
+                    }
+                    continue;
+                },
             }
         };
 
