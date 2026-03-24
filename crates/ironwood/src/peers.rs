@@ -358,14 +358,14 @@ async fn read_uvarint<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result
     }
 }
 
+pub(crate) type ReadDeadline = Arc<std::sync::Mutex<Option<std::time::Instant>>>;
+
 /// The peer reader task. Reads frames from the connection and dispatches
 /// messages to the router via the shared mutex.
 /// Returns Ok(()) for clean shutdown, Err with disconnect reason otherwise.
 /// Shared peer timeout state between writer and reader.
 /// Writer sets the deadline when it sends a non-keepalive frame.
 /// Reader clears it when it receives any frame.
-pub(crate) type ReadDeadline = Arc<std::sync::Mutex<Option<std::time::Instant>>>;
-
 pub(crate) async fn peer_reader(
     peer_id: PeerId,
     peer_key: PublicKey,
@@ -392,25 +392,37 @@ pub(crate) async fn peer_reader(
     let mut buf: Vec<u8> = Vec::with_capacity(16384);
 
     loop {
-        // Read frame: length(uvarint) | content.
-        // Wake every 1 second to check whether the writer-set deadline has
-        // elapsed (matches Go's SetReadDeadline approach: writer arms 3s
-        // deadline on non-keepalive sends; reader clears on any receive).
-        let frame_result = tokio::select! {
-            _ = cancel.cancelled() => { break },
-            result = read_uvarint(&mut reader) => result,
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                let deadline = *read_deadline.lock().unwrap();
-                if let Some(d) = deadline {
-                    if std::time::Instant::now() >= d {
-                        tracing::debug!("peer_reader[{}]: peer timeout ({}ms, no reply from {:02x?}), disconnecting",
-                            peer_id, peer_timeout.as_millis(), &peer_key[..8]);
-                        disconnect_reason = Some(Error::Timeout);
-                        break;
+        // Read frame length (uvarint) with periodic deadline checks.
+        // The read future is pinned and reused across check iterations so that
+        // partially-consumed bytes in BufReader are never lost (previously,
+        // `continue` would drop a mid-flight read_uvarint, causing stream
+        // misalignment and spurious disconnects).
+        let frame_result = {
+            let read_fut = read_uvarint(&mut reader);
+            tokio::pin!(read_fut);
+
+            'poll: loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => { break 'poll None },
+                    result = &mut read_fut => { break 'poll Some(result) },
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        let deadline = *read_deadline.lock().unwrap();
+                        if let Some(d) = deadline {
+                            if std::time::Instant::now() >= d {
+                                tracing::debug!("peer_reader[{}]: peer timeout ({}ms, no reply from {:02x?}), disconnecting",
+                                    peer_id, peer_timeout.as_millis(), &peer_key[..8]);
+                                disconnect_reason = Some(Error::Timeout);
+                                break 'poll None;
+                            }
+                        }
+                        // Continue polling — reuses the same pinned read future
                     }
                 }
-                continue;
             }
+        };
+
+        let Some(frame_result) = frame_result else {
+            break;
         };
 
         // Any received frame clears the deadline (peer is alive).
