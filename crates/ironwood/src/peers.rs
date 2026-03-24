@@ -1,8 +1,8 @@
 //! Peer connection management.
 //!
 //! Each peer connection spawns two tokio tasks:
-//! - **Reader task**: reads frames from the connection, decodes messages,
-//!   dispatches to the router via the shared state mutex.
+//! - **Reader task**: reads frames from the connection, sends messages to the
+//!   router actor via `RouterHandle` (fire-and-forget, never blocks).
 //! - **Writer task**: receives outbound frames via an mpsc channel,
 //!   writes them with buffered I/O, manages keepalive and deadlines.
 
@@ -15,9 +15,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::bloom::BloomFilter;
+use crate::core::{RouterHandle, RouterMsg};
 use crate::crypto::{Crypto, PublicKey};
-use crate::router::{PeerId, PeerEntry, Router, RouterAction, RouterAnnounce};
-use crate::traffic::{DeliveryQueue, PacketQueue, TrafficPacket};
+use crate::router::{PeerId, PeerEntry, RouterAction, RouterAnnounce};
+use crate::traffic::{PacketQueue, TrafficPacket};
 use crate::types::Error;
 use crate::wire::{self, PeerPort};
 
@@ -371,16 +372,13 @@ pub(crate) async fn peer_reader(
     peer_key: PublicKey,
     our_key: PublicKey,
     conn_read: impl tokio::io::AsyncRead + Unpin + Send,
-    router: Arc<tokio::sync::Mutex<Router>>,
+    router: RouterHandle,
     peers: Arc<tokio::sync::Mutex<Peers>>,
-    delivery_queue: Arc<crate::traffic::DeliveryQueue>,
-    traffic_tx: mpsc::Sender<TrafficPacket>,
     writer_tx: mpsc::Sender<PeerMessage>,
     cancel: CancellationToken,
     max_message_size: u64,
     peer_timeout: Duration,
     _keepalive_delay: Duration,
-    path_notify_cb: Option<Arc<dyn Fn(PublicKey) + Send + Sync>>,
     read_deadline: ReadDeadline,
 ) -> Result<(), Error> {
     // Use a larger BufReader to reduce syscall count on high-throughput connections.
@@ -486,15 +484,7 @@ pub(crate) async fn peer_reader(
                         break;
                     },
                 };
-                let router = router.lock().await;
-                // Find peer entry
-                if let Some(peers_map) = router.peers.get(&peer_key) {
-                    if let Some(entry) = peers_map.get(&peer_id) {
-                        let action = router.handle_request_with_data(entry, &req);
-                        drop(router);
-                        dispatch_action(action, &peers).await;
-                    }
-                }
+                router.send(RouterMsg::HandleRequest { peer_id, peer_key, req });
             }
             wire::PacketType::ProtoSigRes => {
                 let mut r = wire::WireReader::new(payload);
@@ -505,7 +495,7 @@ pub(crate) async fn peer_reader(
                         break;
                     },
                 };
-                // Verify the signature
+                // Verify the signature before sending to the actor
                 let bs = {
                     let mut out = Vec::new();
                     out.extend_from_slice(&our_key);
@@ -519,8 +509,7 @@ pub(crate) async fn peer_reader(
                     disconnect_reason = Some(Error::BadMessage);
                     break;
                 }
-                let mut router = router.lock().await;
-                router.handle_response(peer_id, &peer_key, &res);
+                router.send(RouterMsg::HandleResponse { peer_id, key: peer_key, res });
             }
             wire::PacketType::ProtoAnnounce => {
                 let ann = match wire::Announce::decode(payload) {
@@ -535,10 +524,7 @@ pub(crate) async fn peer_reader(
                     disconnect_reason = Some(Error::BadMessage);
                     break;
                 }
-                let mut router = router.lock().await;
-                let actions = router.handle_announce(peer_id, &peer_key, &router_ann);
-                drop(router);
-                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
+                router.send(RouterMsg::HandleAnnounce { peer_id, peer_key, ann: router_ann });
             }
             wire::PacketType::ProtoBloomFilter => {
                 let raw = match wire::decode_bloom(payload) {
@@ -549,8 +535,7 @@ pub(crate) async fn peer_reader(
                     },
                 };
                 let filter = BloomFilter::from_raw(raw);
-                let mut router = router.lock().await;
-                router.handle_bloom(&peer_key, filter);
+                router.send(RouterMsg::HandleBloom { peer_key, filter });
             }
             wire::PacketType::ProtoPathLookup => {
                 let lookup = match wire::PathLookup::decode(payload) {
@@ -560,10 +545,7 @@ pub(crate) async fn peer_reader(
                         break;
                     },
                 };
-                let mut router = router.lock().await;
-                let actions = router.handle_lookup(&peer_key, &lookup);
-                drop(router);
-                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
+                router.send(RouterMsg::HandleLookup { peer_key, lookup });
             }
             wire::PacketType::ProtoPathNotify => {
                 let notify = match wire::PathNotify::decode(payload) {
@@ -573,10 +555,7 @@ pub(crate) async fn peer_reader(
                         break;
                     },
                 };
-                let mut router = router.lock().await;
-                let actions = router.handle_notify(&peer_key, &notify);
-                drop(router);
-                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
+                router.send(RouterMsg::HandleNotify { peer_key, notify });
             }
             wire::PacketType::ProtoPathBroken => {
                 let broken = match wire::PathBroken::decode(payload) {
@@ -586,10 +565,7 @@ pub(crate) async fn peer_reader(
                         break;
                     },
                 };
-                let mut router = router.lock().await;
-                let actions = router.handle_broken(&broken);
-                drop(router);
-                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
+                router.send(RouterMsg::HandleBroken { broken });
             }
             wire::PacketType::Traffic => {
                 let tr = match wire::Traffic::decode(payload) {
@@ -607,10 +583,7 @@ pub(crate) async fn peer_reader(
                     watermark: tr.watermark,
                     payload: tr.payload,
                 };
-                let mut router = router.lock().await;
-                let actions = router.handle_traffic(traffic);
-                drop(router);
-                dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
+                router.send(RouterMsg::HandleTraffic { traffic });
             }
         }
 
@@ -634,15 +607,11 @@ pub(crate) async fn peer_reader(
             .unwrap_or(0);
         drop(peers_lock);
 
-        let mut router = router.lock().await;
-        let actions = router.remove_peer(peer_id, peer_key, port);
-        drop(router);
+        router.send(RouterMsg::RemovePeer { peer_id, key: peer_key, port });
 
         let mut peers_lock = peers.lock().await;
         peers_lock.remove_peer(peer_id, &peer_key);
         drop(peers_lock);
-
-        dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
     }
 
     cancel.cancel();
@@ -741,11 +710,8 @@ pub(crate) async fn peer_writer(
     mut rx: mpsc::Receiver<PeerMessage>,
     conn_write: impl tokio::io::AsyncWrite + Unpin + Send,
     traffic_queue: Arc<tokio::sync::Mutex<PacketQueue>>,
-    router: Arc<tokio::sync::Mutex<Router>>,
+    router: RouterHandle,
     peers: Arc<tokio::sync::Mutex<Peers>>,
-    delivery_queue: Arc<DeliveryQueue>,
-    traffic_tx: mpsc::Sender<TrafficPacket>,
-    path_notify_cb: Option<Arc<dyn Fn(PublicKey) + Send + Sync>>,
     _keepalive_delay: Duration,
     peer_timeout: Duration,
     read_deadline: ReadDeadline,
@@ -887,17 +853,11 @@ pub(crate) async fn peer_writer(
 
     // Remove the stale peer from the router and peer manager.
     {
-        let mut router_guard = router.lock().await;
-        let actions = router_guard.remove_peer(peer_id, peer_key, port);
-        drop(router_guard);
+        router.send(RouterMsg::RemovePeer { peer_id, key: peer_key, port });
 
         let mut peers_guard = peers.lock().await;
         peers_guard.remove_peer(peer_id, &peer_key);
         drop(peers_guard);
-
-        if !actions.is_empty() {
-            dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
-        }
     }
 }
 
@@ -924,17 +884,6 @@ fn peek_frame_type(data: &[u8]) -> Option<wire::PacketType> {
 // ---------------------------------------------------------------------------
 // Action dispatch helpers
 // ---------------------------------------------------------------------------
-
-/// Dispatch a single router action.
-async fn dispatch_action(
-    action: RouterAction,
-    peers: &Arc<tokio::sync::Mutex<Peers>>,
-) {
-    if let Some((peer_id, frame)) = encode_action_frame(&action) {
-        let peers = peers.lock().await;
-        let _ = peers.send_to_peer(peer_id, PeerMessage::SendFrame(frame)).await;
-    }
-}
 
 /// Dispatch a batch of router actions.
 pub(crate) async fn dispatch_actions(

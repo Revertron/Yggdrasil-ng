@@ -2,26 +2,29 @@
 //! `PacketConn` implementation.
 //!
 //! - `PacketConnImpl` is the concrete implementation of `types::PacketConn`.
-//! - Spawns a maintenance loop via `tokio::spawn`.
+//! - The Router runs as a dedicated actor task (`router_actor`), processing
+//!   messages from an mpsc channel. This eliminates mutex contention that
+//!   previously caused cascade disconnects under high peer counts.
 //! - `handle_conn()` spawns reader/writer tasks per peer.
 //! - `read_from()` receives delivered traffic via an mpsc channel.
-//! - `write_to()` encodes traffic and routes via the router.
+//! - `write_to()` sends traffic to the router actor for routing.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::bloom::BloomFilter;
 use crate::config::Config;
 use crate::crypto::{Crypto, PublicKey};
 use crate::peers::{
     dispatch_actions, peer_reader, peer_writer, PeerMessage, Peers, ReadDeadline,
 };
-use crate::router::Router;
+use crate::router::{PeerEntry, PeerId, Router, RouterAction, RouterAnnounce};
 use crate::traffic::{DeliveryQueue, TrafficPacket};
 use crate::types::{Addr, AsyncConn, Error, Result};
 use crate::wire;
@@ -32,6 +35,458 @@ const RECV_CHANNEL_SIZE: usize = 512;
 /// Default channel capacity for peer writer.
 const PEER_WRITER_CHANNEL_SIZE: usize = 512;
 
+/// Channel capacity for the router actor message queue.
+/// With 50 peers at ~10 msg/sec = 500 msg/sec; 4096 gives ~8s headroom.
+const ROUTER_CHANNEL_SIZE: usize = 4096;
+
+// ---------------------------------------------------------------------------
+// Router actor message types
+// ---------------------------------------------------------------------------
+
+/// Messages sent to the router actor task.
+pub(crate) enum RouterMsg {
+    // --- Fire-and-forget mutations (no reply needed) ---
+    AddPeer {
+        entry: PeerEntry,
+        /// Signaled after the peer is registered and initial actions dispatched.
+        done: Option<oneshot::Sender<()>>,
+    },
+    RemovePeer {
+        peer_id: PeerId,
+        key: PublicKey,
+        port: u64,
+    },
+    HandleRequest {
+        peer_id: PeerId,
+        peer_key: PublicKey,
+        req: wire::SigReq,
+    },
+    HandleResponse {
+        peer_id: PeerId,
+        key: PublicKey,
+        res: wire::SigRes,
+    },
+    HandleAnnounce {
+        peer_id: PeerId,
+        peer_key: PublicKey,
+        ann: RouterAnnounce,
+    },
+    HandleBloom {
+        peer_key: PublicKey,
+        filter: BloomFilter,
+    },
+    HandleTraffic {
+        traffic: TrafficPacket,
+    },
+    SendTraffic {
+        traffic: TrafficPacket,
+    },
+    HandleLookup {
+        peer_key: PublicKey,
+        lookup: wire::PathLookup,
+    },
+    HandleNotify {
+        peer_key: PublicKey,
+        notify: wire::PathNotify,
+    },
+    HandleBroken {
+        broken: wire::PathBroken,
+    },
+    /// Combines ensure_rumor + send_traffic (used by send_lookup).
+    SendLookup {
+        our_key: PublicKey,
+        dest: PublicKey,
+    },
+
+    // --- Queries (with oneshot reply) ---
+    ForceLookup {
+        dest: PublicKey,
+        reply: oneshot::Sender<usize>,
+    },
+    GetPeers {
+        reply: oneshot::Sender<Vec<PeerInfo>>,
+    },
+    GetTree {
+        reply: oneshot::Sender<Vec<TreeEntry>>,
+    },
+    GetPaths {
+        reply: oneshot::Sender<Vec<PathEntry>>,
+    },
+    RoutingEntries {
+        reply: oneshot::Sender<usize>,
+    },
+    TreeCoordinates {
+        reply: oneshot::Sender<Vec<wire::PeerPort>>,
+    },
+    GetDebugSnapshot {
+        delivery_queue_bytes: u64,
+        reply: oneshot::Sender<DebugSnapshot>,
+    },
+    GetRoutingPeerKeys {
+        reply: oneshot::Sender<Vec<PublicKey>>,
+    },
+    CountLookupTargets {
+        dest: PublicKey,
+        reply: oneshot::Sender<(PublicKey, usize)>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// RouterHandle — cloneable sender for the router actor
+// ---------------------------------------------------------------------------
+
+/// A cloneable handle to the router actor. Send messages via `send()` (fire-
+/// and-forget) or the `query_*()` async methods (with reply).
+#[derive(Clone)]
+pub(crate) struct RouterHandle {
+    tx: mpsc::Sender<RouterMsg>,
+}
+
+impl RouterHandle {
+    /// Fire-and-forget: enqueue a message to the router actor.
+    /// Never blocks the caller — if the channel is full, spawns a background task.
+    pub fn send(&self, msg: RouterMsg) {
+        match self.tx.try_send(msg) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(msg)) => {
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(msg).await;
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    /// Blocking send: wait until the message is enqueued.
+    /// Used for AddPeer where we must ensure registration completes before
+    /// spawning the peer reader.
+    pub async fn send_wait(&self, msg: RouterMsg) {
+        let _ = self.tx.send(msg).await;
+    }
+
+    // --- Query convenience methods ---
+
+    pub async fn query_peers(&self) -> Vec<PeerInfo> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(RouterMsg::GetPeers { reply: tx }).await;
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn query_tree(&self) -> Vec<TreeEntry> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(RouterMsg::GetTree { reply: tx }).await;
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn query_paths(&self) -> Vec<PathEntry> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(RouterMsg::GetPaths { reply: tx }).await;
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn query_routing_entries(&self) -> usize {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(RouterMsg::RoutingEntries { reply: tx }).await;
+        rx.await.unwrap_or(0)
+    }
+
+    pub async fn query_tree_coordinates(&self) -> Vec<wire::PeerPort> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(RouterMsg::TreeCoordinates { reply: tx }).await;
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn query_debug_snapshot(&self, delivery_queue_bytes: u64) -> DebugSnapshot {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(RouterMsg::GetDebugSnapshot {
+                delivery_queue_bytes,
+                reply: tx,
+            })
+            .await;
+        rx.await.unwrap_or(DebugSnapshot {
+            tree_node_count: 0,
+            routing_peer_count: 0,
+            tree_root: [0; 32],
+            our_coords: vec![],
+            path_cache_count: 0,
+            broken_path_count: 0,
+            pending_lookups: vec![],
+            unresponded_peers: 0,
+            peer_latencies_ms: vec![],
+            delivery_queue_bytes: 0,
+        })
+    }
+
+    pub async fn query_routing_peer_keys(&self) -> Vec<PublicKey> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(RouterMsg::GetRoutingPeerKeys { reply: tx })
+            .await;
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn query_count_lookup_targets(&self, dest: PublicKey) -> (PublicKey, usize) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(RouterMsg::CountLookupTargets { dest, reply: tx })
+            .await;
+        rx.await.unwrap_or(([0; 32], 0))
+    }
+
+    pub async fn query_force_lookup(&self, dest: PublicKey) -> usize {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .tx
+            .send(RouterMsg::ForceLookup { dest, reply: tx })
+            .await;
+        rx.await.unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Router actor task
+// ---------------------------------------------------------------------------
+
+/// The router actor: owns the Router exclusively, processes messages from
+/// the channel, runs periodic maintenance, and dispatches resulting actions.
+/// Replaces both the old `Arc<Mutex<Router>>` and `maintenance_loop`.
+async fn router_actor(
+    mut router: Router,
+    mut rx: mpsc::Receiver<RouterMsg>,
+    peers: Arc<Mutex<Peers>>,
+    delivery_queue: Arc<DeliveryQueue>,
+    traffic_tx: mpsc::Sender<TrafficPacket>,
+    path_notify_cb: Option<Arc<dyn Fn(PublicKey) + Send + Sync>>,
+    cancel: CancellationToken,
+) {
+    let mut maintenance_interval = tokio::time::interval(Duration::from_secs(1));
+    maintenance_interval.tick().await; // skip first immediate tick
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = maintenance_interval.tick() => {
+                router.expire_infos();
+                let actions = router.do_maintenance();
+                if !actions.is_empty() {
+                    dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
+                }
+            }
+            msg = rx.recv() => {
+                let Some(msg) = msg else { break };
+                handle_router_msg(
+                    &mut router, msg, &peers, &delivery_queue,
+                    &traffic_tx, &path_notify_cb,
+                ).await;
+            }
+        }
+    }
+}
+
+/// Process a single router message: call the appropriate Router method and
+/// dispatch any resulting actions.
+async fn handle_router_msg(
+    router: &mut Router,
+    msg: RouterMsg,
+    peers: &Arc<Mutex<Peers>>,
+    delivery_queue: &Arc<DeliveryQueue>,
+    traffic_tx: &mpsc::Sender<TrafficPacket>,
+    path_notify_cb: &Option<Arc<dyn Fn(PublicKey) + Send + Sync>>,
+) {
+    match msg {
+        RouterMsg::AddPeer { entry, done } => {
+            let actions = router.add_peer(entry);
+            dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
+            if let Some(tx) = done {
+                let _ = tx.send(());
+            }
+        }
+        RouterMsg::RemovePeer { peer_id, key, port } => {
+            let actions = router.remove_peer(peer_id, key, port);
+            dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
+        }
+        RouterMsg::HandleRequest { peer_id, peer_key, req } => {
+            // Look up peer entry and compute SigRes response
+            if let Some(peers_map) = router.peers.get(&peer_key) {
+                if let Some(entry) = peers_map.get(&peer_id) {
+                    let action = router.handle_request_with_data(entry, &req);
+                    dispatch_actions(vec![action], peers, delivery_queue, traffic_tx, path_notify_cb).await;
+                }
+            }
+        }
+        RouterMsg::HandleResponse { peer_id, key, res } => {
+            router.handle_response(peer_id, &key, &res);
+        }
+        RouterMsg::HandleAnnounce { peer_id, peer_key, ann } => {
+            let actions = router.handle_announce(peer_id, &peer_key, &ann);
+            dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
+        }
+        RouterMsg::HandleBloom { peer_key, filter } => {
+            router.handle_bloom(&peer_key, filter);
+        }
+        RouterMsg::HandleTraffic { traffic } => {
+            let actions = router.handle_traffic(traffic);
+            dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
+        }
+        RouterMsg::SendTraffic { traffic } => {
+            let actions = router.send_traffic(traffic);
+            dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
+        }
+        RouterMsg::HandleLookup { peer_key, lookup } => {
+            let actions = router.handle_lookup(&peer_key, &lookup);
+            dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
+        }
+        RouterMsg::HandleNotify { peer_key, notify } => {
+            let actions = router.handle_notify(&peer_key, &notify);
+            dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
+        }
+        RouterMsg::HandleBroken { broken } => {
+            let actions = router.handle_broken(&broken);
+            dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
+        }
+        RouterMsg::SendLookup { our_key, dest } => {
+            let xform = router.blooms.x_key(&dest, &router.bloom_transform);
+            router.pathfinder.ensure_rumor(xform);
+            let actions = router.send_traffic(TrafficPacket::new(our_key, dest, Vec::new()));
+            dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
+        }
+        RouterMsg::ForceLookup { dest, reply } => {
+            let actions = router.force_lookup(dest);
+            let n = actions.iter().filter(|a| matches!(a, RouterAction::SendPathLookup { .. })).count();
+            dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
+            let _ = reply.send(n);
+        }
+        RouterMsg::GetPeers { reply } => {
+            let mut result = Vec::new();
+            for (key, entries) in &router.peers {
+                for (_id, entry) in entries {
+                    let latency_ms = router
+                        .lags
+                        .get(&entry.id)
+                        .map(|d| d.as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                    let cost = router.get_cost(entry.id);
+                    result.push(PeerInfo {
+                        key: *key,
+                        port: entry.port,
+                        priority: entry.prio,
+                        latency_ms,
+                        cost,
+                    });
+                }
+            }
+            let _ = reply.send(result);
+        }
+        RouterMsg::GetTree { reply } => {
+            let mut result: Vec<TreeEntry> = router
+                .infos
+                .iter()
+                .map(|(key, info)| TreeEntry {
+                    key: *key,
+                    parent: info.parent,
+                    sequence: info.seq,
+                })
+                .collect();
+            result.sort_by(|a, b| a.key.cmp(&b.key));
+            let _ = reply.send(result);
+        }
+        RouterMsg::GetPaths { reply } => {
+            let mut result: Vec<PathEntry> = router
+                .pathfinder
+                .paths
+                .iter()
+                .filter(|(_, info)| !info.broken)
+                .map(|(key, info)| PathEntry {
+                    key: *key,
+                    path: info.path.clone(),
+                    sequence: info.seq,
+                })
+                .collect();
+            result.sort_by(|a, b| a.key.cmp(&b.key));
+            let _ = reply.send(result);
+        }
+        RouterMsg::RoutingEntries { reply } => {
+            let _ = reply.send(router.infos.len());
+        }
+        RouterMsg::TreeCoordinates { reply } => {
+            let self_key = router.crypto.public_key;
+            let (_root, path) = router.get_root_and_path(&self_key);
+            let _ = reply.send(path);
+        }
+        RouterMsg::GetDebugSnapshot { delivery_queue_bytes, reply } => {
+            use std::time::Instant;
+            let now = Instant::now();
+            let self_key = router.crypto.public_key;
+            let (tree_root, our_coords) = router.get_root_and_path(&self_key);
+
+            let pending_lookups = router
+                .pathfinder
+                .rumors
+                .iter()
+                .map(|(xformed_key, rumor)| {
+                    let dest_key = rumor.traffic.as_ref().map(|t| t.dest);
+                    let age_secs = now.duration_since(rumor.created).as_secs_f64();
+                    let multicast_count =
+                        router.blooms.count_on_tree_targets_for_xkey(xformed_key);
+                    PendingLookup {
+                        dest_key,
+                        xformed_key: *xformed_key,
+                        age_secs,
+                        sent: rumor.send_time.is_some(),
+                        multicast_count,
+                    }
+                })
+                .collect();
+
+            let total_peer_ids: usize = router.peers.values().map(|m| m.len()).sum();
+            let unresponded_peers = total_peer_ids.saturating_sub(router.responded.len());
+
+            let peer_latencies_ms = router
+                .peers
+                .iter()
+                .map(|(key, entries)| {
+                    let latency = entries
+                        .keys()
+                        .find_map(|id| router.lags.get(id))
+                        .map(|d| d.as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                    (*key, latency)
+                })
+                .collect();
+
+            let _ = reply.send(DebugSnapshot {
+                tree_node_count: router.infos.len(),
+                routing_peer_count: router.peers.len(),
+                tree_root,
+                our_coords,
+                path_cache_count: router.pathfinder.paths.len(),
+                broken_path_count: router.pathfinder.paths.values().filter(|p| p.broken).count(),
+                pending_lookups,
+                unresponded_peers,
+                peer_latencies_ms,
+                delivery_queue_bytes,
+            });
+        }
+        RouterMsg::GetRoutingPeerKeys { reply } => {
+            let _ = reply.send(router.peers.keys().copied().collect());
+        }
+        RouterMsg::CountLookupTargets { dest, reply } => {
+            let xform = router.blooms.x_key(&dest, &router.bloom_transform);
+            let count = router.blooms.count_on_tree_targets_for_xkey(&xform);
+            let _ = reply.send((xform, count));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PacketConnImpl
+// ---------------------------------------------------------------------------
+
 /// The concrete PacketConn implementation.
 pub struct PacketConnImpl {
     /// Signing key (identity).
@@ -40,24 +495,20 @@ pub struct PacketConnImpl {
     pub_key: PublicKey,
     /// Configuration.
     config: Config,
-    /// The router (shared with peer tasks).
-    router: Arc<Mutex<Router>>,
+    /// Handle to the router actor (replaces Arc<Mutex<Router>>).
+    pub(crate) router_handle: RouterHandle,
     /// The peer manager (shared with peer tasks).
     peers: Arc<Mutex<Peers>>,
     /// Delivery queue for receive buffering with backpressure.
     delivery_queue: Arc<DeliveryQueue>,
     /// Inbound traffic channel (reader side).
     traffic_rx: Mutex<mpsc::Receiver<TrafficPacket>>,
-    /// Inbound traffic channel (writer side, given to peer readers).
-    traffic_tx: mpsc::Sender<TrafficPacket>,
     /// Whether this PacketConn is closed.
     closed: AtomicBool,
     /// Cancellation token for background tasks.
     cancel: CancellationToken,
-    /// Path notify callback (stored outside router lock so it can be called lock-free).
-    path_notify_cb: Option<Arc<dyn Fn(PublicKey) + Send + Sync>>,
-    /// Maintenance task handle.
-    _maintenance_handle: JoinHandle<()>,
+    /// Router actor task handle.
+    _actor_handle: JoinHandle<()>,
 }
 
 impl PacketConnImpl {
@@ -65,70 +516,40 @@ impl PacketConnImpl {
     pub fn new(secret: SigningKey, config: Config) -> Self {
         let crypto = Crypto::new(secret.clone());
         let pub_key = crypto.public_key;
-        let router = Arc::new(Mutex::new(Router::new(crypto, &config)));
+        let router = Router::new(crypto, &config);
         let peers = Arc::new(Mutex::new(Peers::new()));
         let delivery_queue = DeliveryQueue::new();
         let (traffic_tx, traffic_rx) = mpsc::channel(RECV_CHANNEL_SIZE);
         let cancel = CancellationToken::new();
-
         let path_notify_cb = config.path_notify.clone();
 
-        // Spawn maintenance loop
-        let maintenance_handle = {
-            let router = router.clone();
+        // Create router actor channel and spawn actor task
+        let (router_tx, router_rx) = mpsc::channel(ROUTER_CHANNEL_SIZE);
+        let router_handle = RouterHandle { tx: router_tx };
+
+        let actor_handle = {
             let peers = peers.clone();
             let delivery_queue = delivery_queue.clone();
             let traffic_tx = traffic_tx.clone();
             let cancel = cancel.clone();
             let path_notify_cb = path_notify_cb.clone();
-            tokio::spawn(maintenance_loop(router, peers, delivery_queue, traffic_tx, cancel, path_notify_cb))
+            tokio::spawn(router_actor(
+                router, router_rx, peers, delivery_queue, traffic_tx,
+                path_notify_cb, cancel,
+            ))
         };
 
         Self {
             signing_key: secret,
             pub_key,
             config,
-            router,
+            router_handle,
             peers,
             delivery_queue,
             traffic_rx: Mutex::new(traffic_rx),
-            traffic_tx,
             closed: AtomicBool::new(false),
             cancel,
-            path_notify_cb,
-            _maintenance_handle: maintenance_handle,
-        }
-    }
-}
-
-/// Background maintenance loop — runs every 1 second.
-async fn maintenance_loop(
-    router: Arc<Mutex<Router>>,
-    peers: Arc<Mutex<Peers>>,
-    delivery_queue: Arc<DeliveryQueue>,
-    traffic_tx: mpsc::Sender<TrafficPacket>,
-    cancel: CancellationToken,
-    path_notify_cb: Option<Arc<dyn Fn(PublicKey) + Send + Sync>>,
-) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    interval.tick().await; // skip first immediate tick
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = interval.tick() => {}
-        }
-
-        let actions = {
-            let mut router = router.lock().await;
-            router.expire_infos();
-            router.do_maintenance()
-        };
-
-        if !actions.is_empty() {
-            dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
-        } else {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            _actor_handle: actor_handle,
         }
     }
 }
@@ -142,7 +563,6 @@ impl crate::types::PacketConn for PacketConnImpl {
 
         // First, try to pop from the queue (if packets are already buffered)
         let traffic = if let Some(pkt) = self.delivery_queue.try_pop_or_wait().await {
-            // Got a packet from the queue
             pkt
         } else {
             // Queue was empty, recv_ready was incremented, now wait on channel
@@ -175,20 +595,12 @@ impl crate::types::PacketConn for PacketConnImpl {
         }
 
         let traffic = TrafficPacket::new(self.pub_key, addr.0, buf.to_vec());
-
-        let actions = {
-            let mut router = self.router.lock().await;
-            router.send_traffic(traffic)
-        };
-
-        if !actions.is_empty() {
-            dispatch_actions(actions, &self.peers, &self.delivery_queue, &self.traffic_tx, &self.path_notify_cb).await;
-        }
+        self.router_handle.send(RouterMsg::SendTraffic { traffic });
 
         Ok(buf.len())
     }
 
-    async fn handle_conn(&self, key: Addr, conn: Box<dyn AsyncConn>, prio: u8,) -> Result<()> {
+    async fn handle_conn(&self, key: Addr, conn: Box<dyn AsyncConn>, prio: u8) -> Result<()> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
@@ -206,10 +618,6 @@ impl crate::types::PacketConn for PacketConnImpl {
         // Create writer channel and cancellation token for this peer
         let (writer_tx, writer_rx) = mpsc::channel(PEER_WRITER_CHANNEL_SIZE);
         let peer_cancel = CancellationToken::new();
-        // Ensure peer_cancel is canceled if this future is dropped. Without this,
-        // peer_writer keeps the old TCP write-half alive indefinitely — the stale peer
-        // is never removed from the router, poisoning bloom-filter path lookups for
-        // minutes or hours after a peer switch.
         let _cancel_on_drop = peer_cancel.clone().drop_guard();
 
         // Allocate the peer in the peers manager
@@ -223,16 +631,17 @@ impl crate::types::PacketConn for PacketConnImpl {
         let port = handle.port;
         let traffic_queue = handle.traffic_queue.clone();
 
-        // Register with router and get initial actions
-        let actions = {
-            let mut router = self.router.lock().await;
-            router.add_peer(entry)
-        };
-
-        // Send initial actions (sig req, bloom, etc.)
-        if !actions.is_empty() {
-            dispatch_actions(actions, &self.peers, &self.delivery_queue, &self.traffic_tx, &self.path_notify_cb).await;
-        }
+        // Register with router actor and wait for completion.
+        // This ensures the peer is in the router before the reader starts.
+        let (done_tx, done_rx) = oneshot::channel();
+        self.router_handle
+            .send_wait(RouterMsg::AddPeer {
+                entry,
+                done: Some(done_tx),
+            })
+            .await;
+        // Wait for the actor to process AddPeer and dispatch initial actions
+        let _ = done_rx.await;
 
         // Send a keepalive as initial message
         let keepalive_frame = wire::encode_frame(wire::PacketType::KeepAlive, &[]);
@@ -241,7 +650,7 @@ impl crate::types::PacketConn for PacketConnImpl {
             .await;
 
         // Shared deadline: writer arms it on non-keepalive sends;
-        // reader clears it on any receive.  Matches Go's SetReadDeadline approach.
+        // reader clears it on any receive.
         let read_deadline: ReadDeadline = Arc::new(std::sync::Mutex::new(None));
 
         // Spawn writer task
@@ -253,11 +662,8 @@ impl crate::types::PacketConn for PacketConnImpl {
             writer_rx,
             write_half,
             traffic_queue,
-            self.router.clone(),
+            self.router_handle.clone(),
             self.peers.clone(),
-            self.delivery_queue.clone(),
-            self.traffic_tx.clone(),
-            self.path_notify_cb.clone(),
             self.config.peer_keepalive_delay,
             self.config.peer_timeout,
             read_deadline.clone(),
@@ -270,16 +676,13 @@ impl crate::types::PacketConn for PacketConnImpl {
             peer_key,
             self.pub_key,
             read_half,
-            self.router.clone(),
+            self.router_handle.clone(),
             self.peers.clone(),
-            self.delivery_queue.clone(),
-            self.traffic_tx.clone(),
             writer_tx.clone(),
             peer_cancel.clone(),
             self.config.peer_max_message_size,
             self.config.peer_timeout,
             self.config.peer_keepalive_delay,
-            self.path_notify_cb.clone(),
             read_deadline,
         )
         .await;
@@ -296,17 +699,15 @@ impl crate::types::PacketConn for PacketConnImpl {
     }
 
     fn mtu(&self) -> u64 {
-        // Compute overhead dynamically using Traffic::size()
-        // Create a dummy traffic packet with maximum watermark to get worst-case overhead
         let traffic = wire::Traffic {
             path: vec![],
             from: vec![],
             source: [0; 32],
             dest: [0; 32],
-            watermark: u64::MAX,  // Maximum watermark for worst-case size
+            watermark: u64::MAX,
             payload: vec![],
         };
-        let overhead = traffic.size() + 1;  // +1 for packet type byte
+        let overhead = traffic.size() + 1;
         self.config.peer_max_message_size.saturating_sub(overhead as u64)
     }
 
@@ -314,18 +715,10 @@ impl crate::types::PacketConn for PacketConnImpl {
         if self.closed.load(Ordering::Relaxed) {
             return;
         }
-
-        let actions = {
-            let mut router = self.router.lock().await;
-            let dest = target.0;
-            let xform = router.blooms.x_key(&dest, &router.bloom_transform);
-            router.pathfinder.ensure_rumor(xform);
-            router.send_traffic(TrafficPacket::new(self.pub_key, dest, Vec::new()))
-        };
-
-        if !actions.is_empty() {
-            dispatch_actions(actions, &self.peers, &self.delivery_queue, &self.traffic_tx, &self.path_notify_cb).await;
-        }
+        self.router_handle.send(RouterMsg::SendLookup {
+            our_key: self.pub_key,
+            dest: target.0,
+        });
     }
 
     async fn close(&self) -> Result<()> {
@@ -337,7 +730,7 @@ impl crate::types::PacketConn for PacketConnImpl {
             return Err(Error::Closed);
         }
 
-        // Cancel all background tasks
+        // Cancel all background tasks (including router actor)
         self.cancel.cancel();
 
         // Close all peer connections
@@ -367,46 +760,32 @@ impl crate::types::PacketConn for PacketConnImpl {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Public types returned by query methods
+// ---------------------------------------------------------------------------
+
 /// One pending path lookup ("rumor") that hasn't resolved yet.
 #[derive(Clone, Debug)]
 pub struct PendingLookup {
-    /// Original destination key we're trying to reach (from cached traffic, if any).
-    /// None if the lookup was triggered without buffered traffic.
     pub dest_key: Option<[u8; 32]>,
-    /// Bloom-transformed key used for routing the lookup through the network.
     pub xformed_key: [u8; 32],
-    /// How long this lookup has been waiting (seconds).
     pub age_secs: f64,
-    /// Whether a lookup was ever sent.
     pub sent: bool,
-    /// How many on-tree peers' bloom filters matched this lookup's xformed key.
-    /// 0 means the lookup was sent to nobody (no peer claims to know the route).
     pub multicast_count: usize,
 }
 
 /// Diagnostic snapshot of internal routing state.
 #[derive(Clone, Debug)]
 pub struct DebugSnapshot {
-    /// Number of nodes known in the spanning tree.
     pub tree_node_count: usize,
-    /// Number of direct routing peers (unique keys).
     pub routing_peer_count: usize,
-    /// Public key of the current tree root.
     pub tree_root: [u8; 32],
-    /// Our current tree coordinates (path from root).
     pub our_coords: Vec<u64>,
-    /// Total cached paths (including broken).
     pub path_cache_count: usize,
-    /// Paths currently marked as broken (waiting for replacement).
     pub broken_path_count: usize,
-    /// Pending path lookups with details (bloom-filter route discovery in progress).
     pub pending_lookups: Vec<PendingLookup>,
-    /// Peer connections that haven't responded to our latest SigReq yet.
-    /// High count means peers aren't completing the routing handshake.
     pub unresponded_peers: usize,
-    /// Per-peer measured latency in milliseconds (key, latency_ms).
     pub peer_latencies_ms: Vec<([u8; 32], f64)>,
-    /// Bytes currently queued in the receive delivery queue.
     pub delivery_queue_bytes: u64,
 }
 
@@ -443,164 +822,52 @@ impl PacketConnImpl {
         if self.closed.load(Ordering::Relaxed) {
             return 0;
         }
-
-        let actions = {
-            let mut router = self.router.lock().await;
-            router.force_lookup(dest)
-        };
-
-        let n = actions.iter().filter(|a| matches!(a, crate::router::RouterAction::SendPathLookup { .. })).count();
-        if !actions.is_empty() {
-            dispatch_actions(actions, &self.peers, &self.delivery_queue, &self.traffic_tx, &self.path_notify_cb).await;
-        }
-        n
+        self.router_handle.query_force_lookup(dest).await
     }
 
     /// Get info about all connected peers.
     pub async fn get_peers(&self) -> Vec<PeerInfo> {
-        let router = self.router.lock().await;
-        let mut result = Vec::new();
-        for (key, entries) in &router.peers {
-            for (_id, entry) in entries {
-                let latency_ms = router
-                    .lags
-                    .get(&entry.id)
-                    .map(|d| d.as_secs_f64() * 1000.0)
-                    .unwrap_or(0.0);
-                let cost = router.get_cost(entry.id);
-                result.push(PeerInfo {
-                    key: *key,
-                    port: entry.port,
-                    priority: entry.prio,
-                    latency_ms,
-                    cost,
-                });
-            }
-        }
-        result
+        self.router_handle.query_peers().await
     }
 
     /// Get spanning tree entries.
     pub async fn get_tree(&self) -> Vec<TreeEntry> {
-        let router = self.router.lock().await;
-        let mut result = Vec::new();
-        for (key, info) in &router.infos {
-            result.push(TreeEntry {
-                key: *key,
-                parent: info.parent,
-                sequence: info.seq,
-            });
-        }
-        result.sort_by(|a, b| a.key.cmp(&b.key));
-        result
+        self.router_handle.query_tree().await
     }
 
     /// Get the number of routing entries (tree nodes known).
     pub async fn routing_entries(&self) -> usize {
-        let router = self.router.lock().await;
-        router.infos.len()
+        self.router_handle.query_routing_entries().await
     }
 
     /// Get our current tree coordinates (path from root).
     pub async fn tree_coordinates(&self) -> Vec<wire::PeerPort> {
-        let router = self.router.lock().await;
-        let self_key = router.crypto.public_key;
-        let (_root, path) = router.get_root_and_path(&self_key);
-        path
+        self.router_handle.query_tree_coordinates().await
     }
 
     /// Get all cached paths (from pathfinder).
     pub async fn get_paths(&self) -> Vec<PathEntry> {
-        let router = self.router.lock().await;
-        let mut result = Vec::new();
-        for (key, info) in &router.pathfinder.paths {
-            if !info.broken {
-                result.push(PathEntry {
-                    key: *key,
-                    path: info.path.clone(),
-                    sequence: info.seq,
-                });
-            }
-        }
-        result.sort_by(|a, b| a.key.cmp(&b.key));
-        result
+        self.router_handle.query_paths().await
     }
 
     /// Get a diagnostic snapshot of internal routing state.
     pub async fn get_debug_snapshot(&self) -> DebugSnapshot {
-        use std::time::Instant;
-        let now = Instant::now();
         let delivery_queue_bytes = self.delivery_queue.queue_size().await;
-        let router = self.router.lock().await;
-        let self_key = router.crypto.public_key;
-        let (tree_root, our_coords) = router.get_root_and_path(&self_key);
-
-        // Build pending lookup list with original dest keys where available.
-        let pending_lookups = router
-            .pathfinder
-            .rumors
-            .iter()
-            .map(|(xformed_key, rumor)| {
-                let dest_key = rumor.traffic.as_ref().map(|t| t.dest);
-                let age_secs = now.duration_since(rumor.created).as_secs_f64();
-                let multicast_count = router.blooms.count_on_tree_targets_for_xkey(xformed_key);
-                PendingLookup {
-                    dest_key,
-                    xformed_key: *xformed_key,
-                    age_secs,
-                    sent: rumor.send_time.is_some(),
-                    multicast_count,
-                }
-            })
-            .collect();
-
-        // Count peer connections that haven't responded to our latest SigReq.
-        // `responded` tracks peer_ids that sent a valid matching SigRes.
-        let total_peer_ids: usize = router.peers.values().map(|m| m.len()).sum();
-        let unresponded_peers = total_peer_ids.saturating_sub(router.responded.len());
-
-        let peer_latencies_ms = router
-            .peers
-            .iter()
-            .map(|(key, entries)| {
-                let latency = entries
-                    .keys()
-                    .find_map(|id| router.lags.get(id))
-                    .map(|d| d.as_secs_f64() * 1000.0)
-                    .unwrap_or(0.0);
-                (*key, latency)
-            })
-            .collect();
-
-        DebugSnapshot {
-            tree_node_count: router.infos.len(),
-            routing_peer_count: router.peers.len(),
-            tree_root,
-            our_coords,
-            path_cache_count: router.pathfinder.paths.len(),
-            broken_path_count: router.pathfinder.paths.values().filter(|p| p.broken).count(),
-            pending_lookups,
-            unresponded_peers,
-            peer_latencies_ms,
-            delivery_queue_bytes,
-        }
+        self.router_handle
+            .query_debug_snapshot(delivery_queue_bytes)
+            .await
     }
 
     /// Get routing peer keys (direct neighbors in spanning tree).
     pub async fn get_routing_peer_keys(&self) -> Vec<crate::crypto::PublicKey> {
-        let router = self.router.lock().await;
-        router.peers.keys().copied().collect()
+        self.router_handle.query_routing_peer_keys().await
     }
 
     /// Count how many on-tree peers' bloom filters cover the given destination key.
-    /// Returns (xformed_key, multicast_count).
-    /// A count of 0 means the destination is unreachable through the current spanning tree
-    /// (no peer claims to have it in their subtree); the lookup would go nowhere.
     pub async fn count_lookup_targets(&self, dest: PublicKey) -> (PublicKey, usize) {
-        let router = self.router.lock().await;
-        let xform = router.blooms.x_key(&dest, &router.bloom_transform);
-        let count = router.blooms.count_on_tree_targets_for_xkey(&xform);
-        (xform, count)
+        self.router_handle
+            .query_count_lookup_targets(dest)
+            .await
     }
 }
 
@@ -637,7 +904,6 @@ mod tests {
 
         use crate::types::PacketConn;
         let mtu = conn.mtu();
-        // With 1MB max message size, MTU should be close to 1MB minus small overhead
         assert!(mtu > 1_000_000 - 100);
         assert!(mtu < 1_048_576);
 
@@ -660,7 +926,6 @@ mod tests {
 
     #[tokio::test]
     async fn write_to_self_returns_ok() {
-        // Writing to self should work (packet gets routed, lookup initiated)
         let key = SigningKey::generate(&mut OsRng);
         let config = Config::default();
         let conn = new_packet_conn(key, config);
