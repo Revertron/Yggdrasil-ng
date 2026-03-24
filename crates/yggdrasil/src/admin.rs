@@ -183,15 +183,18 @@ async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_js
             let peers_json: Vec<serde_json::Value> = peers
                 .iter()
                 .map(|p| {
-                    let address = addr_for_key(&p.key);
-                    let subnet = subnet_for_key(&p.key);
+                    let (address, subnet, key) = if p.up {
+                        (addr_for_key(&p.key).to_string(), subnet_for_key(&p.key).to_string(), hex::encode(p.key))
+                    } else {
+                        ("-".to_string(), "-".to_string(), "-".to_string())
+                    };
                     serde_json::json!({
                         "uri": p.uri,
                         "up": p.up,
                         "inbound": p.inbound,
-                        "key": hex::encode(p.key),
-                        "address": address.to_string(),
-                        "subnet": subnet.to_string(),
+                        "key": key,
+                        "address": address,
+                        "subnet": subnet,
                         "priority": p.priority,
                         "cost": p.cost,
                         "latency": p.latency_ms,
