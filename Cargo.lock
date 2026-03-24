@@ -758,7 +758,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
 name = "ironwood"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "bytes",
