@@ -18,7 +18,8 @@ use crate::pathfinder::Pathfinder;
 use crate::wire::{self, PeerPort};
 
 /// Unknown latency sentinel (high but won't overflow in multiplication).
-const UNKNOWN_LATENCY: Duration = Duration::from_millis(u32::MAX as u64);
+/// Go uses `time.Duration(^uint32(0))` ≈ 4.3s. We use a round 5s.
+const UNKNOWN_LATENCY: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Router-level types
