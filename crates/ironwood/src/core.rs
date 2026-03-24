@@ -630,6 +630,7 @@ impl crate::types::PacketConn for PacketConnImpl {
         let entry = handle.to_entry();
         let port = handle.port;
         let traffic_queue = handle.traffic_queue.clone();
+        let traffic_notify = handle.traffic_notify.clone();
 
         // Register with router actor and wait for completion.
         // This ensures the peer is in the router before the reader starts.
@@ -662,6 +663,7 @@ impl crate::types::PacketConn for PacketConnImpl {
             writer_rx,
             write_half,
             traffic_queue,
+            traffic_notify,
             self.router_handle.clone(),
             self.peers.clone(),
             self.config.peer_keepalive_delay,
