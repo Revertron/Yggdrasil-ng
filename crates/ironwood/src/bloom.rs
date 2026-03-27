@@ -292,8 +292,6 @@ impl Blooms {
             .map(|(k, _)| *k)
             .collect();
 
-        tracing::trace!("blooms_maintenance: {} on-tree peers, self_parent={:?}", on_tree_keys.len(), hex::encode(&self_parent[..8]));
-
         for k in on_tree_keys {
             let z_dirty = self.blooms[&k].z_dirty;
             let keep_ones = !z_dirty;

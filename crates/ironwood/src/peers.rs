@@ -824,7 +824,19 @@ pub(crate) async fn peer_writer(
                     }
                 }
                 PeerMessage::ScheduleKeepalive => {
-                    // Send keepalive immediately
+                    // Coalesce: drain any additional ScheduleKeepalive messages
+                    // that queued up during a data burst, then send ONE keepalive.
+                    // Without this, a burst of N received frames triggers N keepalives,
+                    // starving the traffic queue and causing ACK drops (age > 25ms).
+                    while let Ok(msg) = rx.try_recv() {
+                        if let PeerMessage::SendFrame(data) = msg {
+                            // Don't discard protocol frames — send them
+                            if !write_and_flush(peer_id, &mut conn_write, &data).await {
+                                break;
+                            }
+                        }
+                        // ScheduleKeepalive messages are absorbed (coalesced)
+                    }
                     if !write_and_flush(peer_id, &mut conn_write, &keepalive_frame).await {
                         break;
                     }
