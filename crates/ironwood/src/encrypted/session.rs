@@ -644,16 +644,8 @@ impl SessionManager {
                 Err(RecvAction::Drop) => {}
             }
         } else {
-            // Unknown sender: send ephemeral init (anti-spoofing)
-            let (current_pub, _) = new_box_keys();
-            let (next_pub, _) = new_box_keys();
-            let init = SessionInit::new(&current_pub, &next_pub, 0);
-            if let Ok(data) = init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT) {
-                actions.push(OutAction::SendToInner {
-                    dest: *from,
-                    data,
-                });
-            }
+            // Unknown sender — drop silently.
+            tracing::debug!("encrypted: dropping traffic from unknown sender {:?}", hex::encode(&from[..4]));
         }
 
         actions
