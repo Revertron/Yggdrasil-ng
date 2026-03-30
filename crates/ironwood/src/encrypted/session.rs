@@ -542,12 +542,16 @@ impl SessionManager {
         our_ed_priv: &ed25519_dalek::SigningKey,
     ) -> Vec<OutAction> {
         let mut actions = Vec::new();
+        let had_session = self.sessions.contains_key(from);
         let buffered_data = self.session_for_init(from, init);
 
         if let Some(info) = self.sessions.get_mut(from) {
-            if init.seq <= info.seq {
-                // Send ack anyway for existing session
-            } else {
+            if had_session && init.seq <= info.seq {
+                // Stale Init for an existing session — drop silently.
+                return actions;
+            }
+
+            if init.seq > info.seq {
                 info.handle_update(init);
             }
 
