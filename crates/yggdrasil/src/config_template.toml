@@ -21,9 +21,9 @@ peers = []
 listen = ["tcp://0.0.0.0:0"]
 
 # Listen address for the admin socket.
-# This is used by yggdrasilctl to query and control the node.
-# Set to "" to disable the admin socket.
-admin_listen = "tcp://localhost:9001"
+# This is used by yggdrasil to query and control the node by default.
+# Uncomment the line below and set `admin_listen = ""` to disable the admin socket.
+# admin_listen = "tcp://localhost:9001"
 
 # Name of the TUN interface to use.
 # "auto" = automatically assign a name.

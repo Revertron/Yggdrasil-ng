@@ -64,7 +64,7 @@ pub struct Config {
     pub listen: Vec<String>,
 
     /// Admin socket listen address, e.g. `"tcp://localhost:9001"`.
-    #[serde(default)]
+    #[serde(default = "default_admin_listen")]
     pub admin_listen: String,
 
     /// TUN interface name. "auto" for auto-name, "none" to disable.
@@ -182,6 +182,9 @@ impl Default for TunnelRoutingConfig {
             install_system_routes: true,
         }
     }
+}
+fn default_admin_listen() -> String {
+    "tcp://localhost:9001".to_string()
 }
 
 fn default_if_name() -> String {
