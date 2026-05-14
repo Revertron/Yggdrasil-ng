@@ -161,7 +161,9 @@ pub struct TunnelRoutingConfig {
     pub ipv4_address: String,
 
     /// Remote subnets: maps hex public key -> list of CIDRs.
-    /// Example: { "aabbcc...01": ["10.0.0.0/24", "192.168.1.0/24"] }
+    /// A leading "!" on a CIDR creates a CKR tunnel but skips system route
+    /// installation (e.g. for manual or automated routing with third-party app).
+    /// Example: { "aabbcc...01": ["10.0.0.0/24", "!192.168.1.0/24"] }
     #[serde(default)]
     pub remote_subnets: HashMap<String, Vec<String>>,
 

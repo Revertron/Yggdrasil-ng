@@ -152,7 +152,8 @@ pub fn is_yggdrasil_destination(ip: IpAddr) -> bool {
 /// `(union of includes) \ (union of excludes)`.
 ///
 /// Excludes only apply within the same address family as the includes.
-/// Duplicate includes are tolerated; excludes outside any include are ignored.
+/// Duplicate includes are tolerated; excludes outside any include are still
+/// added to the CKR table (they become CKR-only routes with no system route).
 pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
     let mut v4_inc: Vec<IpNet> = Vec::new();
     let mut v6_inc: Vec<IpNet> = Vec::new();
@@ -178,11 +179,24 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
     }
 
     let mut out = Vec::new();
-    for inc in v4_inc {
-        out.extend(subtract_many(inc, &v4_exc));
+    for inc in &v4_inc {
+        out.extend(subtract_many(*inc, &v4_exc));
     }
-    for inc in v6_inc {
-        out.extend(subtract_many(inc, &v6_exc));
+    for inc in &v6_inc {
+        out.extend(subtract_many(*inc, &v6_exc));
+    }
+    // Ignored excludes (those that do not overlap any include) become CKR-only
+    // routes. They are added to the CKR table but will be skipped for system
+    // routes in install_routes/remove_routes.
+    for ex in v4_exc {
+        if !v4_inc.iter().any(|inc| inc.contains(&ex.addr()) || ex.contains(&inc.addr())) {
+            out.push(ex);
+        }
+    }
+    for ex in v6_exc {
+        if !v6_inc.iter().any(|inc| inc.contains(&ex.addr()) || ex.contains(&inc.addr())) {
+            out.push(ex);
+        }
     }
     Ok(out)
 }
@@ -279,11 +293,24 @@ pub fn install_routes(
     // Skip entries whose destination is this node itself — those are handled
     // by the OS's native routing and should not be steered into the TUN.
     let mut cidrs: Vec<IpNet> = Vec::new();
+    let mut no_system_cidrs: Vec<IpNet> = Vec::new();
+    for subnet_list in config.remote_subnets.values() {
+        for raw in subnet_list {
+            if let Some(rest) = raw.strip_prefix('!') {
+                if let Ok(p) = rest.trim().parse::<IpNet>() {
+                    no_system_cidrs.push(p.trunc());
+                }
+            }
+        }
+    }
     for (pubkey_hex, subnet_list) in &config.remote_subnets {
         if parse_pubkey(pubkey_hex).ok().as_ref() == Some(self_key) {
             continue;
         }
         for prefix in expand_cidrs(subnet_list)? {
+            if no_system_cidrs.contains(&prefix) {
+                continue;
+            }
             if !cidrs.contains(&prefix) {
                 cidrs.push(prefix);
             }
@@ -325,12 +352,25 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
     }
 
     let mut cidrs: Vec<IpNet> = Vec::new();
+    let mut no_system_cidrs: Vec<IpNet> = Vec::new();
+    for subnet_list in config.remote_subnets.values() {
+        for raw in subnet_list {
+            if let Some(rest) = raw.strip_prefix('!') {
+                if let Ok(p) = rest.trim().parse::<IpNet>() {
+                    no_system_cidrs.push(p.trunc());
+                }
+            }
+        }
+    }
     for (pubkey_hex, subnet_list) in &config.remote_subnets {
         if parse_pubkey(pubkey_hex).ok().as_ref() == Some(self_key) {
             continue;
         }
         if let Ok(expanded) = expand_cidrs(subnet_list) {
             for prefix in expanded {
+                if no_system_cidrs.contains(&prefix) {
+                    continue;
+                }
                 if !cidrs.contains(&prefix) {
                     cidrs.push(prefix);
                 }
@@ -620,7 +660,8 @@ mod tests {
     fn test_expand_cidrs_exclude_outside_include_ignored() {
         let entries = vec!["10.0.0.0/24".to_string(), "!192.168.0.0/16".to_string()];
         let out = expand_cidrs(&entries).unwrap();
-        assert_eq!(out, vec!["10.0.0.0/24".parse::<IpNet>().unwrap()]);
+        assert!(out.contains(&"10.0.0.0/24".parse::<IpNet>().unwrap()));
+        assert!(out.contains(&"192.168.0.0/16".parse::<IpNet>().unwrap()));
     }
 
     #[test]
@@ -685,5 +726,28 @@ mod tests {
         // /16 should come before /8 (more specific first)
         assert_eq!(ckr.v4_routes[0].prefix.prefix_len(), 16);
         assert_eq!(ckr.v4_routes[1].prefix.prefix_len(), 8);
+    }
+    
+    #[test]
+    fn test_bang_prefix_creates_ckr_without_system_route() {
+        // Lone "!" entry → CKR tunnel is created (get_public_key_for_address works)
+        // but it will be skipped by install_routes/remove_routes.
+        let mut subnets = HashMap::new();
+        subnets.insert(dummy_key_hex(), vec!["!10.5.0.1/32".to_string()]);
+        let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
+        assert_eq!(ckr.v4_routes.len(), 1);
+        let addr: IpAddr = "10.5.0.1".parse().unwrap();
+        assert_eq!(ckr.get_public_key_for_address(addr), Some([0x01u8; 32]));
+
+        // Mixed case: normal entry + lone "!" entry on same key
+        let mut subnets2 = HashMap::new();
+        subnets2.insert(
+            dummy_key_hex(),
+            vec!["10.0.0.0/24".to_string(), "!192.168.1.0/24".to_string()],
+        );
+        let ckr2 = CryptoKey::new(&make_config(subnets2), &SELF_KEY).unwrap();
+        assert_eq!(ckr2.v4_routes.len(), 2); // both are present in CKR table
+        assert!(ckr2.get_public_key_for_address("10.0.0.5".parse().unwrap()).is_some());
+        assert!(ckr2.get_public_key_for_address("192.168.1.5".parse().unwrap()).is_some());
     }
 }
