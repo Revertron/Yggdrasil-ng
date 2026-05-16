@@ -164,6 +164,8 @@ pub struct TunnelRoutingConfig {
     /// A leading "!" on a CIDR creates a CKR tunnel but skips system route
     /// installation (e.g. for manual or automated routing with third-party app).
     /// Example: { "aabbcc...01": ["10.0.0.0/24", "!192.168.1.0/24"] }
+    /// "inetv4"/"!inetv4" may be used in place of the 30 global IPv4 prefixes;
+    /// "inetv6"/"!inetv6" may be used in place of "2000::/3".
     #[serde(default)]
     pub remote_subnets: HashMap<String, Vec<String>>,
 

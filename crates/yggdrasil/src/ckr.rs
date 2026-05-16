@@ -7,6 +7,14 @@ use route_manager::RouteManager;
 use crate::address::{is_valid_address, is_valid_subnet};
 use crate::config::TunnelRoutingConfig;
 
+const INETV4_PREFIXES: &[&str] = &[
+    "0.0.0.0/5", "8.0.0.0/7", "11.0.0.0/8", "12.0.0.0/6", "16.0.0.0/4", "32.0.0.0/3", "64.0.0.0/2", "128.0.0.0/3",
+    "160.0.0.0/5", "168.0.0.0/6", "172.0.0.0/12", "172.32.0.0/11", "172.64.0.0/10", "172.128.0.0/9", "173.0.0.0/8", "174.0.0.0/7",
+    "176.0.0.0/4", "192.0.0.0/9", "192.128.0.0/11", "192.160.0.0/13", "192.169.0.0/16", "192.170.0.0/15", "192.172.0.0/14", "192.176.0.0/12",
+    "192.192.0.0/10", "193.0.0.0/8", "194.0.0.0/7", "196.0.0.0/6", "200.0.0.0/5", "208.0.0.0/4",
+];
+const INETV6_PREFIX: &str = "2000::/3";
+
 /// A single CKR route: CIDR prefix -> destination public key.
 struct Route {
     prefix: IpNet,
@@ -160,6 +168,29 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
     let mut v4_exc: Vec<IpNet> = Vec::new();
     let mut v6_exc: Vec<IpNet> = Vec::new();
 
+    // Shadow `entries` with an expanded list so the rest of this function
+    // (the existing for-loop, strip_prefix match, parse, inc/exc pushes,
+    // subtract_many, duplicate checks, and ignored-exclude CKR-only logic)
+    // remains completely untouched and continues to work exactly as tested.
+    let entries: Vec<String> = {
+        let mut expanded = Vec::new();
+        for raw in entries {
+            let trimmed = raw.trim();
+            if trimmed == "inetv4" {
+                expanded.extend(INETV4_PREFIXES.iter().map(|s| s.to_string()));
+            } else if trimmed == "!inetv4" {
+                expanded.extend(INETV4_PREFIXES.iter().map(|s| format!("!{}", s)));
+            } else if trimmed == "inetv6" {
+                expanded.push(INETV6_PREFIX.to_string());
+            } else if trimmed == "!inetv6" {
+                expanded.push(format!("!{}", INETV6_PREFIX));
+            } else {
+                expanded.push(raw.clone());
+            }
+        }
+        expanded
+    };
+
     for raw in entries {
         let (is_exclude, cidr_str) = match raw.strip_prefix('!') {
             Some(rest) => (true, rest.trim()),
@@ -296,6 +327,18 @@ pub fn install_routes(
     let mut no_system_cidrs: Vec<IpNet> = Vec::new();
     for subnet_list in config.remote_subnets.values() {
         for raw in subnet_list {
+            let trimmed = raw.trim();
+            if trimmed == "!inetv4" {
+                for p_str in INETV4_PREFIXES {
+                    if let Ok(p) = p_str.parse::<IpNet>() {
+                        no_system_cidrs.push(p.trunc());
+                    }
+                }
+            } else if trimmed == "!inetv6" {
+                if let Ok(p) = INETV6_PREFIX.parse::<IpNet>() {
+                    no_system_cidrs.push(p.trunc());
+                }
+            }
             if let Some(rest) = raw.strip_prefix('!') {
                 if let Ok(p) = rest.trim().parse::<IpNet>() {
                     no_system_cidrs.push(p.trunc());
@@ -355,6 +398,18 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
     let mut no_system_cidrs: Vec<IpNet> = Vec::new();
     for subnet_list in config.remote_subnets.values() {
         for raw in subnet_list {
+            let trimmed = raw.trim();
+            if trimmed == "!inetv4" {
+                for p_str in INETV4_PREFIXES {
+                    if let Ok(p) = p_str.parse::<IpNet>() {
+                        no_system_cidrs.push(p.trunc());
+                    }
+                }
+            } else if trimmed == "!inetv6" {
+                if let Ok(p) = INETV6_PREFIX.parse::<IpNet>() {
+                    no_system_cidrs.push(p.trunc());
+                }
+            }
             if let Some(rest) = raw.strip_prefix('!') {
                 if let Ok(p) = rest.trim().parse::<IpNet>() {
                     no_system_cidrs.push(p.trunc());
@@ -749,5 +804,46 @@ mod tests {
         assert_eq!(ckr2.v4_routes.len(), 2); // both are present in CKR table
         assert!(ckr2.get_public_key_for_address("10.0.0.5".parse().unwrap()).is_some());
         assert!(ckr2.get_public_key_for_address("192.168.1.5".parse().unwrap()).is_some());
+    }
+    #[test]
+    fn test_inetv4_keyword() {
+        let mut subnets = HashMap::new();
+        subnets.insert(dummy_key_hex(), vec!["inetv4".to_string()]);
+        let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
+        assert_eq!(ckr.v4_routes.len(), 30);
+        assert!(ckr.get_public_key_for_address("8.8.8.8".parse().unwrap()).is_some());
+        assert!(ckr.get_public_key_for_address("1.1.1.1".parse().unwrap()).is_some());
+        assert!(ckr.get_public_key_for_address("192.168.1.1".parse().unwrap()).is_none());
+        assert!(ckr.get_public_key_for_address("10.0.0.1".parse().unwrap()).is_none());
+        assert!(ckr.get_public_key_for_address("172.16.0.1".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn test_inetv6_keyword() {
+        let mut subnets = HashMap::new();
+        subnets.insert(dummy_key_hex(), vec!["inetv6".to_string()]);
+        let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
+        assert_eq!(ckr.v6_routes.len(), 1);
+        assert_eq!(ckr.v6_routes[0].prefix, "2000::/3".parse::<IpNet>().unwrap());
+        assert!(ckr.get_public_key_for_address("2001:db8::1".parse().unwrap()).is_some());
+        assert!(ckr.get_public_key_for_address("2600::1".parse().unwrap()).is_some());
+    }
+
+    #[test]
+    fn test_bang_inetv4_creates_ckr_without_system_route() {
+        let mut subnets = HashMap::new();
+        subnets.insert(dummy_key_hex(), vec!["!inetv4".to_string()]);
+        let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
+        assert_eq!(ckr.v4_routes.len(), 30);
+        assert!(ckr.get_public_key_for_address("8.8.8.8".parse().unwrap()).is_some());
+    }
+
+    #[test]
+    fn test_bang_inetv6_creates_ckr_without_system_route() {
+        let mut subnets = HashMap::new();
+        subnets.insert(dummy_key_hex(), vec!["!inetv6".to_string()]);
+        let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
+        assert_eq!(ckr.v6_routes.len(), 1);
+        assert!(ckr.get_public_key_for_address("2001:4860:4860::8888".parse().unwrap()).is_some());
     }
 }

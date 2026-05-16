@@ -94,6 +94,7 @@ listen = true
 # ipv4_address = "10.99.0.1/24"  # IPv4 address for the TUN (exit-node/VPN use)
 # [tunnel_routing.remote_subnets]
 # "peer_public_key_hex" = ["10.0.0.0/24", "!192.168.1.0/24"]  # "!" = CKR tunnel created, but no OS route installed
+# "inetv4"/"!inetv4" and "inetv6"/"!inetv6" are also supported
 
 # Built-in stateful firewall. Default policy when enabled: drop inbound
 # from the mesh unless it's a reply to outbound traffic, comes from a
