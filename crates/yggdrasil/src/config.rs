@@ -162,21 +162,22 @@ pub struct TunnelRoutingConfig {
     #[serde(default)]
     pub ipv4_address: String,
 
-    /// Additional IP addresses (IPv4 or IPv6, in CIDR notation) to assign
+    /// Additional IP addresses (IPv4 or IPv6, in CIDR notation; 
+    /// prefix optional — IPv4 defaults to /32, IPv6 to /128) to assign
     /// to the TUN interface. Supports any number of addresses. New preferred
     /// option for exit-node / VPN to replace deprecated ‘ipv4_address’.
     /// Example: ["10.99.0.1/24", "2005:8a:9:11::3/64"]
-    /// The `ipv4_address` (if non-empty) is still assigned as the primary IPv4;
-    /// entries here are added alongside it.
     #[serde(default)]
     pub ip_addresses: Vec<String>,
 
-    /// Remote subnets: maps hex public key -> list of CIDRs.
+    /// Remote subnets: maps hex public key -> list of CIDRs (bare IP addresses 
+    /// without prefix are supported and treated as /32 for IPv4 or /128 for IPv6; 
+    /// this also applies to addresses beginning with "~" and "!").
     /// Example: { "aabbcc...01": ["10.0.0.0/24", "192.168.1.0/24"] }
     /// Supported syntax in the lists (when built with --features ckr):
-    /// - "CIDR" → CKR + system route
-    /// - "~CIDR" → CKR tunnel only (no system route)
-    /// - "!CIDR" → exclude from CKR (applies to both normal and ‘~’ entries)
+    /// - "CIDR" (or bare IP) → CKR + system route
+    /// - "~CIDR" (or ~bare IP) → CKR tunnel only (no system route)
+    /// - "!CIDR" (or !bare IP) → exclude from CKR (applies to both normal and ‘~’ entries)
     /// - "inetv4" / "~inetv4" → full public IPv4 internet (excl. internals) +/– routes
     /// - "inetv6" / "~inetv6" → 2000::/3 +/– routes
     #[serde(default)]

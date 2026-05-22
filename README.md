@@ -337,12 +337,12 @@ ip_addresses = ["10.99.0.1/24"]
 
 System routes for all configured CIDRs are automatically installed when the TUN device starts and removed on shutdown. This works on Linux, Windows, and macOS.
 
-The list of CIDRs for each public key supports additional syntax when the ckr feature is enabled:
+The list of CIDRs for each public key supports additional syntax when the ckr feature is enabled (bare IPv4/IPv6 addresses without a subnet prefix are recognised as /32 and /128 respectively; this also applies to addresses beginning with "\~" and "!"):
 
-Prefix an IPv4 or IPv6 address/subnet with "~" (e.g. "~0.0.0.0/1", "~10.0.0.0/8", "~2000::/3") to establish CKR tunnels without installing system routes for those prefixes.
-Use "inetv4" to include the full list of IPv4 internet prefixes (excluding internal networks) for both CKR and system routes; use "~inetv4" for CKR tunnels only without system routes.
-Use "inetv6" or "~inetv6" similarly for IPv6 (expands to "2000::/3").
-The "!" prefix for exclusions applies to CKR ranges for both normal and "~" prefixed includes. No "!inetv4" or "!inetv6" are supported.
+Prefix an IPv4 or IPv6 address/subnet with "\~" (e.g. "\~0.0.0.0/1", "\~10.0.0.0/8", "\~2000::/3") to establish CKR tunnels without installing system routes for those prefixes.
+Use "inetv4" to include the full list of IPv4 internet prefixes (excluding internal networks) for both CKR and system routes; use "\~inetv4" for CKR tunnels only without system routes.
+Use "inetv6" or "\~inetv6" similarly for IPv6 (expands to "2000::/3").
+The "!" prefix for exclusions applies to CKR ranges for both normal and "\~" prefixed includes. No "!inetv4" or "!inetv6" are supported.
 
 ### Exit-Node Setup
 

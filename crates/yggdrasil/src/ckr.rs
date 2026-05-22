@@ -180,7 +180,16 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
             Some(rest) => (true, rest.trim()),
             None => (false, cidr_input),
         };
-        let prefix: IpNet = cidr_str
+        let cidr_for_parse = if !cidr_str.contains('/') {
+            if cidr_str.contains(':') {
+                format!("{}/128", cidr_str)
+            } else {
+                format!("{}/32", cidr_str)
+            }
+        } else {
+            cidr_str.to_string()
+        };
+        let prefix: IpNet = cidr_for_parse
             .parse()
             .map_err(|e| format!("invalid CIDR '{}': {}", cidr_str, e))?;
         // Normalize to the network address (e.g. 10.0.0.5/24 -> 10.0.0.0/24).
@@ -457,7 +466,7 @@ mod tests {
     #[test]
     fn test_ipv4_route_lookup() {
         let mut subnets = HashMap::new();
-        subnets.insert(dummy_key_hex(), vec!["10.0.0.0/24".to_string()]);
+        subnets.insert(dummy_key_hex(), vec!["10.0.0.0/24".to_string(), "192.168.1.100".to_string()]);
         let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
 
         let addr: IpAddr = "10.0.0.5".parse().unwrap();
@@ -466,6 +475,8 @@ mod tests {
 
         let miss: IpAddr = "192.168.0.1".parse().unwrap();
         assert_eq!(ckr.get_public_key_for_address(miss), None);
+        let bare_addr: IpAddr = "192.168.1.100".parse().unwrap();
+        assert_eq!(ckr.get_public_key_for_address(bare_addr), Some([0x01u8; 32]));
     }
 
     #[test]
@@ -473,7 +484,7 @@ mod tests {
         let mut subnets = HashMap::new();
         subnets.insert(
             dummy_key_hex(),
-            vec!["2001:db8::/32".to_string()],
+            vec!["2001:db8::/32".to_string(), "2001:db8:aaaa::1".to_string()],
         );
         let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
 
@@ -482,6 +493,8 @@ mod tests {
 
         let miss: IpAddr = "2001:db9::1".parse().unwrap();
         assert_eq!(ckr.get_public_key_for_address(miss), None);
+        let bare_addr: IpAddr = "2001:db8:aaaa::1".parse().unwrap();
+        assert_eq!(ckr.get_public_key_for_address(bare_addr), Some([0x01u8; 32]));
     }
 
     #[test]
@@ -785,5 +798,25 @@ mod tests {
         let entries = vec!["~10.0.0.0/24".to_string(), "!10.0.0.0/25".to_string()];
         let out = expand_cidrs(&entries).unwrap();
         assert_eq!(out, vec!["10.0.0.128/25".parse::<IpNet>().unwrap()]);
+    }
+
+    #[test]
+    fn test_expand_cidrs_bare_ip_with_tilde_exclamation() {
+        let mut subnets = HashMap::new();
+        subnets.insert(
+            dummy_key_hex(),
+            vec!["10.0.0.0/24".to_string(), "!10.0.0.5".to_string(), "~192.168.1.100".to_string(), "2001:db8:bbbb::1".to_string()],
+        );
+        let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
+
+        // bare IPv4 exclude applied
+        let excluded: IpAddr = "10.0.0.5".parse().unwrap();
+        assert_eq!(ckr.get_public_key_for_address(excluded), None);
+        // bare IPv4 with ~ still routed via CKR
+        let v4_bare: IpAddr = "192.168.1.100".parse().unwrap();
+        assert_eq!(ckr.get_public_key_for_address(v4_bare), Some([0x01u8; 32]));
+        // bare IPv6 routed via CKR
+        let v6_bare: IpAddr = "2001:db8:bbbb::1".parse().unwrap();
+        assert_eq!(ckr.get_public_key_for_address(v6_bare), Some([0x01u8; 32]));
     }
 }
