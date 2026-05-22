@@ -7,6 +7,15 @@ use route_manager::RouteManager;
 use crate::address::{is_valid_address, is_valid_subnet};
 use crate::config::TunnelRoutingConfig;
 
+const INETV4_PREFIXES: &[&str] = &[
+    "0.0.0.0/5", "8.0.0.0/7", "11.0.0.0/8", "12.0.0.0/6", "16.0.0.0/4", "32.0.0.0/3", "64.0.0.0/2", "128.0.0.0/3",
+    "160.0.0.0/5", "168.0.0.0/6", "172.0.0.0/12", "172.32.0.0/11", "172.64.0.0/10", "172.128.0.0/9", "173.0.0.0/8", "174.0.0.0/7",
+    "176.0.0.0/4", "192.0.0.0/9", "192.128.0.0/11", "192.160.0.0/13", "192.169.0.0/16", "192.170.0.0/15", "192.172.0.0/14", "192.176.0.0/12",
+    "192.192.0.0/10", "193.0.0.0/8", "194.0.0.0/7", "196.0.0.0/6", "200.0.0.0/5", "208.0.0.0/4"
+];
+
+const INETV6_PREFIXES: &[&str] = &["2000::/3"];
+
 /// A single CKR route: CIDR prefix -> destination public key.
 struct Route {
     prefix: IpNet,
@@ -159,10 +168,17 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
     let mut v4_exc: Vec<IpNet> = Vec::new();
     let mut v6_exc: Vec<IpNet> = Vec::new();
 
-    for raw in entries {
-        let (is_exclude, cidr_str) = match raw.strip_prefix('!') {
+    let normalized = normalize_subnet_entries(entries);
+    for raw in &normalized {
+        let trimmed = raw.trim();
+        let cidr_input = if let Some(after_tilde) = trimmed.strip_prefix('~') {
+            after_tilde.trim()
+        } else {
+            trimmed
+        };
+        let (is_exclude, cidr_str) = match cidr_input.strip_prefix('!') {
             Some(rest) => (true, rest.trim()),
-            None => (false, raw.as_str()),
+            None => (false, cidr_input),
         };
         let prefix: IpNet = cidr_str
             .parse()
@@ -238,6 +254,21 @@ fn subtract_one(a: IpNet, b: IpNet) -> Vec<IpNet> {
     result
 }
 
+fn normalize_subnet_entries(entries: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for entry in entries {
+        let trimmed = entry.trim();
+        match trimmed {
+            "inetv4" => normalized.extend(INETV4_PREFIXES.iter().map(|&s| s.to_string())),
+            "~inetv4" => normalized.extend(INETV4_PREFIXES.iter().map(|&s| format!("~{}", s))),
+            "inetv6" => normalized.extend(INETV6_PREFIXES.iter().map(|&s| s.to_string())),
+            "~inetv6" => normalized.extend(INETV6_PREFIXES.iter().map(|&s| format!("~{}", s))),
+            _ => normalized.push(trimmed.to_string()),
+        }
+    }
+    normalized
+}
+
 fn parse_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
     let bytes =
         hex::decode(hex_str).map_err(|e| format!("invalid public key hex '{}': {}", hex_str, e))?;
@@ -283,7 +314,9 @@ pub fn install_routes(
         if parse_pubkey(pubkey_hex).ok().as_ref() == Some(self_key) {
             continue;
         }
-        for prefix in expand_cidrs(subnet_list)? {
+        let non_tilde_entries: Vec<String> = subnet_list.iter().filter(|s| !s.trim().starts_with('~')).cloned().collect();
+        let route_list = normalize_subnet_entries(&non_tilde_entries);
+        for prefix in expand_cidrs(&route_list)? {
             if !cidrs.contains(&prefix) {
                 cidrs.push(prefix);
             }
@@ -329,7 +362,9 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
         if parse_pubkey(pubkey_hex).ok().as_ref() == Some(self_key) {
             continue;
         }
-        if let Ok(expanded) = expand_cidrs(subnet_list) {
+        let non_tilde_entries: Vec<String> = subnet_list.iter().filter(|s| !s.trim().starts_with('~')).cloned().collect();
+        let route_list = normalize_subnet_entries(&non_tilde_entries);
+        if let Ok(expanded) = expand_cidrs(&route_list) {
             for prefix in expanded {
                 if !cidrs.contains(&prefix) {
                     cidrs.push(prefix);
@@ -702,5 +737,53 @@ mod tests {
         let ckr = CryptoKey::new(&config, &SELF_KEY).unwrap();
         assert!(ckr.v4_routes.is_empty());
         assert!(ckr.v6_routes.is_empty());
+    }
+
+    #[test]
+    fn test_expand_cidrs_inetv4_keyword() {
+        let entries = vec!["inetv4".to_string()];
+        let out = expand_cidrs(&entries).unwrap();
+        assert!(out.contains(&"0.0.0.0/5".parse::<IpNet>().unwrap()));
+        assert!(out.contains(&"208.0.0.0/4".parse::<IpNet>().unwrap()));
+        assert_eq!(out.len(), 30);
+    }
+
+    #[test]
+    fn test_expand_cidrs_tilde_inetv4_keyword() {
+        let entries = vec!["~inetv4".to_string()];
+        let out = expand_cidrs(&entries).unwrap();
+        assert!(out.contains(&"0.0.0.0/5".parse::<IpNet>().unwrap()));
+        assert_eq!(out.len(), 30);
+    }
+
+    #[test]
+    fn test_expand_cidrs_inetv6_keyword() {
+        let entries = vec!["inetv6".to_string()];
+        let out = expand_cidrs(&entries).unwrap();
+        assert!(out.contains(&"2000::/3".parse::<IpNet>().unwrap()));
+    }
+
+    #[test]
+    fn test_expand_cidrs_tilde_prefix() {
+        let entries = vec!["~10.0.0.0/24".to_string()];
+        let out = expand_cidrs(&entries).unwrap();
+        assert_eq!(out, vec!["10.0.0.0/24".parse::<IpNet>().unwrap()]);
+    }
+
+    #[test]
+    fn test_expand_cidrs_tilde_with_exclude() {
+        let entries = vec!["~0.0.0.0/0".to_string(), "!192.168.0.0/16".to_string()];
+        let out = expand_cidrs(&entries).unwrap();
+        let allowed: IpAddr = "8.8.8.8".parse().unwrap();
+        let blocked: IpAddr = "192.168.5.1".parse().unwrap();
+        assert!(out.iter().any(|n| n.contains(&allowed)));
+        assert!(!out.iter().any(|n| n.contains(&blocked)));
+    }
+
+    #[test]
+    fn test_expand_cidrs_exclude_applies_to_tilde() {
+        let entries = vec!["~10.0.0.0/24".to_string(), "!10.0.0.0/25".to_string()];
+        let out = expand_cidrs(&entries).unwrap();
+        assert_eq!(out, vec!["10.0.0.128/25".parse::<IpNet>().unwrap()]);
     }
 }

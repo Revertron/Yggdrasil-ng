@@ -173,6 +173,12 @@ pub struct TunnelRoutingConfig {
 
     /// Remote subnets: maps hex public key -> list of CIDRs.
     /// Example: { "aabbcc...01": ["10.0.0.0/24", "192.168.1.0/24"] }
+    /// Supported syntax in the lists (when built with --features ckr):
+    /// - "CIDR" → CKR + system route
+    /// - "~CIDR" → CKR tunnel only (no system route)
+    /// - "!CIDR" → exclude from CKR (applies to both normal and ‘~’ entries)
+    /// - "inetv4" / "~inetv4" → full public IPv4 internet (excl. internals) +/– routes
+    /// - "inetv6" / "~inetv6" → 2000::/3 +/– routes
     #[serde(default)]
     pub remote_subnets: HashMap<String, Vec<String>>,
 

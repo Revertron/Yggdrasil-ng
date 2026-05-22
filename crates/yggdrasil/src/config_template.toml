@@ -88,13 +88,17 @@ listen = true
 
 # Crypto-Key Routing (CKR) — tunnel arbitrary IPv4/IPv6 subnets through
 # the Yggdrasil mesh. Requires the "ckr" feature to be enabled at build time.
+# ‘~’ prefix means CKR tunnels without system routes. "inetv4"/"~inetv4" and 
+# "inetv6"/"~inetv6" expand to internet prefixes excluding internal networks. 
+# "!" excludes range from CKR, (e.g., "!142.250.109.0/24") for both normal 
+# and "~" prefixed includes. No "!inetv4" or "!inetv6" are supported.
 # [tunnel_routing]
 # enable = true
 # yggdrasil_routing = true
 # install_system_routes = true  # Automatically install system routing table entries for CKR.
 # ip_addresses = [ "10.99.0.1/24", "2005:8a:9:11::3/64" ]  # IPs for the TUN (VPN use) 
 # [tunnel_routing.remote_subnets]
-# "peer_public_key_hex" = ["10.99.0.0/24", "192.168.1.0/24", "2005:8a:9:10::/64"]
+# "peer_public_key_hex" = ["10.99.0.0/24", "fd03:1:2:3::/64", "~inetv4", "inetv6", "!172.16.0.0/12"]
 
 # Built-in stateful firewall. Default policy when enabled: drop inbound
 # from the mesh unless it's a reply to outbound traffic, comes from a
