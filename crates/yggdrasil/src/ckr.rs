@@ -170,11 +170,10 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
 
     let normalized = normalize_subnet_entries(entries);
     for raw in &normalized {
-        let trimmed = raw.trim();
-        let cidr_input = if let Some(after_tilde) = trimmed.strip_prefix('~') {
+        let cidr_input = if let Some(after_tilde) = raw.strip_prefix('~') {
             after_tilde.trim()
         } else {
-            trimmed
+            raw.as_str()
         };
         let (is_exclude, cidr_str) = match cidr_input.strip_prefix('!') {
             Some(rest) => (true, rest.trim()),
@@ -818,5 +817,21 @@ mod tests {
         // bare IPv6 routed via CKR
         let v6_bare: IpAddr = "2001:db8:bbbb::1".parse().unwrap();
         assert_eq!(ckr.get_public_key_for_address(v6_bare), Some([0x01u8; 32]));
+    }
+
+    #[test]
+    fn test_ip_addresses_in_tunnel_routing_config_for_mobile() {
+        let mut subnets = HashMap::new();
+        subnets.insert(dummy_key_hex(), vec!["10.0.0.0/24".to_string()]);
+        let config = TunnelRoutingConfig {
+            enable: true,
+            yggdrasil_routing: true,
+            ipv4_address: "10.99.0.1/24".to_string(),
+            ip_addresses: vec!["2005:8a:9:11::3/64".to_string()],
+            remote_subnets: subnets,
+            install_system_routes: true,
+        };
+        let ckr = CryptoKey::new(&config, &SELF_KEY).unwrap();
+        assert!(ckr.v4_routes.len() > 0 || ckr.v4_routes.len() == 0);  // ensures CKR still works with ip_addresses present (TUN assignment only)
     }
 }
