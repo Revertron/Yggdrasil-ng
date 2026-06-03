@@ -47,6 +47,9 @@ dictionary YggdrasilConfig {
     string                              node_info_name;
     /// Crypto-key tunnel routing (CKR) configuration.
     TunnelRoutingConfig                 tunnel_routing;
+    /// Closed-network group password. When non-empty, this node only forms
+    /// encrypted sessions with peers using the same password; empty = open.
+    string                              group_password;
 };
 
 /// One CKR routing entry: a destination public key and the CIDRs to send to it.
