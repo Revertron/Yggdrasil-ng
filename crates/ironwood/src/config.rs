@@ -23,6 +23,10 @@ pub struct Config {
     pub path_timeout: Duration,
     /// Minimum interval between path lookups to the same destination. Default: 1 second.
     pub path_throttle: Duration,
+    /// Optional closed-network group password. When set, only peers configured
+    /// with the same password can complete an encrypted session handshake.
+    /// `None`/empty = open network (no change to the handshake). Default: `None`.
+    pub group_password: Option<Vec<u8>>,
 }
 
 impl Default for Config {
@@ -37,6 +41,7 @@ impl Default for Config {
             path_notify: None,
             path_timeout: Duration::from_secs(60),
             path_throttle: Duration::from_secs(1),
+            group_password: None,
         }
     }
 }
@@ -90,6 +95,18 @@ impl Config {
 
     pub fn with_path_throttle(mut self, d: Duration) -> Self {
         self.path_throttle = d;
+        self
+    }
+
+    /// Set a closed-network group password. All nodes that should be able to
+    /// open sessions with each other must use the same password. An empty
+    /// password leaves the network open (the handshake is unchanged).
+    pub fn with_group_password(mut self, password: Vec<u8>) -> Self {
+        self.group_password = if password.is_empty() {
+            None
+        } else {
+            Some(password)
+        };
         self
     }
 }

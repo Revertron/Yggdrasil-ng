@@ -18,7 +18,7 @@ use crate::config::Config;
 use crate::core::PacketConnImpl;
 use crate::types::{Addr, Error, Result};
 
-use self::crypto::{ed25519_private_to_curve25519, CurvePrivateKey};
+use self::crypto::{ed25519_private_to_curve25519, CurvePrivateKey, GroupAuth};
 use self::session::{ConcurrentSessionManager, OutAction, SESSION_TRAFFIC_OVERHEAD};
 
 /// Channel capacity for delivering decrypted traffic to readers.
@@ -67,8 +67,11 @@ impl EncryptedPacketConn {
     /// Create a new EncryptedPacketConn with the given private key and config.
     pub fn new(secret: SigningKey, config: Config) -> Self {
         let curve_priv = ed25519_private_to_curve25519(&secret);
+        // Build the group-password gate before `config` is moved into the inner
+        // PacketConn. Empty/absent password yields a disabled GroupAuth.
+        let group_auth = GroupAuth::new(config.group_password.as_deref().unwrap_or(&[]));
         let inner = Arc::new(PacketConnImpl::new(secret.clone(), config));
-        let sessions = Arc::new(ConcurrentSessionManager::new());
+        let sessions = Arc::new(ConcurrentSessionManager::new(group_auth));
         let (recv_tx, recv_rx) = mpsc::channel(RECV_CHANNEL_SIZE);
         let cancel = CancellationToken::new();
 

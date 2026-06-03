@@ -8,7 +8,7 @@ use crypto_box::aead::Aead;
 use crypto_box::aead::generic_array::GenericArray;
 use crypto_box::{PublicKey as BoxPublicKey, SecretKey as BoxSecretKey, SalsaBox};
 use ed25519_dalek::SigningKey;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 
 /// XSalsa20-Poly1305 overhead (Poly1305 authentication tag).
 pub(crate) const BOX_OVERHEAD: usize = 16;
@@ -21,6 +21,45 @@ pub(crate) type CurvePublicKey = [u8; 32];
 
 /// Curve25519 private key (32 bytes).
 pub(crate) type CurvePrivateKey = [u8; 32];
+
+// ---------------------------------------------------------------------------
+// Group password (closed-network session auth)
+// ---------------------------------------------------------------------------
+
+/// Optional shared-secret gate for the session handshake. When enabled, a
+/// `sha256("ironwood/encrypted\0" + password)` "preimage" is prepended to the
+/// bytes the handshake signature covers, so a session only completes between
+/// peers that derived the same secret. Empty password = disabled (byte-identical
+/// to the no-password handshake). Matches Go ironwood's `groupAuth`.
+#[derive(Clone, Default)]
+pub(crate) struct GroupAuth {
+    secret: Option<[u8; 32]>,
+}
+
+impl GroupAuth {
+    /// Build from a password. An empty password disables the feature.
+    pub fn new(password: &[u8]) -> Self {
+        if password.is_empty() {
+            return Self { secret: None };
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"ironwood/encrypted\x00");
+        hasher.update(password);
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&hasher.finalize());
+        Self {
+            secret: Some(secret),
+        }
+    }
+
+    /// The signature preimage: the 32-byte secret, or an empty slice if disabled.
+    pub fn preimage(&self) -> &[u8] {
+        match &self.secret {
+            Some(s) => &s[..],
+            None => &[],
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Ed25519 → Curve25519 conversion

@@ -53,6 +53,13 @@ if_name = "auto"
 # Maximum Transmission Unit (MTU) for the TUN interface.
 if_mtu = 65535
 
+# Closed-network group password. When set, this node only establishes encrypted
+# sessions with peers that use the EXACT same password, turning the mesh into a
+# private closed network. Every member must share the same value;
+# empty = open network. This is independent of the per-peer/per-multicast
+# `password` above, which only authenticates direct links.
+# group_password = ""
+
 # Custom node info that is advertised to other nodes.
 # This can be any TOML table, e.g. { name = "my-node", location = "earth" }
 [node_info]

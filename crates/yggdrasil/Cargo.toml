@@ -27,7 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] 
 time = { version = "0.3.47", features = ["macros", "local-offset"] }
 getopts = "0.2"
 toml = "1"
-toml_edit = "0.22"
+toml_edit = "0.25"
 hex = "0.4"
 url = "2"
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -35,7 +35,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 rcgen = "0.14.7"
 glob-match = "0.2"
-x509-parser = "0.16"
+x509-parser = "0.18"
 socket2 = "0.6.3"
 getifaddrs = "0.6"
 rustc-hash = "2.1.2"

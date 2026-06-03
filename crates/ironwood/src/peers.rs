@@ -89,6 +89,7 @@ impl Peers {
         prio: u8,
         tx: mpsc::Sender<PeerMessage>,
         cancel: CancellationToken,
+        pmtu: u64,
     ) -> PeerHandle {
         let id = self.next_id;
         self.next_id += 1;
@@ -119,7 +120,7 @@ impl Peers {
             order,
             tx,
             cancel,
-            traffic_queue: Arc::new(tokio::sync::Mutex::new(PacketQueue::new())),
+            traffic_queue: Arc::new(tokio::sync::Mutex::new(PacketQueue::new(pmtu))),
             traffic_notify: traffic_notify.clone(),
         };
 

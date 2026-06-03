@@ -16,7 +16,7 @@ use crate::wire;
 use super::crypto::{
     box_open, box_open_precomputed, box_seal, box_seal_precomputed,
     ed25519_public_to_curve25519, make_salsa_box, new_box_keys, CurvePrivateKey, CurvePublicKey,
-    BOX_OVERHEAD,
+    GroupAuth, BOX_OVERHEAD,
 };
 
 // ---------------------------------------------------------------------------
@@ -76,6 +76,7 @@ impl SessionInit {
         our_ed_priv: &ed25519_dalek::SigningKey,
         to_ed_pub: &PublicKey,
         msg_type: u8,
+        preimage: &[u8],
     ) -> Result<Vec<u8>, Error> {
         // Generate ephemeral Curve25519 keypair
         let (from_pub, from_priv) = new_box_keys();
@@ -91,8 +92,18 @@ impl SessionInit {
         sig_bytes.extend_from_slice(&self.key_seq.to_be_bytes());
         sig_bytes.extend_from_slice(&self.seq.to_be_bytes());
 
-        // Sign with our Ed25519 key
-        let sig = Crypto::sign_with_key(our_ed_priv, &sig_bytes);
+        // Sign with our Ed25519 key. When a group password is set, the password
+        // hash is prepended to the signed bytes (preimage), so verification only
+        // succeeds for peers that share the same secret. Empty preimage signs the
+        // bytes unchanged. Matches Go ironwood's preimaged edSign.
+        let sig = if preimage.is_empty() {
+            Crypto::sign_with_key(our_ed_priv, &sig_bytes)
+        } else {
+            let mut signed = Vec::with_capacity(preimage.len() + sig_bytes.len());
+            signed.extend_from_slice(preimage);
+            signed.extend_from_slice(&sig_bytes);
+            Crypto::sign_with_key(our_ed_priv, &signed)
+        };
 
         // Build payload to encrypt: [sig(64)][current(32)][next(32)][keySeq(8)][seq(8)]
         let mut payload = Vec::with_capacity(64 + 32 + 32 + 8 + 8);
@@ -120,6 +131,7 @@ impl SessionInit {
         data: &[u8],
         our_curve_priv: &CurvePrivateKey,
         from_ed_pub: &PublicKey,
+        preimage: &[u8],
     ) -> Result<Self, Error> {
         if data.len() != SESSION_INIT_SIZE {
             return Err(Error::Decode);
@@ -156,7 +168,18 @@ impl SessionInit {
         sig_bytes.extend_from_slice(&key_seq.to_be_bytes());
         sig_bytes.extend_from_slice(&seq.to_be_bytes());
 
-        if !Crypto::verify(from_ed_pub, &sig_bytes, &sig) {
+        // When a group password is set, the password hash is prepended to the
+        // verified bytes (preimage); the signature only checks out if the sender
+        // used the same secret. Empty preimage verifies the bytes unchanged.
+        let verified = if preimage.is_empty() {
+            Crypto::verify(from_ed_pub, &sig_bytes, &sig)
+        } else {
+            let mut signed = Vec::with_capacity(preimage.len() + sig_bytes.len());
+            signed.extend_from_slice(preimage);
+            signed.extend_from_slice(&sig_bytes);
+            Crypto::verify(from_ed_pub, &signed, &sig)
+        };
+        if !verified {
             return Err(Error::BadMessage);
         }
 
@@ -564,13 +587,18 @@ pub(crate) struct SessionBuffer {
 pub(crate) struct ConcurrentSessionManager {
     sessions: std::sync::RwLock<HashMap<PublicKey, Arc<std::sync::Mutex<SessionInfo>>>>,
     buffers: std::sync::Mutex<HashMap<PublicKey, SessionBuffer>>,
+    /// Optional closed-network group password. When set, its preimage is folded
+    /// into every handshake signature so sessions only form between peers that
+    /// share the same password.
+    group_auth: GroupAuth,
 }
 
 impl ConcurrentSessionManager {
-    pub fn new() -> Self {
+    pub fn new(group_auth: GroupAuth) -> Self {
         Self {
             sessions: std::sync::RwLock::new(HashMap::default()),
             buffers: std::sync::Mutex::new(HashMap::default()),
+            group_auth,
         }
     }
 
@@ -589,13 +617,13 @@ impl ConcurrentSessionManager {
         match data[0] {
             SESSION_TYPE_DUMMY => Vec::new(),
             SESSION_TYPE_INIT => {
-                match SessionInit::decrypt(data, our_curve_priv, from) {
+                match SessionInit::decrypt(data, our_curve_priv, from, self.group_auth.preimage()) {
                     Ok(init) => self.handle_init(from, &init, our_ed_priv),
                     Err(_) => Vec::new(),
                 }
             }
             SESSION_TYPE_ACK => {
-                match SessionInit::decrypt(data, our_curve_priv, from) {
+                match SessionInit::decrypt(data, our_curve_priv, from, self.group_auth.preimage()) {
                     Ok(ack) => self.handle_ack(from, &ack, our_ed_priv),
                     Err(_) => Vec::new(),
                 }
@@ -620,7 +648,7 @@ impl ConcurrentSessionManager {
             let (current_pub, _) = new_box_keys();
             let (next_pub, _) = new_box_keys();
             let init = SessionInit::new(&current_pub, &next_pub, 0);
-            return match init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT) {
+            return match init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT, self.group_auth.preimage()) {
                 Ok(data) => vec![OutAction::SendToInner { dest: *from, data }],
                 Err(_) => Vec::new(),
             };
@@ -633,7 +661,7 @@ impl ConcurrentSessionManager {
                 Ok(snap) => snap,
                 Err(RecvSnapshotError::SendInit { send_pub, next_pub, local_key_seq }) => {
                     let init = SessionInit::new(&send_pub, &next_pub, local_key_seq);
-                    return match init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT) {
+                    return match init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT, self.group_auth.preimage()) {
                         Ok(data) => vec![OutAction::SendToInner { dest: *from, data }],
                         Err(_) => Vec::new(),
                     };
@@ -648,7 +676,7 @@ impl ConcurrentSessionManager {
             Err(RecvAction::SendInit) => {
                 let info = session_arc.lock().unwrap();
                 let init = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq);
-                return match init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT) {
+                return match init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT, self.group_auth.preimage()) {
                     Ok(data) => vec![OutAction::SendToInner { dest: *from, data }],
                     Err(_) => Vec::new(),
                 };
@@ -737,7 +765,7 @@ impl ConcurrentSessionManager {
 
             // Send ack
             let ack_init = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq);
-            if let Ok(data) = ack_init.encrypt(our_ed_priv, from, SESSION_TYPE_ACK) {
+            if let Ok(data) = ack_init.encrypt(our_ed_priv, from, SESSION_TYPE_ACK, self.group_auth.preimage()) {
                 actions.push(OutAction::SendToInner { dest: *from, data });
             }
         } else {
@@ -753,7 +781,7 @@ impl ConcurrentSessionManager {
                 }
                 info.handle_update(init);
                 let ack_init = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq);
-                if let Ok(data) = ack_init.encrypt(our_ed_priv, from, SESSION_TYPE_ACK) {
+                if let Ok(data) = ack_init.encrypt(our_ed_priv, from, SESSION_TYPE_ACK, self.group_auth.preimage()) {
                     actions.push(OutAction::SendToInner { dest: *from, data });
                 }
             } else {
@@ -776,7 +804,7 @@ impl ConcurrentSessionManager {
                 drop(map);
 
                 // Send ack
-                if let Ok(data) = ack_init.encrypt(our_ed_priv, from, SESSION_TYPE_ACK) {
+                if let Ok(data) = ack_init.encrypt(our_ed_priv, from, SESSION_TYPE_ACK, self.group_auth.preimage()) {
                     actions.push(OutAction::SendToInner { dest: *from, data });
                 }
             }
@@ -833,7 +861,7 @@ impl ConcurrentSessionManager {
                     &info.next_pub,
                     info.local_key_seq,
                 );
-                if let Ok(data) = ack_init.encrypt(our_ed_priv, from, SESSION_TYPE_ACK) {
+                if let Ok(data) = ack_init.encrypt(our_ed_priv, from, SESSION_TYPE_ACK, self.group_auth.preimage()) {
                     actions.push(OutAction::SendToInner { dest: *from, data });
                 }
 
@@ -903,7 +931,7 @@ impl ConcurrentSessionManager {
 
         buf.data = Some(msg.to_vec());
 
-        if let Ok(data) = buf.init.encrypt(our_ed_priv, dest, SESSION_TYPE_INIT) {
+        if let Ok(data) = buf.init.encrypt(our_ed_priv, dest, SESSION_TYPE_INIT, self.group_auth.preimage()) {
             actions.push(OutAction::SendToInner {
                 dest: *dest,
                 data,
@@ -962,6 +990,65 @@ mod tests {
         (signing_key, pub_key, curve_priv)
     }
 
+    /// Mirrors Go ironwood's `TestSessionInitPasswordAuth`: a handshake only
+    /// verifies when both sides derive the same group-password preimage.
+    #[test]
+    fn group_password_handshake_matrix() {
+        // (sender password, receiver password, expect handshake to verify)
+        let cases: &[(&[u8], &[u8], bool)] = &[
+            (b"", b"", true),                               // both open
+            (b"shared-password", b"shared-password", true), // matching
+            (b"shared-password", b"", false),               // sender only
+            (b"", b"shared-password", false),               // receiver only
+            (b"shared-password", b"wrong-password", false), // mismatch
+        ];
+
+        for (sender_pw, receiver_pw, want_ok) in cases {
+            let (priv_a, pub_a, _curve_a) = make_keys();
+            let (_priv_b, pub_b, curve_priv_b) = make_keys();
+
+            let (current, _) = new_box_keys();
+            let (next, _) = new_box_keys();
+            let init = SessionInit::new(&current, &next, 9);
+
+            let sender_auth = GroupAuth::new(sender_pw);
+            let receiver_auth = GroupAuth::new(receiver_pw);
+
+            let data = init
+                .encrypt(&priv_a, &pub_b, SESSION_TYPE_INIT, sender_auth.preimage())
+                .unwrap();
+            let result =
+                SessionInit::decrypt(&data, &curve_priv_b, &pub_a, receiver_auth.preimage());
+
+            assert_eq!(
+                result.is_ok(),
+                *want_ok,
+                "sender={:?} receiver={:?}",
+                sender_pw,
+                receiver_pw
+            );
+            if *want_ok {
+                let decoded = result.unwrap();
+                assert_eq!(decoded.current, current);
+                assert_eq!(decoded.next, next);
+                assert_eq!(decoded.key_seq, init.key_seq);
+                assert_eq!(decoded.seq, init.seq);
+            }
+        }
+    }
+
+    /// Guards the domain prefix and hashing against silent drift from Go
+    /// ironwood, which must produce the identical preimage for interop.
+    #[test]
+    fn group_auth_preimage_matches_go() {
+        // sha256("ironwood/encrypted\0" + "shared-password")
+        let expected =
+            hex::decode("16ccb8396ed9c53e85c369adb6b3befcb275a75bc185bcbd5f01f4c6fa54fee8").unwrap();
+        assert_eq!(GroupAuth::new(b"shared-password").preimage(), expected.as_slice());
+        // Empty password = disabled = empty preimage.
+        assert!(GroupAuth::new(b"").preimage().is_empty());
+    }
+
     #[test]
     fn init_encrypt_decrypt() {
         let (priv_a, pub_a, _curve_priv_a) = make_keys();
@@ -971,11 +1058,11 @@ mod tests {
         let (next, _) = new_box_keys();
         let init = SessionInit::new(&current, &next, 0);
 
-        let encrypted = init.encrypt(&priv_a, &pub_b, SESSION_TYPE_INIT).unwrap();
+        let encrypted = init.encrypt(&priv_a, &pub_b, SESSION_TYPE_INIT, &[]).unwrap();
         assert_eq!(encrypted.len(), SESSION_INIT_SIZE);
         assert_eq!(encrypted[0], SESSION_TYPE_INIT);
 
-        let decrypted = SessionInit::decrypt(&encrypted, &curve_priv_b, &pub_a).unwrap();
+        let decrypted = SessionInit::decrypt(&encrypted, &curve_priv_b, &pub_a, &[]).unwrap();
         assert_eq!(decrypted.current, current);
         assert_eq!(decrypted.next, next);
         assert_eq!(decrypted.key_seq, 0);
@@ -990,10 +1077,10 @@ mod tests {
         let (next, _) = new_box_keys();
         let init = SessionInit::new(&current, &next, 5);
 
-        let encrypted = init.encrypt(&priv_a, &pub_b, SESSION_TYPE_ACK).unwrap();
+        let encrypted = init.encrypt(&priv_a, &pub_b, SESSION_TYPE_ACK, &[]).unwrap();
         assert_eq!(encrypted[0], SESSION_TYPE_ACK);
 
-        let decrypted = SessionInit::decrypt(&encrypted, &curve_priv_b, &pub_a).unwrap();
+        let decrypted = SessionInit::decrypt(&encrypted, &curve_priv_b, &pub_a, &[]).unwrap();
         assert_eq!(decrypted.key_seq, 5);
     }
 
@@ -1002,8 +1089,8 @@ mod tests {
         let (priv_a, pub_a, curve_priv_a) = make_keys();
         let (priv_b, pub_b, curve_priv_b) = make_keys();
 
-        let mgr_a = ConcurrentSessionManager::new();
-        let mgr_b = ConcurrentSessionManager::new();
+        let mgr_a = ConcurrentSessionManager::new(GroupAuth::default());
+        let mgr_b = ConcurrentSessionManager::new(GroupAuth::default());
 
         // A writes to B (triggers buffer + init)
         let actions = mgr_a.write_to(&pub_b, b"hello from A", &priv_a);
@@ -1049,8 +1136,8 @@ mod tests {
         let (priv_a, pub_a, curve_priv_a) = make_keys();
         let (priv_b, pub_b, curve_priv_b) = make_keys();
 
-        let mgr_a = ConcurrentSessionManager::new();
-        let mgr_b = ConcurrentSessionManager::new();
+        let mgr_a = ConcurrentSessionManager::new(GroupAuth::default());
+        let mgr_b = ConcurrentSessionManager::new(GroupAuth::default());
 
         // Establish session: A→B init, B→A ack
         let a_actions = mgr_a.write_to(&pub_b, b"msg1", &priv_a);

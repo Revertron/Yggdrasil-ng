@@ -66,6 +66,7 @@ impl Core {
                 subnet.get_key()
             })
             .with_peer_max_message_size(65535 * 2)
+            .with_group_password(config.group_password.clone().into_bytes())
             .with_path_notify(move |key: [u8; 32]| {
                 let rwc = {
                     let guard = slot_clone.lock().unwrap();

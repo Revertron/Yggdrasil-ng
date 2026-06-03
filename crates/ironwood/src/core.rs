@@ -553,7 +553,7 @@ impl PacketConnImpl {
         let pub_key = crypto.public_key;
         let router = Router::new(crypto, &config);
         let peers = Arc::new(Mutex::new(Peers::new()));
-        let delivery_queue = DeliveryQueue::new();
+        let delivery_queue = DeliveryQueue::new(config.peer_max_message_size);
         let (traffic_tx, traffic_rx) = mpsc::channel(RECV_CHANNEL_SIZE);
         let cancel = CancellationToken::new();
         let path_notify_cb = config.path_notify.clone();
@@ -658,7 +658,13 @@ impl crate::types::PacketConn for PacketConnImpl {
         // Allocate the peer in the peers manager
         let handle = {
             let mut peers = self.peers.lock().await;
-            peers.allocate_peer(peer_key, prio, writer_tx.clone(), peer_cancel.clone())
+            peers.allocate_peer(
+                peer_key,
+                prio,
+                writer_tx.clone(),
+                peer_cancel.clone(),
+                self.config.peer_max_message_size,
+            )
         };
 
         let peer_id = handle.id;

@@ -2265,6 +2265,12 @@ data class YggdrasilConfig (
      * Crypto-key tunnel routing (CKR) configuration.
      */
     var `tunnelRouting`: TunnelRoutingConfig
+    , 
+    /**
+     * Closed-network group password. When non-empty, this node only forms
+     * encrypted sessions with peers using the same password; empty = open.
+     */
+    var `groupPassword`: kotlin.String
     
 ){
     
@@ -2288,6 +2294,7 @@ public object FfiConverterTypeYggdrasilConfig: FfiConverterRustBuffer<YggdrasilC
             FfiConverterSequenceTypeMulticastInterfaceConfig.read(buf),
             FfiConverterString.read(buf),
             FfiConverterTypeTunnelRoutingConfig.read(buf),
+            FfiConverterString.read(buf),
         )
     }
 
@@ -2298,7 +2305,8 @@ public object FfiConverterTypeYggdrasilConfig: FfiConverterRustBuffer<YggdrasilC
             FfiConverterULong.allocationSize(value.`ifMtu`) +
             FfiConverterSequenceTypeMulticastInterfaceConfig.allocationSize(value.`multicastInterfaces`) +
             FfiConverterString.allocationSize(value.`nodeInfoName`) +
-            FfiConverterTypeTunnelRoutingConfig.allocationSize(value.`tunnelRouting`)
+            FfiConverterTypeTunnelRoutingConfig.allocationSize(value.`tunnelRouting`) +
+            FfiConverterString.allocationSize(value.`groupPassword`)
     )
 
     override fun write(value: YggdrasilConfig, buf: ByteBuffer) {
@@ -2309,6 +2317,7 @@ public object FfiConverterTypeYggdrasilConfig: FfiConverterRustBuffer<YggdrasilC
             FfiConverterSequenceTypeMulticastInterfaceConfig.write(value.`multicastInterfaces`, buf)
             FfiConverterString.write(value.`nodeInfoName`, buf)
             FfiConverterTypeTunnelRoutingConfig.write(value.`tunnelRouting`, buf)
+            FfiConverterString.write(value.`groupPassword`, buf)
     }
 }
 

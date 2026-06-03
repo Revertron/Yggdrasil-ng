@@ -99,6 +99,13 @@ pub struct Config {
     /// Built-in stateful firewall configuration.
     #[serde(default)]
     pub firewall: FirewallConfig,
+
+    /// Closed-network group password. When non-empty, this node only completes
+    /// encrypted sessions with peers that share the same password (folded into
+    /// the ironwood handshake signature). Empty = open network. This is separate
+    /// from the per-peer/per-multicast `password`, which gates direct peering.
+    #[serde(default)]
+    pub group_password: String,
 }
 
 /// Built-in stateful firewall configuration. Default-off; when enabled,
@@ -234,6 +241,7 @@ impl Default for Config {
             #[cfg(feature = "ckr")]
             tunnel_routing: TunnelRoutingConfig::default(),
             firewall: FirewallConfig::default(),
+            group_password: String::new(),
         }
     }
 }
