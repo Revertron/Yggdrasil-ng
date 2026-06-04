@@ -65,12 +65,15 @@ impl TunAdapter {
         // Assign IPv4 address to TUN if configured in CKR
         #[cfg(feature = "ckr")]
         if let Some(ckr_cfg) = ckr_config {
-            if ckr_cfg.enable && !ckr_cfg.ipv4_address.is_empty() {
+            if ckr_cfg.enable && !ckr_cfg.ipv4_address.is_empty() && ckr_cfg.ip_addresses.iter().all(|s| s.is_empty()) {
                 let (v4_addr, v4_prefix) = parse_ipv4_cidr(&ckr_cfg.ipv4_address)?;
                 builder = builder.ipv4(v4_addr, v4_prefix, None);
                 tracing::info!("CKR: assigning IPv4 address {} to TUN", ckr_cfg.ipv4_address);
             }
         }
+
+        #[cfg(feature = "ckr")]
+        let mut ipv4_addrs: Vec<(Ipv4Addr, u8)> = Vec::new();
 
         // Assign IP addresses to TUN if configured in CKR
         #[cfg(feature = "ckr")]
@@ -91,11 +94,13 @@ impl TunAdapter {
                             let ip: Ipv6Addr = ip_str.parse().map_err(|e| format!("invalid IPv6 in ip_addresses '{}': {}", cidr, e))?;
                             builder = builder.ipv6(ip, prefix);
                             tracing::info!("CKR: assigning IPv6 address {} to TUN", cidr);
+                        } else {
+                            return Err(format!("invalid IPv6 CIDR in ip_addresses '{}': expected addr or addr/prefix", cidr));
                         }
                     } else {
                         // IPv4 path - reuse the exact existing parse_ipv4_cidr function
                         let (v4_addr, v4_prefix) = parse_ipv4_cidr(cidr)?;
-                        builder = builder.ipv4(v4_addr, v4_prefix, None);
+                        ipv4_addrs.push((v4_addr, v4_prefix));
                         tracing::info!("CKR: assigning IPv4 address {} to TUN", cidr);
                     }
                 }
@@ -113,6 +118,13 @@ impl TunAdapter {
             .map_err(|e| format!("failed to create TUN device: {}", e))?;
 
         let device = Arc::new(device);
+
+        #[cfg(feature = "ckr")]
+        for (v4_addr, v4_prefix) in ipv4_addrs {
+            device
+                .add_address_v4(v4_addr, v4_prefix)
+                .map_err(|e| format!("failed to add IPv4 address to TUN: {}", e))?;
+        }
 
         tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, mtu);
 
