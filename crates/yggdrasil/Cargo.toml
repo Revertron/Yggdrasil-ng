@@ -63,7 +63,7 @@ optional = true
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.0"
-windows = { version = "0.61", features = ["Win32_NetworkManagement_IpHelper"] }
+windows = { version = "0.61", features = ["Win32_NetworkManagement_IpHelper", "Win32_System_LibraryLoader", "Win32_Foundation"] }
 
 # systemd readiness notification (Type=notify). Linux-only; pulled in by the
 # default `systemd` feature. Drop it for OpenWRT/minimal builds via

@@ -258,6 +258,62 @@ fn parse_ipv4_cidr(cidr: &str) -> Result<(Ipv4Addr, u8), String> {
     Ok((addr, prefix))
 }
 
+#[cfg(windows)]
+unsafe fn get_set_interface_dns_settings_ptr() -> Option<
+    unsafe extern "system" fn(
+        windows::core::GUID,
+        *const windows::Win32::NetworkManagement::IpHelper::DNS_INTERFACE_SETTINGS,
+    ) -> windows::core::HRESULT,
+> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+    let dll_name: Vec<u16> = OsStr::new("iphlpapi.dll")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let hmod_result = unsafe { GetModuleHandleW(windows::core::PCWSTR(dll_name.as_ptr())) };
+    let hmod = match hmod_result {
+        Ok(h) => h,
+        Err(_) => return None,
+    };
+    if hmod.is_invalid() {
+        return None;
+    }
+
+    let proc_name = b"SetInterfaceDnsSettings\0";
+    let proc = unsafe { GetProcAddress(hmod, windows::core::PCSTR(proc_name.as_ptr())) };
+    return proc.map(|addr| unsafe { std::mem::transmute(addr) });
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn is_set_interface_dns_settings_supported() -> bool {
+    unsafe { get_set_interface_dns_settings_ptr().is_some() }
+}
+
+#[cfg(windows)]
+unsafe fn call_set_interface_dns_settings(
+    guid: windows::core::GUID,
+    settings: *const windows::Win32::NetworkManagement::IpHelper::DNS_INTERFACE_SETTINGS,
+) -> windows::core::Result<()> {
+    match unsafe { get_set_interface_dns_settings_ptr() } {
+        Some(func) => {
+            let hr = unsafe { func(guid, settings) };
+            if hr.is_ok() {
+                Ok(())
+            } else {
+                Err(windows::core::Error::from(hr))
+            }
+        }
+        None => Err(windows::core::Error::from(
+            windows::Win32::Foundation::ERROR_PROC_NOT_FOUND,
+        )),
+    }
+}
+
 /// Assign DNS servers to our TUN interface via `SetInterfaceDnsSettings`, and
 /// disable dynamic DNS registration for it. Targets the adapter by the fixed
 /// GUID we registered it with.
@@ -297,7 +353,7 @@ fn set_interface_dns(servers: &[String]) -> Result<(), String> {
 #[cfg(windows)]
 fn set_interface_registration(guid: windows::core::GUID, enabled: bool) -> Result<(), String> {
     use windows::Win32::NetworkManagement::IpHelper::{
-        SetInterfaceDnsSettings, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
+        DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
         DNS_SETTING_REGISTRATION_ENABLED,
     };
 
@@ -309,8 +365,7 @@ fn set_interface_registration(guid: windows::core::GUID, enabled: bool) -> Resul
     };
 
     unsafe {
-        SetInterfaceDnsSettings(guid, &settings)
-            .ok()
+        call_set_interface_dns_settings(guid, &settings as *const _)
             .map_err(|e| format!("SetInterfaceDnsSettings (registration): {}", e))
     }
 }
@@ -321,7 +376,7 @@ fn set_interface_registration(guid: windows::core::GUID, enabled: bool) -> Resul
 fn apply_interface_dns(guid: windows::core::GUID, addrs: &[&str], ipv6: bool) -> Result<(), String> {
     use windows::core::PWSTR;
     use windows::Win32::NetworkManagement::IpHelper::{
-        SetInterfaceDnsSettings, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
+        DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
         DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER,
     };
 
@@ -350,8 +405,7 @@ fn apply_interface_dns(guid: windows::core::GUID, addrs: &[&str], ipv6: bool) ->
     };
 
     unsafe {
-        SetInterfaceDnsSettings(guid, &settings)
-            .ok()
+        call_set_interface_dns_settings(guid, &settings as *const _)
             .map_err(|e| format!("SetInterfaceDnsSettings (ipv6={}): {}", ipv6, e))
     }
 }
