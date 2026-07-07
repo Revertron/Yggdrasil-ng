@@ -7,6 +7,35 @@ use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring::default_provider;
 use std::sync::Arc;
 
+/// Signature schemes advertised in the TLS `signature_algorithms` extension.
+///
+/// rustls derives that extension (and, server-side, the `CertificateRequest`)
+/// from the verifier's `supported_verify_schemes()`. It must cover every scheme
+/// a real-world peer might use to sign the handshake, or the peer returns
+/// `handshake_failure`.
+///
+/// In particular, TLS 1.3 forbids RSA_PKCS1_* for handshake signatures — an RSA
+/// server (e.g. a wss endpoint fronted by nginx with a Let's Encrypt cert) MUST
+/// sign with RSA-PSS. Advertising only RSA_PKCS1_SHA256 meant such servers had
+/// no usable scheme and the handshake failed, while ed25519 yggdrasil peers kept
+/// working. We accept all certs anyway (auth happens in Yggdrasil's own
+/// handshake), so advertise broadly.
+fn all_supported_verify_schemes() -> Vec<rustls::SignatureScheme> {
+    use rustls::SignatureScheme::*;
+    vec![
+        ED25519,
+        ECDSA_NISTP256_SHA256,
+        ECDSA_NISTP384_SHA384,
+        ECDSA_NISTP521_SHA512,
+        RSA_PSS_SHA256,
+        RSA_PSS_SHA384,
+        RSA_PSS_SHA512,
+        RSA_PKCS1_SHA256,
+        RSA_PKCS1_SHA384,
+        RSA_PKCS1_SHA512,
+    ]
+}
+
 /// Custom certificate verifier that accepts all certificates.
 /// This is safe because Yggdrasil uses its own handshake protocol for authentication.
 #[derive(Debug)]
@@ -43,11 +72,7 @@ impl ServerCertVerifier for AcceptAllVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ED25519,
-        ]
+        all_supported_verify_schemes()
     }
 }
 
@@ -202,11 +227,7 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAllClientVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ED25519,
-        ]
+        all_supported_verify_schemes()
     }
 }
 

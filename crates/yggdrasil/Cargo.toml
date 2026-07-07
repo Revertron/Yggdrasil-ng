@@ -45,12 +45,20 @@ getifaddrs = "0.6"
 rustc-hash = "2.1.2"
 arc-swap = "1.9"
 
+# QUIC (quic://) transport (enabled only via feature "transport-quic-ws")
+quinn = { version = "0.11", optional = true }
+
+# WebSocket (ws:// / wss://) transport (enabled only via feature "transport-quic-ws")
+tokio-tungstenite = { version = "0.26", optional = true }
+futures-util = { version = "0.3", optional = true }
+
 [features]
 default = ["ctl", "tun", "systemd", "ckr"]
 ctl = []
 tun = ["dep:tun-rs"]
 ckr = ["dep:route_manager"]
 systemd = ["dep:sd-notify"]
+transport-quic-ws = ["dep:quinn", "dep:tokio-tungstenite", "dep:futures-util"]
 
 [dependencies.ipnet]
 version = "2"
