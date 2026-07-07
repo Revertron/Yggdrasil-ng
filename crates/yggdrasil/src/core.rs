@@ -11,7 +11,7 @@ use crate::ipv6rwc::ReadWriteCloser;
 use crate::links::{ActiveLinks, Links, LinkPeerInfo};
 use crate::multicast::{Multicast, NetworkInterface};
 use crate::proto::ProtoHandler;
-use crate::transport::tls as tls_support;
+use crate::transport::tls;
 
 /// Session type byte prefixed to ironwood payloads.
 const TYPE_SESSION_TRAFFIC: u8 = 0x01;
@@ -84,13 +84,13 @@ impl Core {
         let active_links = ActiveLinks::new();
 
         // Generate self-signed TLS certificate
-        let tls_material = tls_support::generate_self_signed_cert(&signing_key)
+        let tls_material = tls::generate_self_signed_cert(&signing_key)
             .expect("failed to generate TLS certificate");
-        let tls_server_config = tls_support::create_server_config(
+        let tls_server_config = tls::create_server_config(
             tls_material.cert_chain(),
             tls_material.private_key().expect("invalid private key"),
         ).expect("failed to create TLS server config");
-        let tls_client_config = tls_support::create_client_config(
+        let tls_client_config = tls::create_client_config(
             tls_material.cert_chain(),
             tls_material.private_key().expect("invalid private key"),
         ).expect("failed to create TLS client config");
@@ -518,13 +518,13 @@ impl Core {
                 tracing::info!("TLS certificate expires in {} days, renewing...", days_until_expiry);
 
                 // Generate new certificate
-                match tls_support::generate_self_signed_cert(&self.signing_key) {
+                match tls::generate_self_signed_cert(&self.signing_key) {
                     Ok(material) => {
-                        let server_result = tls_support::create_server_config(
+                        let server_result = tls::create_server_config(
                             material.cert_chain(),
                             material.private_key().unwrap(),
                         );
-                        let client_result = tls_support::create_client_config(
+                        let client_result = tls::create_client_config(
                             material.cert_chain(),
                             material.private_key().unwrap(),
                         );
