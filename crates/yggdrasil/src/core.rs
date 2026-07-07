@@ -11,7 +11,7 @@ use crate::ipv6rwc::ReadWriteCloser;
 use crate::links::{ActiveLinks, Links, LinkPeerInfo};
 use crate::multicast::{Multicast, NetworkInterface};
 use crate::proto::ProtoHandler;
-use crate::tls_support;
+use crate::transport::tls as tls_support;
 
 /// Session type byte prefixed to ironwood payloads.
 const TYPE_SESSION_TRAFFIC: u8 = 0x01;

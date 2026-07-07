@@ -11,7 +11,7 @@ pub mod ipv6rwc;
 pub mod links;
 pub mod multicast;
 pub mod proto;
-pub mod tls_support;
+pub mod transport;
 #[cfg(feature = "tun")]
 pub mod tun;
 pub mod version;

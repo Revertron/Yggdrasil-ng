@@ -17,7 +17,7 @@ use url::Url;
 use rustls::pki_types::CertificateDer;
 
 use crate::core::Core;
-use crate::tls_support::extract_ed25519_pubkey_from_cert;
+use crate::transport::tls::extract_ed25519_pubkey_from_cert;
 use crate::version::Metadata;
 
 /// Enum to handle both TCP and TLS streams uniformly.
