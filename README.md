@@ -86,6 +86,11 @@ sudo cp target/release/yggdrasil /usr/local/bin/
 cargo install --path crates/yggdrasil
 ```
 
+## Container Image
+
+Release container images are available from GitHub Container Registry.
+See [docs/CONTAINER.md](docs/CONTAINER.md) for tags, supported platforms, and Docker/Podman usage.
+
 ## Usage
 
 ### Command Line Options
