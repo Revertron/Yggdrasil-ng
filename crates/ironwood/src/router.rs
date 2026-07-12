@@ -337,6 +337,11 @@ impl Router {
         actions.extend(self.send_announces());
         actions.extend(self.blooms_maintenance());
         self.pathfinder.cleanup_expired(self.path_timeout);
+        // Retry any rumor still waiting on a path — its reactive lookup may have
+        // been lost during convergence and nothing else re-sends it.
+        for dest in self.pathfinder.rumors_needing_retry() {
+            actions.extend(self.do_send_lookup(&dest));
+        }
         actions
     }
 
@@ -1148,6 +1153,9 @@ impl Router {
             }]
         } else if tr.dest == self.crypto.public_key {
             tracing::debug!("Traffic arrived for us: {} bytes from {:?}", tr.payload.len(), hex::encode(&tr.source[..4]));
+            // Adopt a path back to the source from its coords in the packet, so a
+            // reply needs no lookup of its own (see learn_path_from_traffic).
+            self.pathfinder.learn_path_from_traffic(&tr.source, &tr.from);
             self.pathfinder.reset_timeout(&tr.source);
             vec![RouterAction::DeliverTraffic { traffic: tr }]
         } else {

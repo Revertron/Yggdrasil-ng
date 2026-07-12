@@ -272,6 +272,36 @@ impl Pathfinder {
         }
     }
 
+    /// Adopt the sender's coordinates from a received packet (`tr.from`) as a path
+    /// back to them, so a node can reply to traffic it never looked up itself (e.g.
+    /// an encrypted-session ACK) without a fresh lookup that may not resolve. `seq`
+    /// stays 0 so a signed PathNotify supersedes it; an empty path (sender is the
+    /// root) is cached too, as `send_traffic` has no special case for the root.
+    pub fn learn_path_from_traffic(&mut self, source: &PublicKey, path: &[PeerPort]) {
+        match self.paths.get_mut(source) {
+            Some(info) => {
+                if info.broken || info.path != path {
+                    info.path = path.to_vec();
+                    info.broken = false;
+                }
+                info.last_refresh = Instant::now();
+            }
+            None => {
+                self.paths.insert(
+                    *source,
+                    PathInfo {
+                        path: path.to_vec(),
+                        seq: 0,
+                        req_time: Instant::now(),
+                        last_refresh: Instant::now(),
+                        cached_traffic: None,
+                        broken: false,
+                    },
+                );
+            }
+        }
+    }
+
     /// Reset the timeout for a destination (called when we receive traffic from them).
     pub fn reset_timeout(&mut self, key: &PublicKey) {
         if let Some(info) = self.paths.get_mut(key) {
@@ -326,6 +356,19 @@ impl Pathfinder {
             let expiry_base = rumor.send_time.unwrap_or(rumor.created);
             now.duration_since(expiry_base) < path_timeout
         });
+    }
+
+    /// Real destination keys of rumors still waiting on a path: they have
+    /// buffered traffic but no live (non-broken) path yet. `do_maintenance`
+    /// re-issues a lookup for each every tick, so a `PathLookup`/`PathNotify`
+    /// lost during tree/bloom convergence is retried instead of wedging until
+    /// the rumor expires. Matches upstream Go ironwood, which retries these.
+    pub fn rumors_needing_retry(&self) -> Vec<PublicKey> {
+        self.rumors
+            .values()
+            .filter_map(|rumor| rumor.traffic.as_ref().map(|t| t.dest))
+            .filter(|dest| self.paths.get(dest).map_or(true, |info| info.broken))
+            .collect()
     }
 }
 
