@@ -13,7 +13,7 @@ FROM docker.io/busybox:stable-uclibc AS main
 
 COPY --from=builder /yggdrasil /usr/local/bin/yggdrasil
 
-COPY ./entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY ./contrib/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

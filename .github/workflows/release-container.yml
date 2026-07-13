@@ -58,7 +58,7 @@ jobs:
         with:
           image: ${{ needs.metadata.outputs.image }}
           tags: ci-${{ matrix.arch }}
-          containerfiles: ./dockerfile
+          containerfiles: ./contrib/docker/dockerfile
 
       - name: Save OCI archive
         run: |
