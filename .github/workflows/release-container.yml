@@ -58,12 +58,15 @@ jobs:
         with:
           image: ${{ needs.metadata.outputs.image }}
           tags: ci-${{ matrix.arch }}
-          containerfiles: ./dockerfile
+          containerfiles: ./contrib/docker/dockerfile
 
       - name: Save OCI archive
+        env:
+          IMAGE: ${{ needs.metadata.outputs.image }}
+          ARCH: ${{ matrix.arch }}
         run: |
           mkdir -p out
-          podman save --format oci-archive -o "out/${{ matrix.arch }}.tar" "${{ needs.metadata.outputs.image }}:ci-${{ matrix.arch }}"
+          podman save --format oci-archive -o "out/${ARCH}.tar" "${IMAGE}:ci-${ARCH}"
 
       - name: Upload OCI archive
         uses: actions/upload-artifact@v7
@@ -101,12 +104,12 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push multi-arch tags
+        env:
+          IMAGE: ${{ needs.metadata.outputs.image }}
+          AMD: ${{ needs.metadata.outputs.image }}:ci-x86_64
+          ARM: ${{ needs.metadata.outputs.image }}:ci-aarch64
         run: |
           set -euxo pipefail
-          IMAGE="${{ needs.metadata.outputs.image }}"
-          AMD="${IMAGE}:ci-x86_64"
-          ARM="${IMAGE}:ci-aarch64"
-
           for tag in "${{ needs.metadata.outputs.version }}" latest; do
             podman manifest rm "${IMAGE}:${tag}" 2>/dev/null || true
             podman manifest create "${IMAGE}:${tag}"
