@@ -338,8 +338,16 @@ impl Router {
         actions.extend(self.blooms_maintenance());
         self.pathfinder.cleanup_expired(self.path_timeout);
         // Retry any rumor still waiting on a path — its reactive lookup may have
-        // been lost during convergence and nothing else re-sends it.
+        // been lost during convergence and nothing else re-sends it. Throttle each
+        // retry by `path_throttle` (via the rumor's own timers, since a pure rumor
+        // has no `paths` entry for `do_send_lookup`'s path-level throttle to catch)
+        // without extending the rumor's lifetime.
         for dest in self.pathfinder.rumors_needing_retry() {
+            let xform = self.blooms.x_key(&dest, &self.bloom_transform);
+            if self.pathfinder.should_throttle_rumor_retry(&xform, self.path_throttle) {
+                continue;
+            }
+            self.pathfinder.mark_rumor_retry(&xform);
             actions.extend(self.do_send_lookup(&dest));
         }
         actions
