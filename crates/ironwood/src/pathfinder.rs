@@ -38,8 +38,14 @@ pub(crate) struct PathInfo {
 pub(crate) struct PathRumor {
     /// Cached traffic packet.
     pub traffic: Option<super::traffic::TrafficPacket>,
-    /// When we last sent a lookup (None = never sent).
+    /// When we last sent a lookup on the application-write path (None = never sent).
+    /// Also the expiry base in `cleanup_expired`, so it bounds the rumor's lifetime.
     pub send_time: Option<Instant>,
+    /// When `do_maintenance` last *retried* a lookup (None = never retried). Kept
+    /// separate from `send_time` on purpose: retries must be throttled but must NOT
+    /// extend the rumor's lifetime, or a permanently-unreachable peer would be looked
+    /// up forever instead of expiring `path_timeout` after the last application write.
+    pub retry_time: Option<Instant>,
     /// When this rumor was created (used as expiry fallback if never sent).
     pub created: Instant,
 }
@@ -155,6 +161,7 @@ impl Pathfinder {
                 PathRumor {
                     traffic: None,
                     send_time: None,
+                    retry_time: None,
                     created: Instant::now(),
                 },
             );
@@ -166,6 +173,30 @@ impl Pathfinder {
     pub fn mark_rumor_sent(&mut self, xformed_dest: &PublicKey) {
         if let Some(rumor) = self.rumors.get_mut(xformed_dest) {
             rumor.send_time = Some(Instant::now());
+        }
+    }
+
+    /// Throttle a `do_maintenance` *retry*: skip if either the last application-write
+    /// lookup (`send_time`) or the last retry (`retry_time`) was within `throttle`.
+    pub fn should_throttle_rumor_retry(
+        &self,
+        xformed_dest: &PublicKey,
+        throttle: Duration,
+    ) -> bool {
+        if let Some(rumor) = self.rumors.get(xformed_dest) {
+            let recent = |t: Option<Instant>| t.map_or(false, |t| t.elapsed() < throttle);
+            recent(rumor.send_time) || recent(rumor.retry_time)
+        } else {
+            false
+        }
+    }
+
+    /// Record a maintenance retry. Unlike `mark_rumor_sent` this leaves `send_time`
+    /// untouched, so `cleanup_expired` still bounds the rumor to `path_timeout` after
+    /// the last application write — our own retries do not keep a dead peer alive.
+    pub fn mark_rumor_retry(&mut self, xformed_dest: &PublicKey) {
+        if let Some(rumor) = self.rumors.get_mut(xformed_dest) {
+            rumor.retry_time = Some(Instant::now());
         }
     }
 
@@ -272,6 +303,30 @@ impl Pathfinder {
         }
     }
 
+    /// Adopt the sender's coordinates from a received packet (`tr.from`) as a path
+    /// back to them, so a node can reply to traffic it never looked up itself (e.g.
+    /// an encrypted-session ACK) without a fresh lookup that may not resolve.
+    ///
+    /// `tr.from` is an *unsigned*, attacker-forgeable routing header, so this must
+    /// never overwrite or resurrect an existing entry — otherwise any node that can
+    /// get a packet delivered to us could replace a signed PathNotify path or
+    /// un-break a broken one (path-cache poisoning). We therefore only fill an empty
+    /// slot, with `seq = 0` so any signed PathNotify (`seq > 0`) supersedes it. A live
+    /// learned entry is kept fresh by `reset_timeout` (non-broken only); a broken or
+    /// expired one is dropped by `cleanup_expired` and re-learned from the next packet.
+    /// An empty path (sender is the tree root) is cached too, as `send_traffic` has no
+    /// special case for the root.
+    pub fn learn_path_from_traffic(&mut self, source: &PublicKey, path: &[PeerPort]) {
+        self.paths.entry(*source).or_insert_with(|| PathInfo {
+            path: path.to_vec(),
+            seq: 0,
+            req_time: Instant::now(),
+            last_refresh: Instant::now(),
+            cached_traffic: None,
+            broken: false,
+        });
+    }
+
     /// Reset the timeout for a destination (called when we receive traffic from them).
     pub fn reset_timeout(&mut self, key: &PublicKey) {
         if let Some(info) = self.paths.get_mut(key) {
@@ -326,6 +381,26 @@ impl Pathfinder {
             let expiry_base = rumor.send_time.unwrap_or(rumor.created);
             now.duration_since(expiry_base) < path_timeout
         });
+    }
+
+    /// Real destination keys of rumors still waiting on a path: they have
+    /// buffered traffic but no live (non-broken) path yet. `do_maintenance`
+    /// re-issues a throttled lookup for each, so a `PathLookup`/`PathNotify`
+    /// lost during tree/bloom convergence is retried instead of wedging until
+    /// the rumor expires.
+    ///
+    /// This is a deliberate divergence from upstream Go ironwood: Go's
+    /// `_doMaintenance` has no rumor retry — it re-sends a lookup only on the next
+    /// application write (`_handleTraffic` → `_rumorSendLookup`) or an explicit
+    /// `SendLookup`. That is fine for TUN traffic (TCP retransmits force new writes)
+    /// but a one-shot send (e.g. a single mail to a cold peer behind another hub)
+    /// would otherwise wedge until the buffer expires.
+    pub fn rumors_needing_retry(&self) -> Vec<PublicKey> {
+        self.rumors
+            .values()
+            .filter_map(|rumor| rumor.traffic.as_ref().map(|t| t.dest))
+            .filter(|dest| self.paths.get(dest).map_or(true, |info| info.broken))
+            .collect()
     }
 }
 
@@ -430,5 +505,53 @@ mod tests {
         assert!(pf.get_path(&dest).is_some());
         pf.handle_broken(&dest);
         assert!(pf.get_path(&dest).is_none()); // broken paths not returned
+    }
+
+    // `tr.from` is unsigned, so learned paths must never overwrite or resurrect an
+    // existing entry — otherwise any node that can reach us could poison our cache.
+    #[test]
+    fn learn_path_only_fills_empty_slot() {
+        let crypto = make_crypto();
+        let mut pf = Pathfinder::new(&crypto);
+        let src = [7u8; 32];
+
+        // Empty slot: adopt the coords, seq stays 0 so a signed notify supersedes.
+        pf.learn_path_from_traffic(&src, &[1, 2, 3]);
+        assert_eq!(pf.paths[&src].path, vec![1, 2, 3]);
+        assert_eq!(pf.paths[&src].seq, 0);
+
+        // Pretend a signed PathNotify has since set this path (seq > 0).
+        pf.paths.get_mut(&src).unwrap().seq = 5;
+        pf.learn_path_from_traffic(&src, &[9, 9, 9]);
+        assert_eq!(pf.paths[&src].path, vec![1, 2, 3], "must not overwrite a known path");
+        assert_eq!(pf.paths[&src].seq, 5);
+
+        // A broken path must not be un-broken by unsigned traffic.
+        pf.handle_broken(&src);
+        pf.learn_path_from_traffic(&src, &[4, 4]);
+        assert!(pf.paths[&src].broken, "must not un-break via unsigned traffic");
+        assert_eq!(pf.paths[&src].path, vec![1, 2, 3]);
+    }
+
+    // A maintenance retry must be throttled by path_throttle, but must NOT reset the
+    // rumor's expiry clock (send_time) — otherwise an unreachable peer is looked up
+    // forever instead of expiring path_timeout after the last application write.
+    #[test]
+    fn rumor_retry_throttles_without_extending_lifetime() {
+        let crypto = make_crypto();
+        let mut pf = Pathfinder::new(&crypto);
+        let xform = [3u8; 32];
+        let throttle = Duration::from_secs(1);
+
+        pf.ensure_rumor(xform);
+        assert!(!pf.should_throttle_rumor_retry(&xform, throttle)); // never retried
+
+        pf.mark_rumor_retry(&xform);
+        assert!(pf.should_throttle_rumor_retry(&xform, throttle)); // just retried
+
+        assert!(
+            pf.rumors[&xform].send_time.is_none(),
+            "maintenance retry must not extend rumor lifetime"
+        );
     }
 }

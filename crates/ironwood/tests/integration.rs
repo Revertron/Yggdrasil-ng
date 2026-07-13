@@ -12,6 +12,7 @@ use tokio::time::timeout;
 
 use ironwood::{
     new_encrypted_packet_conn, new_packet_conn, new_signed_packet_conn, Config, PacketConn,
+    PacketConnImpl,
 };
 
 /// Connect two PacketConn nodes via a duplex stream.
@@ -94,6 +95,16 @@ async fn two_node_plain() {
 
     node_a.close().await.unwrap();
     node_b.close().await.unwrap();
+}
+
+async fn connect_plain(a: &Arc<PacketConnImpl>, b: &Arc<PacketConnImpl>) {
+    let (sa, sb) = tokio::io::duplex(1 << 16);
+    let addr_a = a.local_addr();
+    let addr_b = b.local_addr();
+    let a2 = Arc::clone(a);
+    let b2 = Arc::clone(b);
+    tokio::spawn(async move { let _ = a2.handle_conn(addr_b, Box::new(sa), 0).await; });
+    tokio::spawn(async move { let _ = b2.handle_conn(addr_a, Box::new(sb), 0).await; });
 }
 
 #[tokio::test]
@@ -318,4 +329,68 @@ async fn two_node_signed() {
 
     node_a.close().await.unwrap();
     node_b.close().await.unwrap();
+}
+
+/// Verifies that a PathLookup lost during tree/bloom convergence is retried by
+/// the periodic maintenance tick. A sends ONE packet to D (no reply from D).
+/// We settle for only 500ms so the first lookup races convergence; the retry
+/// in `do_maintenance` must be what delivers it. Without the retry loop this
+/// wedges; with it, every trial delivers.
+///
+/// Topology: A — H1 — H2 — D  (forward direction only; return path not tested here).
+///
+/// Ignored by default: each trial spins up four in-memory nodes and waits on real
+/// ~1s maintenance ticks, so it runs for seconds. The retry logic itself is covered
+/// by fast unit tests in `pathfinder` (`rumor_retry_throttles_without_extending_lifetime`);
+/// run this end-to-end check manually:
+///   cargo test -p ironwood --test integration cross_hub_forward_discovery_retry -- --ignored
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow E2E: multi-node network with real maintenance ticks; run with --ignored"]
+async fn cross_hub_forward_discovery_retry() {
+    // Each trial needs several 1s retries to deliver (the first lookup often races
+    // convergence and is lost), so this is inherently multi-second per trial.
+    let trials = 10;
+    for trial in 0..trials {
+        let a  = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+        let h1 = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+        let h2 = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+        let d  = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+
+        connect_plain(&a, &h1).await;
+        connect_plain(&h1, &h2).await;
+        connect_plain(&h2, &d).await;
+
+        let addr_a = a.local_addr();
+        let addr_d = d.local_addr();
+
+        // Short settle: forces a lookup race with convergence so the retry is exercised.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // A sends exactly one packet to D.
+        a.write_to(b"PING", &addr_d).await.ok();
+
+        // D must receive it (the retry closes the window; without it this wedges).
+        let d2 = d.clone();
+        let received = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match d2.read_from(&mut buf).await {
+                    Ok((n, from)) if n > 0 && from == addr_a => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        });
+
+        let ok = matches!(
+            timeout(Duration::from_secs(8), received).await,
+            Ok(Ok(true))
+        );
+
+        for n in [&a, &h1, &h2, &d] {
+            let _ = n.close().await;
+        }
+
+        assert!(ok, "trial {}: D did not receive the packet within 8s", trial);
+    }
 }
