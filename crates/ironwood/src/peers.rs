@@ -380,20 +380,34 @@ pub(crate) async fn peer_reader(
             tokio::pin!(read_fut);
 
             'poll: loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => { break 'poll None },
-                    result = &mut read_fut => { break 'poll Some(result) },
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        let deadline = *read_deadline.lock().unwrap();
-                        if let Some(d) = deadline {
-                            if std::time::Instant::now() >= d {
+                // Sleep only as long as necessary: until the outstanding read
+                // deadline if one is set, otherwise a coarse idle interval. A
+                // deadline is always `now + peer_timeout` and the idle wait is
+                // exactly peer_timeout, so we still wake before any freshly-set
+                // deadline can expire — timeout detection stays precise while an
+                // idle connection no longer wakes once per second.
+                let wait = {
+                    let deadline = *read_deadline.lock().unwrap();
+                    match deadline {
+                        Some(d) => match d.checked_duration_since(std::time::Instant::now()) {
+                            Some(remaining) => remaining,
+                            None => {
                                 tracing::debug!("peer_reader[{}]: peer timeout ({}ms, no reply from {:02x?}), disconnecting",
                                     peer_id, peer_timeout.as_millis(), hex::encode(&peer_key[..8]));
                                 disconnect_reason = Some(Error::Timeout);
                                 break 'poll None;
                             }
-                        }
-                        // Continue polling — reuses the same pinned read future
+                        },
+                        None => peer_timeout,
+                    }
+                };
+
+                tokio::select! {
+                    _ = cancel.cancelled() => { break 'poll None },
+                    result = &mut read_fut => { break 'poll Some(result) },
+                    _ = tokio::time::sleep(wait) => {
+                        // Deadline re-checked at the top of the next iteration;
+                        // reuses the same pinned read future.
                     }
                 }
             }

@@ -269,27 +269,41 @@ async fn router_actor(
     path_notify_cb: Option<Arc<dyn Fn(PublicKey) + Send + Sync>>,
     cancel: CancellationToken,
 ) {
-    let mut maintenance_interval = tokio::time::interval(Duration::from_secs(1));
-    maintenance_interval.tick().await; // skip first immediate tick
+    // Coarse cadence for periodic housekeeping (60s status log, 4-min refresh,
+    // info/path expiry). Between passes the actor sleeps instead of waking every
+    // second, so an idle node stops burning CPU on no-op maintenance ticks.
+    const IDLE_MAINT_INTERVAL: Duration = Duration::from_secs(10);
+    // A topology-changing message (peer add/remove, accepted announce, SigRes,
+    // bloom) still needs fix()/send_announces() to run promptly, but a single
+    // reconnect can deliver a burst of announces — debounce them into one pass
+    // rather than recomputing the tree per message.
+    const MAINT_DEBOUNCE: Duration = Duration::from_millis(100);
 
-    // Track wall-clock alongside the monotonic interval so we can detect post-
+    // Track wall-clock alongside the monotonic timer so we can detect post-
     // suspend wake-ups. CLOCK_MONOTONIC (which tokio::time uses) is frozen on
     // Android during Doze; SystemTime is not. If the wall-clock delta between
-    // ticks is far larger than the ~1s interval, the device just resumed and
-    // the rest of the mesh has already expired our tree info on their side —
-    // we must immediately re-announce, not wait the next 4-minute refresh.
+    // maintenance passes is far larger than our cadence, the device just resumed
+    // and the rest of the mesh has already expired our tree info on their side —
+    // we must immediately re-announce, not wait the next 4-minute refresh. The
+    // threshold stays comfortably above IDLE_MAINT_INTERVAL so a normal idle
+    // pass never false-triggers.
     let mut last_wall = std::time::SystemTime::now();
     const WALL_JUMP_THRESHOLD: Duration = Duration::from_secs(30);
+
+    // Deadline-driven maintenance: sleep until the next scheduled pass rather
+    // than ticking every second. Topology messages pull this forward (debounced);
+    // otherwise it runs on the coarse idle cadence.
+    let mut next_maint = tokio::time::Instant::now() + IDLE_MAINT_INTERVAL;
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = maintenance_interval.tick() => {
+            _ = tokio::time::sleep_until(next_maint) => {
                 let wall_now = std::time::SystemTime::now();
                 if let Ok(elapsed) = wall_now.duration_since(last_wall) {
                     if elapsed >= WALL_JUMP_THRESHOLD {
                         tracing::info!(
-                            "wall-clock jumped {}s between maintenance ticks (suspend/Doze resume) — forcing router refresh",
+                            "wall-clock jumped {}s between maintenance passes (suspend/Doze resume) — forcing router refresh",
                             elapsed.as_secs()
                         );
                         router.force_refresh();
@@ -302,16 +316,41 @@ async fn router_actor(
                 if !actions.is_empty() {
                     dispatch_actions(actions, &peers, &delivery_queue, &traffic_tx, &path_notify_cb).await;
                 }
+                next_maint = tokio::time::Instant::now() + IDLE_MAINT_INTERVAL;
             }
             msg = rx.recv() => {
                 let Some(msg) = msg else { break };
+                let topology = is_topology_msg(&msg);
                 handle_router_msg(
                     &mut router, msg, &peers, &delivery_queue,
                     &traffic_tx, &path_notify_cb,
                 ).await;
+                // Pull the next maintenance pass forward so the tree recompute
+                // and re-announce happen promptly after a topology change.
+                if topology {
+                    let soon = tokio::time::Instant::now() + MAINT_DEBOUNCE;
+                    if soon < next_maint {
+                        next_maint = soon;
+                    }
+                }
             }
         }
     }
+}
+
+/// Whether a router message changes tree/announce state and therefore warrants
+/// a prompt maintenance pass (fix + send_announces). Traffic, lookups and
+/// queries are deliberately excluded — they carry their own immediate actions
+/// and arrive far too often to trigger a recompute each.
+fn is_topology_msg(msg: &RouterMsg) -> bool {
+    matches!(
+        msg,
+        RouterMsg::AddPeer { .. }
+            | RouterMsg::RemovePeer { .. }
+            | RouterMsg::HandleResponse { .. }
+            | RouterMsg::HandleAnnounce { .. }
+            | RouterMsg::HandleBloom { .. }
+    )
 }
 
 /// Process a single router message: call the appropriate Router method and
