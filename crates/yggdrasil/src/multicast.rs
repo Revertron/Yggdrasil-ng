@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use blake2::Blake2b512;
 use getifaddrs::{self, InterfaceFlags};
@@ -18,9 +19,14 @@ use crate::links::{self, LinkOptions, LinkType, Stream};
 use crate::version::{PROTOCOL_VERSION_MAJOR, PROTOCOL_VERSION_MINOR};
 
 const MULTICAST_GROUP: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x0114);
-const MULTICAST_PORT: u16 = 9001;
+static MULTICAST_PORT: AtomicU16 = AtomicU16::new(9001);
 const BEACON_MAX_INTERVAL: Duration = Duration::from_secs(15);
 const RECV_BUF_SIZE: usize = 2048;
+
+/// Override the multicast UDP port (default 9001). Call once at startup.
+pub fn set_multicast_port(port: u16) {
+    MULTICAST_PORT.store(port, Ordering::Relaxed);
+}
 
 // ── External interface info ──────────────────────────────────────────────
 
@@ -239,7 +245,7 @@ fn create_multicast_socket() -> std::io::Result<Socket> {
     socket.set_reuse_port(true)?;
     socket.set_only_v6(true)?;
 
-    let bind_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MULTICAST_PORT, 0, 0);
+    let bind_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MULTICAST_PORT.load(Ordering::Relaxed), 0, 0);
     socket.bind(&bind_addr.into())?;
     socket.set_nonblocking(true)?;
 
@@ -413,7 +419,7 @@ async fn monitor_and_announce_loop(
     patterns: Vec<MulticastInterfaceConfig>,
     external_rx: Option<watch::Receiver<Vec<NetworkInterface>>>,
 ) {
-    let dest = SocketAddrV6::new(MULTICAST_GROUP, MULTICAST_PORT, 0, 0);
+    let dest = SocketAddrV6::new(MULTICAST_GROUP, MULTICAST_PORT.load(Ordering::Relaxed), 0, 0);
 
     loop {
         // Update interfaces: use external source if provided, otherwise enumerate via getifaddrs

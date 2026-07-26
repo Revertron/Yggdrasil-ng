@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opts.optflag("j", "json", "Output control command results as raw JSON");
     #[cfg(windows)]
     opts.optflag("", "service", "Run as a Windows service (launched by the Service Control Manager)");
+    opts.optopt("", "prefix-port", "Network prefix (02-fc) and port (1024-65535) for admin_listen/multicast, e.g. 02:9001", "PREFIXPORT");
     opts.optflag("h", "help", "Print this help");
     opts.optflag("v", "version", "Print version");
 
@@ -58,6 +59,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches.opt_present("version") {
         println!("yggdrasil {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+
+    // --prefix-port handling (must be before address generation)
+    if let Some(val) = matches.opt_str("prefix-port") {
+        match parse_prefix_port(&val) {
+            Some((prefix, port)) => {
+                // We need a mutable Config later; store the values for now
+                // and apply after Config is loaded. For --address/--subnet
+                // we can set the prefix immediately.
+                yggdrasil::address::set_address_prefix(prefix);
+                yggdrasil::multicast::set_multicast_port(port);
+                // The full apply (admin_listen + if_name) is done after Config load
+            }
+            None => {
+                tracing::warn!(
+                    "Invalid --prefix-port value '{}', ignoring (expected format like 02:9001)",
+                    val
+                );
+            }
+        }
     }
 
     // If there are free (positional) arguments, treat as a control command
@@ -140,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging(&loglevel, logto.as_deref());
 
     // Load config
-    let config = if autoconf {
+    let mut config = if autoconf {
         Config::default()
     } else if !config_path.is_empty() {
         let file = File::open(&config_path)?;
@@ -150,6 +171,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!("Please specify --genconf, --config, or --autoconf");
         std::process::exit(1);
     };
+
+    if let Some(val) = matches.opt_str("prefix-port") {
+        if let Some((prefix, port)) = parse_prefix_port(&val) {
+            apply_prefix_port(prefix, port, &mut config);
+        }
+    }
 
     // Parse or generate signing key
     // Priority: config file > YGGDRASIL_PRIVATE_KEY env var > ephemeral
@@ -214,6 +241,7 @@ async fn run_node(
     opts.optflag("a", "address", "");
     opts.optflag("s", "subnet", "");
     opts.optflag("n", "no-replace", "");
+    opts.optopt("", "prefix-port", "", "PREFIXPORT");
     opts.optflag("h", "help", "");
     opts.optflag("v", "version", "");
     #[cfg(feature = "ctl")]
@@ -237,7 +265,7 @@ async fn run_node(
     init_logging(&loglevel, logto.as_deref());
 
     // Load config
-    let config = if autoconf {
+    let mut config = if autoconf {
         Config::default()
     } else if !config_path.is_empty() {
         let file = File::open(&config_path)?;
@@ -246,6 +274,12 @@ async fn run_node(
     } else {
         return Err("No configuration: specify --config or --autoconf".into());
     };
+
+    if let Some(val) = matches.opt_str("prefix-port") {
+        if let Some((prefix, port)) = parse_prefix_port(&val) {
+            apply_prefix_port(prefix, port, &mut config);
+        }
+    }
 
     // Parse or generate signing key
     let signing_key = if !config.private_key.is_empty() {
@@ -547,6 +581,82 @@ fn usage_string() -> String {
     return "Usage: yggdrasil [options] [command [key=value ...]]".to_string();
     #[cfg(not(feature = "ctl"))]
     return "Usage: yggdrasil [options]".to_string();
+}
+
+/// Parse --prefix-port value according to the required format.
+/// Returns (prefix_u8, port_u16) on success, None on failure.
+fn parse_prefix_port(s: &str) -> Option<(u8, u16)> {
+    // Manual implementation of the given regex (no extra dependency).
+    if s.len() < 6 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    // First two characters must be a valid prefix from the allowed set
+    let p0 = bytes[0] as char;
+    let p1 = bytes[1] as char;
+    let valid_prefix = matches!(
+        (p0, p1),
+        ('0', '2' | '4' | '6' | '8' | 'a' | 'c' | 'e' | 'A' | 'C' | 'E')
+            | ('1'..='9' | 'a'..='e' | 'A'..='E', '0' | '2' | '4' | '6' | '8' | 'a' | 'c' | 'e' | 'A' | 'C' | 'E')
+            | ('f' | 'F', '0' | '2' | '4' | '6' | '8' | 'a' | 'c' | 'A' | 'C')
+    );
+    if !valid_prefix {
+        return None;
+    }
+    let prefix = u8::from_str_radix(&s[..2], 16).ok()?;
+
+    // Optional separator: any char that is not space and not hex digit
+    let rest = &s[2..];
+    let numeric_start = if rest.is_empty() {
+        return None;
+    } else if rest.as_bytes()[0].is_ascii_hexdigit() {
+        0
+    } else if rest.as_bytes()[0] != b' ' {
+        1
+    } else {
+        return None;
+    };
+    let num_str: String = rest[numeric_start..]
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    if num_str.is_empty() {
+        return None;
+    }
+    let port: u16 = num_str.parse().ok()?;
+    if !(1024..=65535).contains(&port) {
+        return None;
+    }
+    Some((prefix, port))
+}
+
+fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
+    yggdrasil::address::set_address_prefix(prefix);
+    yggdrasil::multicast::set_multicast_port(port);
+
+    tracing::info!(
+        "Using address prefix 0x{:02x} and port {} from --prefix-port",
+        prefix, port
+    );
+
+    // Override admin_listen only when it still has the default value
+    // (i.e. was absent/commented in the config file).
+    if config.admin_listen == "tcp://localhost:9001" {
+        config.admin_listen = format!("tcp://localhost:{}", port);
+    }
+
+    // Override if_name only when it is the default "auto"
+    // (absent/commented in config). macOS is left as "auto".
+    if config.if_name == "auto" {
+        let suffix = format!("{:02x}{}", prefix, port);
+        if cfg!(windows) {
+            config.if_name = format!("Yggdrasil{}", suffix);
+        } else if !cfg!(target_os = "macos") {
+            // Linux / BSD: strip the trailing "0" from "ygg0"
+            config.if_name = format!("ygg{}", suffix);
+        }
+        // macOS: keep "auto" — kernel assigns utunN
+    }
 }
 
 #[cfg(feature = "ctl")]
