@@ -689,8 +689,16 @@ if !config.enable {
         return;
     }
 
-    // Fast check: do we have any http(s) entries at all?
-    let has_http_entries = config.remote_subnets.values().any(|entries| {
+    // Fast check: do we have any http(s) entries for keys other than our own?
+    // Entries under our own public key are ignored by CryptoKey::new / install_routes,
+    // so there is no need to wait for peers or download them.
+    let self_key = core.public_key();
+    let has_http_entries = config.remote_subnets.iter().any(|(pubkey_hex, entries)| {
+        if let Ok(dest) = parse_pubkey(pubkey_hex) {
+            if &dest == self_key {
+                return false;
+            }
+        }
         entries.iter().any(|e| {
             let t = e.trim();
             t.starts_with("http://")
@@ -793,6 +801,24 @@ if !config.enable {
     for (pubkey_hex, entries) in &config.remote_subnets {
         if pubkey_hex.is_empty() {
             continue;
+        }
+
+        // Skip route lists configured for our own public key —
+        // they are ignored by CryptoKey::new / install_routes / remove_routes anyway.
+        if let Ok(dest) = parse_pubkey(pubkey_hex) {
+            if &dest == core.public_key() {
+                tracing::info!(
+                    "CKR: skipping download of route list(s) for own public key {}",
+                    pubkey_hex
+                );
+                // Clean up any previously downloaded files for the self key
+                // so they do not linger and generate routes later.
+                let subdir = base_dir.join(pubkey_hex);
+                if subdir.exists() {
+                    let _ = fs::remove_dir_all(&subdir);
+                }
+                continue;
+            }
         }
 
         // Collect ONLY http(s) entries in the order they appear (for correct 0,1,2... numbering)
