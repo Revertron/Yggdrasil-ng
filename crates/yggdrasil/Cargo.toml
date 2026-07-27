@@ -59,7 +59,7 @@ md5 = { version = "0.8", default-features = false, optional = true }
 ureq = { version = "2.12", default-features = false, features = ["tls"], optional = true }
 
 [features]
-default = ["ctl", "tun", "systemd", "ckr", "ws", "quic"]
+default = ["ctl", "tun", "systemd", "ckr", "ws", "quic", "ckr-advanced"]
 ctl = []
 tun = ["dep:tun-rs"]
 ckr = ["dep:route_manager"]

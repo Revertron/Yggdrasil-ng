@@ -61,23 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // --prefix-port handling (must be before address generation)
+    // --prefix-port: set the atomics early so --address / --subnet see the new prefix.
+    // Config mutation and the info/warn messages happen later (after logging is ready).
     if let Some(val) = matches.opt_str("prefix-port") {
-        match parse_prefix_port(&val) {
-            Some((prefix, port)) => {
-                // We need a mutable Config later; store the values for now
-                // and apply after Config is loaded. For --address/--subnet
-                // we can set the prefix immediately.
-                yggdrasil::address::set_address_prefix(prefix);
-                yggdrasil::multicast::set_multicast_port(port);
-                // The full apply (admin_listen + if_name) is done after Config load
-            }
-            None => {
-                tracing::warn!(
-                    "Invalid --prefix-port value '{}', ignoring (expected format like 02:9001)",
-                    val
-                );
-            }
+        if let Some((prefix, port)) = parse_prefix_port(&val) {
+            yggdrasil::address::set_address_prefix(prefix);
+            yggdrasil::multicast::set_multicast_port(port);
         }
     }
 
@@ -160,8 +149,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     init_logging(&loglevel, logto.as_deref());
 
+    // Warn about an invalid --prefix-port as soon as logging is ready.
+    // The actual apply (and the info message) is performed later in run_node.
+    if let Some(val) = matches.opt_str("prefix-port") {
+        if parse_prefix_port(&val).is_none() {
+            tracing::warn!(
+                "Invalid --prefix-port value '{}', ignoring (expected format like 02:9001)",
+                val
+            );
+        }
+    }
+
     // Load config
-    let mut config = if autoconf {
+    let config = if autoconf {
         Config::default()
     } else if !config_path.is_empty() {
         let file = File::open(&config_path)?;
@@ -171,12 +171,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!("Please specify --genconf, --config, or --autoconf");
         std::process::exit(1);
     };
-
-    if let Some(val) = matches.opt_str("prefix-port") {
-        if let Some((prefix, port)) = parse_prefix_port(&val) {
-            apply_prefix_port(prefix, port, &mut config);
-        }
-    }
 
     // Parse or generate signing key
     // Priority: config file > YGGDRASIL_PRIVATE_KEY env var > ephemeral
