@@ -1,5 +1,6 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::AtomicBool;
 
 /// Yggdrasil IPv6 address (16 bytes, prefix 0x02).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -11,17 +12,25 @@ pub struct Subnet(pub [u8; 8]);
 
 static ADDRESS_PREFIX: AtomicU8 = AtomicU8::new(0x02);
 static SUBNET_PREFIX: AtomicU8 = AtomicU8::new(0x03);
+/// Set to true when --prefix-port was successfully applied.
+static PREFIX_PORT_SET: AtomicBool = AtomicBool::new(false);
 
 /// Set the address prefix used by addr_for_key / is_valid_* (and subnet = prefix + 1).
 /// Must be called once at startup before any address generation.
 pub fn set_address_prefix(prefix: u8) {
     ADDRESS_PREFIX.store(prefix, Ordering::Relaxed);
     SUBNET_PREFIX.store(prefix.wrapping_add(1), Ordering::Relaxed);
+    PREFIX_PORT_SET.store(true, Ordering::Relaxed);
 }
 
 /// Current address prefix (default 0x02).
 pub fn address_prefix() -> u8 {
     ADDRESS_PREFIX.load(Ordering::Relaxed)
+}
+
+/// Returns true if --prefix-port was successfully applied at startup.
+pub fn prefix_port_set() -> bool {
+    PREFIX_PORT_SET.load(Ordering::Relaxed)
 }
 
 impl Address {

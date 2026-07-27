@@ -28,6 +28,11 @@ pub fn set_multicast_port(port: u16) {
     MULTICAST_PORT.store(port, Ordering::Relaxed);
 }
 
+/// Current multicast / admin port (default 9001).
+pub fn multicast_port() -> u16 {
+    MULTICAST_PORT.load(Ordering::Relaxed)
+}
+
 // ── External interface info ──────────────────────────────────────────────
 
 /// Network interface info provided externally (e.g. from Android ConnectivityManager).
