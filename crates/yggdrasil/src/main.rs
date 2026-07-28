@@ -36,6 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opts.optflag("j", "json", "Output control command results as raw JSON");
     #[cfg(windows)]
     opts.optflag("", "service", "Run as a Windows service (launched by the Service Control Manager)");
+    opts.optopt("", "peers", "Comma-separated list of additional peer URIs to connect to (appended to config peers)", "PEERS");
+    opts.optopt("", "prefix-port", "Network prefix *00::/7 (00-fc) and port (1024-65535) for admin_listen/multicast, e.g. 02:9001", "PREFIXPORT");
     opts.optflag("h", "help", "Print this help");
     opts.optflag("v", "version", "Print version");
 
@@ -58,6 +60,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches.opt_present("version") {
         println!("yggdrasil {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+
+    // --prefix-port: set the atomics early so --address / --subnet see the new prefix.
+    // Config mutation and the info/warn messages happen later (after logging is ready).
+    if let Some(val) = matches.opt_str("prefix-port") {
+        if let Some((prefix, port)) = parse_prefix_port(&val) {
+            yggdrasil::address::set_address_prefix(prefix);
+            yggdrasil::multicast::set_multicast_port(port);
+        }
     }
 
     // If there are free (positional) arguments, treat as a control command
@@ -139,6 +150,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     init_logging(&loglevel, logto.as_deref());
 
+    // Warn about an invalid --prefix-port as soon as logging is ready.
+    // The actual apply (and the info message) is performed later in run_node.
+    if let Some(val) = matches.opt_str("prefix-port") {
+        if parse_prefix_port(&val).is_none() {
+            tracing::warn!(
+                "Invalid --prefix-port value '{}', ignoring (expected format like 02:9001)",
+                val
+            );
+        }
+    }
+
     // Load config
     let config = if autoconf {
         Config::default()
@@ -214,6 +236,8 @@ async fn run_node(
     opts.optflag("a", "address", "");
     opts.optflag("s", "subnet", "");
     opts.optflag("n", "no-replace", "");
+    opts.optopt("", "peers", "", "PEERS");
+    opts.optopt("", "prefix-port", "", "PREFIXPORT");
     opts.optflag("h", "help", "");
     opts.optflag("v", "version", "");
     #[cfg(feature = "ctl")]
@@ -237,7 +261,7 @@ async fn run_node(
     init_logging(&loglevel, logto.as_deref());
 
     // Load config
-    let config = if autoconf {
+    let mut config = if autoconf {
         Config::default()
     } else if !config_path.is_empty() {
         let file = File::open(&config_path)?;
@@ -246,6 +270,24 @@ async fn run_node(
     } else {
         return Err("No configuration: specify --config or --autoconf".into());
     };
+
+    if let Some(val) = matches.opt_str("prefix-port") {
+        if let Some((prefix, port)) = parse_prefix_port(&val) {
+            apply_prefix_port(prefix, port, &mut config);
+        }
+    }
+
+    if let Some(val) = matches.opt_str("peers") {
+        let extra = parse_peers_list(&val);
+        if !extra.is_empty() {
+            tracing::info!(
+                "Adding {} peer(s) from --peers: {:?}",
+                extra.len(),
+                extra
+            );
+            config.peers.extend(extra);
+        }
+    }
 
     // Parse or generate signing key
     let signing_key = if !config.private_key.is_empty() {
@@ -547,6 +589,123 @@ fn usage_string() -> String {
     return "Usage: yggdrasil [options] [command [key=value ...]]".to_string();
     #[cfg(not(feature = "ctl"))]
     return "Usage: yggdrasil [options]".to_string();
+}
+
+/// Parse a comma-separated peer list.
+/// Supports optional single/double quotes around individual peers
+/// or around the whole list.
+/// Empty entries after splitting are ignored.
+fn parse_peers_list(s: &str) -> Vec<String> {
+    let mut s = s.trim();
+
+    // Strip outer quotes if the whole value is quoted
+    if s.len() >= 2 {
+        let bytes = s.as_bytes();
+        let first = bytes[0];
+        let last = bytes[s.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            s = &s[1..s.len() - 1];
+        }
+    }
+
+    s.split(',')
+        .filter_map(|part| {
+            let mut p = part.trim();
+            if p.is_empty() {
+                return None;
+            }
+            // Strip optional quotes around a single peer
+            if p.len() >= 2 {
+                let bytes = p.as_bytes();
+                let first = bytes[0];
+                let last = bytes[p.len() - 1];
+                if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+                    p = &p[1..p.len() - 1];
+                }
+            }
+            let p = p.trim();
+            if p.is_empty() {
+                None
+            } else {
+                Some(p.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Parse --prefix-port value according to the required format.
+/// Returns (prefix_u8, port_u16) on success, None on failure.
+fn parse_prefix_port(s: &str) -> Option<(u8, u16)> {
+    // Manual implementation of the given regex (no extra dependency).
+    if s.len() < 6 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    // First two characters must be a valid prefix from the allowed set
+    let p0 = bytes[0] as char;
+    let p1 = bytes[1] as char;
+    let valid_prefix = matches!(
+        (p0, p1),
+        ('0'..='9' | 'a'..='e' | 'A'..='E', '0' | '2' | '4' | '6' | '8' | 'a' | 'c' | 'e' | 'A' | 'C' | 'E')
+            | ('f' | 'F', '0' | '2' | '4' | '6' | '8' | 'a' | 'c' | 'A' | 'C')
+    );
+    if !valid_prefix {
+        return None;
+    }
+    let prefix = u8::from_str_radix(&s[..2], 16).ok()?;
+
+    // Optional separator: any char that is not space and not hex digit
+    let rest = &s[2..];
+    let numeric_start = if rest.is_empty() {
+        return None;
+    } else if rest.as_bytes()[0].is_ascii_hexdigit() {
+        0
+    } else if rest.as_bytes()[0] != b' ' {
+        1
+    } else {
+        return None;
+    };
+    let num_str: String = rest[numeric_start..]
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    if num_str.is_empty() {
+        return None;
+    }
+    let port: u16 = num_str.parse().ok()?;
+    if !(1024..=65535).contains(&port) {
+        return None;
+    }
+    Some((prefix, port))
+}
+
+fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
+    yggdrasil::address::set_address_prefix(prefix);
+    yggdrasil::multicast::set_multicast_port(port);
+
+    tracing::info!(
+        "Using address prefix 0x{:02x} and port {} from --prefix-port",
+        prefix, port
+    );
+
+    // Override admin_listen only when it still has the default value
+    // (i.e. was absent/commented in the config file).
+    if config.admin_listen == "tcp://localhost:9001" {
+        config.admin_listen = format!("tcp://localhost:{}", port);
+    }
+
+    // Override if_name only when it is the default "auto"
+    // (absent/commented in config). macOS is left as "auto".
+    if config.if_name == "auto" {
+        let suffix = format!("{:02x}{}", prefix, port);
+        if cfg!(windows) {
+            config.if_name = format!("Yggdrasil{}", suffix);
+        } else if !cfg!(target_os = "macos") {
+            // Linux / BSD: strip the trailing "0" from "ygg0"
+            config.if_name = format!("ygg{}", suffix);
+        }
+        // macOS: keep "auto" — kernel assigns utunN
+    }
 }
 
 #[cfg(feature = "ctl")]

@@ -112,6 +112,8 @@ yggdrasil [options]
 | `-n, --no-replace` | With `--genconf FILE`, skip if the file already exists |
 | `--logto FILE` | Log to a file instead of stderr (appends) |
 | `--service` | Run as a Windows service (Windows only) |
+| `--peers PEERS` | Peer URIs. Comma-separated and may be quoted. |
+| `--prefix-port PREFIXPORT` | Custom `*00::/7` prefix (`00`–`fc`) and port (`1024`–`65535`) |
 | `-h, --help` | Print help message |
 | `-v, --version` | Print version |
 
@@ -145,6 +147,18 @@ Print your address without starting the daemon:
 
 ```bash
 yggdrasil --config yggdrasil.toml --address
+```
+
+Run with a custom `*00::/7` prefix (`00`–`fc`) and port (`1024`–`65535`):
+
+```bash
+sudo yggdrasil -c yggdrasil.toml --prefix-port 02:9001
+```
+
+Run with adding extra peers from the command line (they are appended to any peers already listed in the config):
+
+```bash
+sudo yggdrasil -c yggdrasil.toml --peers "tcp://1.2.3.4:1234,tcp://[2001:db8::1]:5678"
 ```
 
 ### Control Commands

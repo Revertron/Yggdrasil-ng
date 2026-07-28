@@ -581,13 +581,25 @@ fn sort_routes(a: &Route, b: &Route) -> std::cmp::Ordering {
 /// Matches exactly the paths specified in the task (Linux/BSD, macOS, Windows).
 #[cfg(feature = "ckr-advanced")]
 fn get_routes_download_base_dir() -> PathBuf {
+    // When --prefix-port was given, isolate the cache directory so multiple
+    // instances with different prefixes/ports do not share downloaded lists.
+    let dir_name = if crate::address::prefix_port_set() {
+        format!(
+            "yggdrasil_routes_download_{:02x}{}",
+            crate::address::address_prefix(),
+            crate::multicast::multicast_port()
+        )
+    } else {
+        "yggdrasil_routes_download".to_string()
+    };
+
     if cfg!(target_os = "macos") {
-        PathBuf::from("/Library/Caches/yggdrasil_routes_download")
+        PathBuf::from(format!("/Library/Caches/{}", dir_name))
     } else if cfg!(target_os = "windows") {
-        std::env::temp_dir().join("yggdrasil_routes_download")
+        std::env::temp_dir().join(dir_name)
     } else {
         // Linux, FreeBSD, OpenBSD, NetBSD etc.
-        PathBuf::from("/var/cache/yggdrasil_routes_download")
+        PathBuf::from(format!("/var/cache/{}", dir_name))
     }
 }
 
@@ -689,8 +701,16 @@ if !config.enable {
         return;
     }
 
-    // Fast check: do we have any http(s) entries at all?
-    let has_http_entries = config.remote_subnets.values().any(|entries| {
+    // Fast check: do we have any http(s) entries for keys other than our own?
+    // Entries under our own public key are ignored by CryptoKey::new / install_routes,
+    // so there is no need to wait for peers or download them.
+    let self_key = core.public_key();
+    let has_http_entries = config.remote_subnets.iter().any(|(pubkey_hex, entries)| {
+        if let Ok(dest) = parse_pubkey(pubkey_hex) {
+            if &dest == self_key {
+                return false;
+            }
+        }
         entries.iter().any(|e| {
             let t = e.trim();
             t.starts_with("http://")
@@ -793,6 +813,20 @@ if !config.enable {
     for (pubkey_hex, entries) in &config.remote_subnets {
         if pubkey_hex.is_empty() {
             continue;
+        }
+
+        // Skip route lists configured for our own public key —
+        // they are ignored by CryptoKey::new / install_routes / remove_routes anyway.
+        if let Ok(dest) = parse_pubkey(pubkey_hex) {
+            if &dest == core.public_key() {
+                // Clean up any previously downloaded files for the self key
+                // so they do not linger and generate routes later.
+                let subdir = base_dir.join(pubkey_hex);
+                if subdir.exists() {
+                    let _ = fs::remove_dir_all(&subdir);
+                }
+                continue;
+            }
         }
 
         // Collect ONLY http(s) entries in the order they appear (for correct 0,1,2... numbering)
