@@ -70,8 +70,9 @@ impl EncryptedPacketConn {
         // Build the group-password gate before `config` is moved into the inner
         // PacketConn. Empty/absent password yields a disabled GroupAuth.
         let group_auth = GroupAuth::new(config.group_password.as_deref().unwrap_or(&[]));
+        let session_timeout = config.session_timeout;
         let inner = Arc::new(PacketConnImpl::new(secret.clone(), config));
-        let sessions = Arc::new(ConcurrentSessionManager::new(group_auth));
+        let sessions = Arc::new(ConcurrentSessionManager::new(group_auth, session_timeout));
         let (recv_tx, recv_rx) = mpsc::channel(RECV_CHANNEL_SIZE);
         let cancel = CancellationToken::new();
 

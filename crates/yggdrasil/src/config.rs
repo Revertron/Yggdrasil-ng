@@ -111,6 +111,12 @@ pub struct Config {
     /// from the per-peer/per-multicast `password`, which gates direct peering.
     #[serde(default)]
     pub group_password: String,
+
+    /// Timeout in seconds for both encrypted sessions and cached paths.
+    /// Idle sessions and paths expire after this duration of inactivity.
+    /// Values outside the range [60, 86400] are clamped. Default: 60.
+    #[serde(default = "default_session_path_timeout")]
+    pub session_path_timeout: u64,
 }
 
 /// Built-in stateful firewall configuration. Default-off; when enabled,
@@ -237,6 +243,10 @@ fn default_node_info() -> toml::Value {
     toml::Value::Table(toml::map::Map::new())
 }
 
+fn default_session_path_timeout() -> u64 {
+    60
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -255,6 +265,7 @@ impl Default for Config {
             tunnel_routing: TunnelRoutingConfig::default(),
             firewall: FirewallConfig::default(),
             group_password: String::new(),
+            session_path_timeout: default_session_path_timeout(),
         }
     }
 }
@@ -367,6 +378,13 @@ impl Config {
                 Some(arr)
             })
             .collect()
+    }
+    
+    /// Returns the effective session/path timeout as a Duration,
+    /// clamped to the allowed range [60, 86400] seconds.
+    pub fn effective_session_path_timeout(&self) -> std::time::Duration {
+        let secs = self.session_path_timeout.clamp(60, 86400);
+        std::time::Duration::from_secs(secs)
     }
 
     /// Get node info as JSON string (for protocol responses).

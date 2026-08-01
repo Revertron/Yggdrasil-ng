@@ -23,7 +23,8 @@ use super::crypto::{
 // Constants
 // ---------------------------------------------------------------------------
 
-const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Removed because of new ‘session_path_timeout’ option.
+// const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Minimum traffic overhead: type(1) + varint(1) + varint(1) + varint(1) + box_overhead(16) + nextPub(32)
 const SESSION_TRAFFIC_OVERHEAD_MIN: usize = 1 + 1 + 1 + 1 + BOX_OVERHEAD + 32;
@@ -471,8 +472,8 @@ impl SessionInfo {
     }
 
     /// Check if the session has timed out.
-    pub fn is_expired(&self) -> bool {
-        self.last_activity.elapsed() > SESSION_TIMEOUT
+    pub fn is_expired(&self, timeout: Duration) -> bool {
+        self.last_activity.elapsed() > timeout
     }
 }
 
@@ -591,14 +592,17 @@ pub(crate) struct ConcurrentSessionManager {
     /// into every handshake signature so sessions only form between peers that
     /// share the same password.
     group_auth: GroupAuth,
+    /// Timeout after which an idle session (or buffer) is considered expired.
+    session_timeout: Duration,
 }
 
 impl ConcurrentSessionManager {
-    pub fn new(group_auth: GroupAuth) -> Self {
+    pub fn new(group_auth: GroupAuth, session_timeout: Duration) -> Self {
         Self {
             sessions: std::sync::RwLock::new(HashMap::default()),
             buffers: std::sync::Mutex::new(HashMap::default()),
             group_auth,
+            session_timeout,
         }
     }
 
@@ -947,12 +951,12 @@ impl ConcurrentSessionManager {
             let mut map = self.sessions.write().unwrap();
             map.retain(|_, session_arc| {
                 let info = session_arc.lock().unwrap();
-                !info.is_expired()
+                !info.is_expired(self.session_timeout)
             });
         }
         {
             let mut buffers = self.buffers.lock().unwrap();
-            buffers.retain(|_, buf| buf.created.elapsed() < SESSION_TIMEOUT);
+            buffers.retain(|_, buf| buf.created.elapsed() < self.session_timeout);
         }
     }
 
@@ -1089,8 +1093,8 @@ mod tests {
         let (priv_a, pub_a, curve_priv_a) = make_keys();
         let (priv_b, pub_b, curve_priv_b) = make_keys();
 
-        let mgr_a = ConcurrentSessionManager::new(GroupAuth::default());
-        let mgr_b = ConcurrentSessionManager::new(GroupAuth::default());
+        let mgr_a = ConcurrentSessionManager::new(GroupAuth::default(), Duration::from_secs(60));
+        let mgr_b = ConcurrentSessionManager::new(GroupAuth::default(), Duration::from_secs(60));
 
         // A writes to B (triggers buffer + init)
         let actions = mgr_a.write_to(&pub_b, b"hello from A", &priv_a);
@@ -1136,8 +1140,8 @@ mod tests {
         let (priv_a, pub_a, curve_priv_a) = make_keys();
         let (priv_b, pub_b, curve_priv_b) = make_keys();
 
-        let mgr_a = ConcurrentSessionManager::new(GroupAuth::default());
-        let mgr_b = ConcurrentSessionManager::new(GroupAuth::default());
+        let mgr_a = ConcurrentSessionManager::new(GroupAuth::default(), Duration::from_secs(60));
+        let mgr_b = ConcurrentSessionManager::new(GroupAuth::default(), Duration::from_secs(60));
 
         // Establish session: A→B init, B→A ack
         let a_actions = mgr_a.write_to(&pub_b, b"msg1", &priv_a);
