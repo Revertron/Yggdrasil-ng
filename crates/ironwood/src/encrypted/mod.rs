@@ -254,6 +254,12 @@ async fn keepalive_direct_loop(
                     if !seen.insert(peer.key) {
                         continue;
                     }
+                    // Only refresh sessions that already exist. Do not start
+                    // Init/handshake or path lookups for cold peers — that
+                    // races with tree convergence after startup.
+                    if !sessions.has_session(&peer.key) {
+                        continue;
+                    }
                     let actions = sessions.write_to(&peer.key, &[], &signing_key);
                     for action in actions {
                         match action {

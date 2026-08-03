@@ -960,6 +960,11 @@ impl ConcurrentSessionManager {
         }
     }
 
+    /// Returns true if an active session exists for `key`.
+    pub fn has_session(&self, key: &PublicKey) -> bool {
+        self.sessions.read().unwrap().contains_key(key)
+    }
+    
     /// Get snapshot of all active sessions for stats.
     pub fn get_all_sessions(&self) -> Vec<(PublicKey, u64, u64, Instant)> {
         let map = self.sessions.read().unwrap();
