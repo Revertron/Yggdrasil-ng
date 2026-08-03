@@ -53,8 +53,10 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         process_id: None,
     })?;
 
-    // Build a tokio runtime and run the node
-    let rt = tokio::runtime::Runtime::new()?;
+    // Build a tokio runtime and run the node. Same worker count as console
+    // mode -- the SCM calls service_main on its own thread, so this runtime is
+    // separate from the one main() built.
+    let rt = super::build_runtime()?;
     let result = rt.block_on(async {
         let (watch_tx, watch_rx) = tokio::sync::watch::channel(false);
 

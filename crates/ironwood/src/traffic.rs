@@ -71,10 +71,20 @@ impl TrafficPacket {
 // Packet queue: deficit round robin (DRR) scheduling, byte-bounded
 // ---------------------------------------------------------------------------
 
+// The byte caps below are a memory backstop, not the congestion control --
+// deciding *when* to drop is CoDel's job. They were previously 4x smaller
+// (16 / 4), which inverted those roles on any fast link: the daemon runs with
+// `peer_max_message_size = 65535 * 2`, so a flow could hold only 512 KB, and a
+// queue draining faster than ~280 Mbit/s hit that ceiling before its sojourn
+// could ever reach CoDel's 15 ms target. Measured on a real path, the caps
+// were doing all the dropping and CoDel none: the exit node's delivery queue
+// lost 0.081% of packets while its peak sojourn was 2.1 ms. At 1400-byte
+// packets that loss rate alone caps a single TCP flow at tens of Mbit/s.
+
 /// Total queued bytes are capped at `quantum * this`.
-const DEFAULT_PACKET_QUEUE_MAX_BYTES_MULTIPLIER: u64 = 16;
+const DEFAULT_PACKET_QUEUE_MAX_BYTES_MULTIPLIER: u64 = 64;
 /// A single flow's queued bytes are capped at `quantum * this`.
-const DEFAULT_PACKET_QUEUE_PER_FLOW_MULTIPLIER: u64 = 4;
+const DEFAULT_PACKET_QUEUE_PER_FLOW_MULTIPLIER: u64 = 16;
 /// Fallback quantum when constructed with `0` (matches Go's default message size).
 const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1024 * 1024;
 
@@ -84,17 +94,17 @@ const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1024 * 1024;
 // high-latency links (Wi-Fi/mobile): it fired on a single transient spike even
 // when the queue was nearly empty. CoDel drops only when the *sojourn time*
 // (how long a packet actually spent in this queue) stays above TARGET for a
-// full INTERVAL — i.e. a persistent standing queue — and never while the
-// backlog is below one max packet. Evaluated at dequeue. Faithful to the Linux
-// `codel_impl.h` reference.
+// full INTERVAL — i.e. a persistent standing queue — and never while at most
+// one packet is left behind the one just served. Evaluated at dequeue.
+// Follows the Linux `codel_impl.h` reference, except that the "nothing is
+// really queued" test counts packets where the reference counts bytes; see
+// `codel_should_drop`.
 
 /// Acceptable standing-queue sojourn time.
 const CODEL_TARGET: Duration = Duration::from_millis(15);
 /// Window the standing queue must persist before CoDel starts dropping. Sized to
 /// cover typical worst-case RTTs, including Wi-Fi/mobile.
 const CODEL_INTERVAL: Duration = Duration::from_millis(100);
-/// Never drop while the whole backlog is below one max-size packet.
-const CODEL_MAX_PACKET: u64 = 65535;
 
 /// Signed nanoseconds of `now - t` (negative when `t` is in the future).
 #[inline]
@@ -172,6 +182,10 @@ pub(crate) struct PacketQueue {
     next: Option<usize>,
     /// Total queued bytes across all flows.
     size: u64,
+    /// Total queued packets across all flows. Maintained alongside `size`
+    /// because CoDel's "is this a standing queue" test needs a packet count,
+    /// not a byte count -- see `codel_should_drop`.
+    count: usize,
     /// Hard cap for total queued bytes.
     max_bytes_total: u64,
     /// Hard cap for bytes a single flow may hold.
@@ -196,6 +210,7 @@ impl PacketQueue {
             active: Vec::new(),
             next: None,
             size: 0,
+            count: 0,
             max_bytes_total: quantum * DEFAULT_PACKET_QUEUE_MAX_BYTES_MULTIPLIER,
             max_bytes_per_flow: quantum * DEFAULT_PACKET_QUEUE_PER_FLOW_MULTIPLIER,
             quantum,
@@ -291,6 +306,7 @@ impl PacketQueue {
             info
         };
         self.size -= info.size;
+        self.count -= 1;
         self.remove_flow_if_empty(key);
         Some(info)
     }
@@ -364,6 +380,7 @@ impl PacketQueue {
             flow.index.is_none()
         };
         self.size += pkt_size;
+        self.count += 1;
         if needs_activate {
             self.activate(key);
         }
@@ -502,7 +519,14 @@ impl PacketQueue {
             }
             Some(pkt) => {
                 let sojourn = now.saturating_duration_since(pkt.time);
-                if sojourn < CODEL_TARGET || self.size < CODEL_MAX_PACKET {
+                // Deliberate divergence from the byte-based reference: the test
+                // is "is anything actually standing behind the packet we just
+                // served", and one queue here carries both 1.5 KB forwarded
+                // traffic and 65 KB mesh packets. Expressed in bytes that test
+                // is meaningless at a 40x size spread -- a single large packet
+                // pushed the threshold to 65669 and disabled the AQM for
+                // everything smaller. Expressed in packets it is exact.
+                if sojourn < CODEL_TARGET || self.count <= 1 {
                     // Below target (or trivially small backlog): stay/return below.
                     self.codel.first_above_time = None;
                     false
@@ -751,10 +775,15 @@ mod tests {
         let mut q = PacketQueue::new(1024);
         let cap = q.max_bytes_per_flow;
 
+        // Size the payload off the cap rather than hard-coding it, so retuning
+        // the multipliers can't silently turn this into a no-overflow test.
+        // Ten packets fill the cap, so 40 overflows it four times over.
+        let payload_len = (cap / 10) as usize;
+
         // Tag each packet's payload[0] with a sequence number 0..N.
         const N: u8 = 40;
         for i in 0..N {
-            let mut payload = vec![0u8; 200];
+            let mut payload = vec![0u8; payload_len];
             payload[0] = i;
             q.push(make_packet(1, 2, &payload));
             // The per-flow cap must hold after every push.
@@ -809,8 +838,9 @@ mod tests {
     #[test]
     fn oversized_packet_rejected() {
         // A packet larger than the per-flow cap can never fit and is rejected.
-        let mut q = PacketQueue::new(1024); // per-flow cap = 4096
-        q.push(make_packet(1, 2, &[0u8; 5000]));
+        let mut q = PacketQueue::new(1024);
+        let too_big = q.max_bytes_per_flow as usize + 1;
+        q.push(make_packet(1, 2, &vec![0u8; too_big]));
         assert!(q.is_empty());
         assert_eq!(q.size(), 0);
         assert!(q.pop().is_none());

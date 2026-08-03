@@ -11,10 +11,117 @@ use std::time::Duration;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::CertificateDer;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+
+/// Receive window for the link's stream.
+///
+/// quinn's default is derived from `100 Mbit/s * 100 ms` = 1.25 MB. A whole
+/// Yggdrasil link is a *single* bidirectional stream, so that default caps the
+/// link at `window / RTT` — about 590 Mbit/s at a 17 ms RTT, which is exactly
+/// where measurements landed (566 and 591 Mbit/s) on a path whose raw capacity
+/// was over 800. TCP looked faster than QUIC purely because its autotuning
+/// reaches the several megabytes this was missing.
+///
+/// 6 MB matches the usual Linux `net.ipv4.tcp_rmem` maximum, covering a gigabit
+/// link out to ~48 ms RTT. It is a limit, not an allocation, but it is charged
+/// per peer — nodes with very many peers and little RAM may want it lower.
+///
+/// Note this only pays off if the OS UDP socket buffer is large enough too:
+/// QUIC has no equivalent of TCP autotuning, and `net.core.rmem_max` defaults
+/// to ~208 KB on Linux, which shows up as `receive buffer errors` in
+/// `netstat -su`.
+const QUIC_STREAM_RECEIVE_WINDOW: u32 = 6 * 1024 * 1024;
+
+/// UDP socket buffer for QUIC endpoints.
+///
+/// quinn never sizes this itself when the endpoint comes from
+/// `Endpoint::client`/`Endpoint::server`, and the defaults are tiny next to a
+/// gigabit link: ~208 KB on Linux (`net.core.rmem_default`) and 64 KB on
+/// Windows, under 2 ms of traffic, so one scheduling hiccup costs packets.
+/// Raising `net.core.rmem_max` does nothing on its own — that is only a
+/// ceiling, the size still has to be requested, and Windows has no global
+/// knob at all. Overflow shows up as `receive buffer errors` in `netstat -su`,
+/// which grew by 581 across a single test run before this was set.
+///
+/// Charged per endpoint: one for the listener, plus one per outbound QUIC peer.
+const QUIC_SOCKET_BUFFER: usize = 6 * 1024 * 1024;
+
+/// Warn once if the OS refused to give us the UDP buffer we asked for.
+///
+/// Linux reports back twice what was requested, so anything below the request
+/// itself means we were clamped by `net.core.rmem_max`.
+fn warn_if_buffer_clamped(socket: &Socket) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+
+    let actual = match socket.recv_buffer_size() {
+        Ok(n) if n < QUIC_SOCKET_BUFFER => n,
+        _ => return,
+    };
+
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "QUIC: the OS capped our UDP receive buffer at {} KiB (asked for {} KiB). \
+             Under load the kernel will drop datagrams before QUIC ever sees them, \
+             which costs throughput.",
+            actual / 1024,
+            QUIC_SOCKET_BUFFER / 1024,
+        );
+        #[cfg(target_os = "linux")]
+        tracing::warn!(
+            "QUIC: raise the cap with 'sysctl -w net.core.rmem_max=16777216 \
+             net.core.wmem_max=16777216' (persist it in /etc/sysctl.d/), then restart. \
+             Watch for drops with \"netstat -su | grep 'receive buffer errors'\"."
+        );
+    });
+}
+
+/// Build a QUIC endpoint on a socket we size ourselves.
+///
+/// Socket options are otherwise left at their defaults so this behaves exactly
+/// like the `Endpoint::client`/`Endpoint::server` helpers it replaces — in
+/// particular neither those nor `socket2` touch `IPV6_V6ONLY`, so dual-stack
+/// binding on `[::]` is unchanged.
+fn make_endpoint(
+    bind_addr: SocketAddr,
+    server_config: Option<quinn::ServerConfig>,
+) -> Result<quinn::Endpoint, String> {
+    let domain = if bind_addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|e| format!("QUIC socket: {}", e))?;
+
+    // Best-effort: the OS silently clamps the request to its own maximum, so a
+    // node that has not raised `rmem_max` keeps the old behaviour instead of
+    // failing to start. It does get told about it, once.
+    let _ = socket.set_recv_buffer_size(QUIC_SOCKET_BUFFER);
+    let _ = socket.set_send_buffer_size(QUIC_SOCKET_BUFFER);
+    warn_if_buffer_clamped(&socket);
+
+    socket
+        .bind(&bind_addr.into())
+        .map_err(|e| format!("QUIC bind {}: {}", bind_addr, e))?;
+
+    let socket: std::net::UdpSocket = socket.into();
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("QUIC socket nonblocking: {}", e))?;
+
+    let runtime = quinn::default_runtime().ok_or("no async runtime for QUIC")?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        server_config,
+        socket,
+        runtime,
+    )
+    .map_err(|e| format!("QUIC endpoint: {}", e))
+}
 
 /// Match yggdrasil-go: MaxIdleTimeout = 1 minute, KeepAlivePeriod = 20 seconds.
 fn quic_transport_config() -> quinn::TransportConfig {
@@ -23,6 +130,7 @@ fn quic_transport_config() -> quinn::TransportConfig {
         Duration::from_secs(60).try_into().expect("valid idle timeout"),
     ));
     transport.keep_alive_interval(Some(Duration::from_secs(20)));
+    transport.stream_receive_window(quinn::VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW));
     transport
 }
 
@@ -106,10 +214,10 @@ pub(crate) async fn quic_connect(
             "0.0.0.0:0".parse().unwrap()
         };
 
-        let mut endpoint = match quinn::Endpoint::client(bind_addr) {
+        let mut endpoint = match make_endpoint(bind_addr, None) {
             Ok(e) => e,
             Err(e) => {
-                last_err = format!("QUIC endpoint: {}", e);
+                last_err = e;
                 continue;
             }
         };
@@ -136,7 +244,7 @@ pub(crate) async fn quic_connect(
         let connection = match tokio::time::timeout(Duration::from_secs(5), connecting).await {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
-                last_err = format!("QUIC connection to {} failed: {}", remote_addr, e);
+                last_err = format!("QUIC connection failed: {}", e);
                 if remote_addr.is_ipv6()
                     && !v4_addrs.is_empty()
                     && is_unreachable_error(&last_err)
@@ -149,7 +257,7 @@ pub(crate) async fn quic_connect(
                 continue;
             }
             Err(_) => {
-                last_err = format!("QUIC connection to {} timed out", remote_addr);
+                last_err = "QUIC connection timed out".to_string();
                 continue;
             }
         };
@@ -158,7 +266,7 @@ pub(crate) async fn quic_connect(
         let (send, recv) = match connection.open_bi().await {
             Ok(streams) => streams,
             Err(e) => {
-                last_err = format!("QUIC open stream to {}: {}", remote_addr, e);
+                last_err = format!("QUIC open stream: {}", e);
                 continue;
             }
         };
@@ -175,6 +283,12 @@ pub(crate) async fn quic_connect(
         });
     }
 
+    // Only list the attempted addresses when there was more than one candidate
+    // (multi-record DNS, or the v6 -> v4 fallback above). With a single address
+    // this merely repeats the target that the caller already appends.
+    if tried.len() < 2 {
+        return Err(last_err);
+    }
     Err(format!(
         "{} (tried: {})",
         last_err,
@@ -202,8 +316,7 @@ pub(crate) async fn quic_listen(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
     server_config.transport_config(Arc::new(quic_transport_config()));
 
-    let endpoint = quinn::Endpoint::server(server_config, bind_addr)
-        .map_err(|e| format!("QUIC server bind: {}", e))?;
+    let endpoint = make_endpoint(bind_addr, Some(server_config))?;
 
     let local_addr = endpoint
         .local_addr()
