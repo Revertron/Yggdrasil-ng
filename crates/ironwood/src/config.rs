@@ -29,6 +29,11 @@ pub struct Config {
     /// with the same password can complete an encrypted session handshake.
     /// `None`/empty = open network (no change to the handshake). Default: `None`.
     pub group_password: Option<Vec<u8>>,
+    /// When true, EncryptedPacketConn periodically sends empty encrypted traffic
+    /// to each currently connected direct peer. Default: false.
+    pub keepalive_direct: bool,
+    /// Interval between direct-peer keepalive probes. Default: 20 seconds.
+    pub keepalive_interval: Duration,
 }
 
 impl Default for Config {
@@ -45,6 +50,8 @@ impl Default for Config {
             path_throttle: Duration::from_secs(1),
             session_timeout: Duration::from_secs(60),
             group_password: None,
+            keepalive_direct: false,
+            keepalive_interval: Duration::from_secs(20),
         }
     }
 }
@@ -115,6 +122,18 @@ impl Config {
         } else {
             Some(password)
         };
+        self
+    }
+
+    /// Enable or disable proactive empty-traffic keepalives to direct peers.
+    pub fn with_keepalive_direct(mut self, enable: bool) -> Self {
+        self.keepalive_direct = enable;
+        self
+    }
+
+    /// Set the interval between direct-peer keepalive probes.
+    pub fn with_keepalive_interval(mut self, d: Duration) -> Self {
+        self.keepalive_interval = d;
         self
     }
 }

@@ -71,6 +71,12 @@ if_mtu = 65535
 # default for compatibility with the public Yggdrasil network.
 # session_path_timeout = 60
 
+# When true, periodically send empty encrypted traffic to each directly
+# connected peer so that the encrypted session (and the remote path) do
+# not expire during idle periods. Compatible with yggdrasil-go and older
+# yggdrasil-ng nodes. Default: false.
+# keepalive_direct = false
+
 # Custom node info that is advertised to other nodes.
 # This can be any TOML table, e.g. { name = "my-node", location = "earth" }
 [node_info]

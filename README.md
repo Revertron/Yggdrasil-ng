@@ -224,6 +224,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `if_dns` | array | DNS servers for the TUN interface (Windows only), e.g. `["308:84:68:55::", "308:62:45:62::"]` |
 | `group_password` | string |Closed-network group password for turning the mesh into a private closed network. |
 | `session_path_timeout` | integer | Timeout in seconds for both encrypted sessions and cached paths. For experienced users. |
+| `keepalive_direct` | bool | Send empty traffic to direct peers on a short interval so idle sessions do not expire (default: false). |
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |

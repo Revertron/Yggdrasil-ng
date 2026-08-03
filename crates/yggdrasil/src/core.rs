@@ -70,6 +70,8 @@ impl Core {
             .with_group_password(config.group_password.clone().into_bytes())
             .with_path_timeout(session_path_timeout)
             .with_session_timeout(session_path_timeout)
+            .with_keepalive_direct(config.keepalive_direct)
+            .with_keepalive_interval(config.effective_keepalive_interval())
             .with_path_notify(move |key: [u8; 32]| {
                 let rwc = {
                     let guard = slot_clone.lock().unwrap();

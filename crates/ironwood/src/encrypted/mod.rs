@@ -61,6 +61,8 @@ pub struct EncryptedPacketConn {
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     /// Session cleanup task handle (wrapped in Mutex so we can await it in close()).
     cleanup_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Optional direct-peer keepalive task handle (present only when enabled).
+    keepalive_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl EncryptedPacketConn {
@@ -71,6 +73,8 @@ impl EncryptedPacketConn {
         // PacketConn. Empty/absent password yields a disabled GroupAuth.
         let group_auth = GroupAuth::new(config.group_password.as_deref().unwrap_or(&[]));
         let session_timeout = config.session_timeout;
+        let keepalive_direct = config.keepalive_direct;
+        let keepalive_interval = config.keepalive_interval;
         let inner = Arc::new(PacketConnImpl::new(secret.clone(), config));
         let sessions = Arc::new(ConcurrentSessionManager::new(group_auth, session_timeout));
         let (recv_tx, recv_rx) = mpsc::channel(RECV_CHANNEL_SIZE);
@@ -101,6 +105,23 @@ impl EncryptedPacketConn {
             tokio::spawn(session_cleanup_loop(sessions, cancel))
         };
 
+        // Optional proactive keepalive to direct peers (empty encrypted traffic).
+        let keepalive_handle = if keepalive_direct {
+            let inner = inner.clone();
+            let sessions = sessions.clone();
+            let cancel = cancel.clone();
+            let signing_key = secret.clone();
+            Some(tokio::spawn(keepalive_direct_loop(
+                inner,
+                sessions,
+                signing_key,
+                keepalive_interval,
+                cancel,
+            )))
+        } else {
+            None
+        };
+
         Self {
             inner,
             signing_key: secret,
@@ -111,6 +132,7 @@ impl EncryptedPacketConn {
             cancel,
             reader_handle: Mutex::new(Some(reader_handle)),
             cleanup_handle: Mutex::new(Some(cleanup_handle)),
+            keepalive_handle: Mutex::new(keepalive_handle),
         }
     }
 
@@ -199,6 +221,49 @@ async fn session_cleanup_loop(sessions: Arc<ConcurrentSessionManager>, cancel: C
             _ = cancel.cancelled() => break,
             _ = interval.tick() => {
                 sessions.cleanup_expired();
+            }
+        }
+    }
+}
+
+/// Background task that sends empty encrypted traffic to each currently
+/// connected direct peer on a fixed interval. This refreshes `last_activity`
+/// on the sender and, when the peer receives the packet, refreshes the
+/// peer's session and path toward us. Path `last_refresh` on the sender is
+/// only updated when traffic is received back (no local touch on send).
+async fn keepalive_direct_loop(
+    inner: Arc<PacketConnImpl>,
+    sessions: Arc<ConcurrentSessionManager>,
+    signing_key: SigningKey,
+    interval: std::time::Duration,
+    cancel: CancellationToken,
+) {
+    use crate::types::PacketConn;
+    use std::collections::HashSet;
+
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await; // Skip first immediate tick
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {
+                let peers = inner.get_peers().await;
+                let mut seen = HashSet::new();
+                for peer in peers {
+                    if !seen.insert(peer.key) {
+                        continue;
+                    }
+                    let actions = sessions.write_to(&peer.key, &[], &signing_key);
+                    for action in actions {
+                        match action {
+                            OutAction::SendToInner { dest, data } => {
+                                let _ = inner.write_to(&data, &Addr(dest)).await;
+                            }
+                            OutAction::Deliver { .. } => {}
+                        }
+                    }
+                }
             }
         }
     }
@@ -343,6 +408,9 @@ impl crate::types::PacketConn for EncryptedPacketConn {
         if let Some(handle) = self.cleanup_handle.lock().await.take() {
             let _ = handle.await;
         }
+        if let Some(handle) = self.keepalive_handle.lock().await.take() {
+            let _ = handle.await;
+        }
 
         // Close the inner connection
         self.inner.close().await
@@ -375,6 +443,21 @@ mod tests {
         assert!(conn.is_closed());
     }
 
+    #[tokio::test]
+    async fn encrypted_create_and_close_with_keepalive_direct() {
+        let key = SigningKey::generate(&mut OsRng);
+        let config = Config::default()
+            .with_keepalive_direct(true)
+            .with_keepalive_interval(std::time::Duration::from_secs(15));
+        let conn = new_encrypted_packet_conn(key, config);
+
+        use crate::types::PacketConn;
+        assert!(!conn.is_closed());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        conn.close().await.unwrap();
+        assert!(conn.is_closed());
+    }
+    
     #[tokio::test]
     async fn encrypted_mtu_accounts_for_overhead() {
         let key = SigningKey::generate(&mut OsRng);
