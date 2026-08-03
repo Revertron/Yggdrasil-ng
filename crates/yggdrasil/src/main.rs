@@ -16,8 +16,33 @@ use yggdrasil::tun::TunAdapter;
 #[cfg(windows)]
 mod service;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Tokio worker threads for the daemon.
+///
+/// tokio defaults to one worker per core, which is counter-productive here: the
+/// data path is a chain of small per-packet tasks, so spreading it over every
+/// core buys nothing but a cross-thread wakeup per hop. Measured with two peered
+/// daemons at MTU 1400 on a 32-core box (see `benchmarks/datapath-throughput`):
+/// 32 workers cost 23.7 us of CPU per packet for 1218 Mbit/s, while 3 workers
+/// cost 18.9 us for 1300 Mbit/s -- more throughput for less CPU. Dropping to 1
+/// worker is cheaper still (10.4 us/pkt) but caps throughput at ~910 Mbit/s.
+const WORKER_THREADS: usize = 3;
+
+/// Build the daemon's tokio runtime. Used by both console and service mode.
+fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().min(WORKER_THREADS))
+        .unwrap_or(1);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    build_runtime()?.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
     let mut opts = Options::new();
