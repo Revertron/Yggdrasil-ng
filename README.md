@@ -17,18 +17,17 @@ This project aims to provide a lightweight, self-arranging, and secure mesh netw
 **✅ Fully Implemented:**
 - Core routing protocol (spanning tree, path discovery, bloom filters)
 - End-to-end encryption with forward secrecy (session key ratcheting)
-- TCP and TLS transports with automatic reconnection and exponential backoff
+- TCP, TLS, QUIC, WS transports with automatic reconnection and exponential backoff
 - TUN/TAP interface for IPv6 traffic
 - Admin socket API (getSelf, getPeers, getTree, getPaths, getSessions, addPeer, removePeer, etc.)
 - Session cleanup and timeout handling
 - Optimized Ed25519→Curve25519 key conversion
 - Single binary for daemon and control commands (no separate `yggdrasilctl`)
 - Windows service support (runs as `yggdrasil-ng` service via SCM)
-- UniFFI bindings for Android
+- Multicast peer discovery on local networks
 - Crypto-Key Routing (CKR) — tunnel arbitrary IPv4/IPv6 subnets through the mesh (enabled by default via the `ckr` feature)
 
 **⏳ Planned Features:**
-- Multicast peer discovery on local networks
 - Performance optimizations and protocol improvements
 
 ## Building from Source
@@ -223,9 +222,10 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `if_mtu` | integer | TUN MTU (default: 65535) |
 | `if_dns` | array | DNS servers for the TUN interface (Windows only), e.g. `["308:84:68:55::", "308:62:45:62::"]` |
 | `group_password` | string |Closed-network group password for turning the mesh into a private closed network. |
-| `session_path_timeout` | integer | Timeout in seconds for both encrypted sessions and cached paths. For experienced users. |
-| `keepalive_direct` | bool | Send empty traffic to direct peers on a short interval so idle sessions do not expire (default: false). |
-| `keepalive_remote_count` | integer | LRU size for recently used non-direct destinations to keep alive (0–1000, default: 0 = off). |
+| `session_path_timeout` | integer | Timeout in seconds for both encrypted sessions and cached paths. (60-86400, default: 60) For geeks. |
+| `keepalive_direct` | bool | Send empty traffic to direct peers on a short interval so idle sessions do not expire. (default: false). |
+| `keepalive_remote_count` | integer | LRU size for recently used non-direct destinations to keep alive. (0–1000, default: 0 = off). |
+| `keepalive_interval` | integer | Seconds between keepalive probes (direct and remote LRU). (15-`session_path_timeout`/2) (default: 20). |
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
