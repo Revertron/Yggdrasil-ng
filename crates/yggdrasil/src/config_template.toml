@@ -73,13 +73,14 @@ if_mtu = 65535
 
 # When true, periodically send empty encrypted traffic to each directly
 # connected peer so that the encrypted session (and the remote path) do
-# not expire during idle periods. Compatible with yggdrasil-go and older
-# yggdrasil-ng nodes. Default: false.
+# not expire during idle periods. Default: false. Compatible with 
+# yggdrasil-go and older yggdrasil-ng nodes.
 # keepalive_direct = false
 
 # Keep up to this many recently used non-direct destinations alive with
 # empty encrypted traffic after the first outbound application write
-# (LRU, range 0-1000). Independent of keepalive_direct. 0 = disabled.
+# (LRU, range 0-1000). Default: 0 = disabled. Independent of keepalive_direct. 
+# Compatible with yggdrasil-go and older yggdrasil-ng nodes.
 # keepalive_remote_count = 0
 
 # Interval in seconds between keepalive probes for direct peers and for
