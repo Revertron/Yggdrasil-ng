@@ -6,6 +6,7 @@
 pub(crate) mod crypto;
 pub(crate) mod session;
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::core::PacketConnImpl;
+use crate::crypto::PublicKey;
 use crate::types::{Addr, Error, Result};
 
 use self::crypto::{ed25519_private_to_curve25519, CurvePrivateKey, GroupAuth};
@@ -26,6 +28,41 @@ use self::session::{ConcurrentSessionManager, OutAction, SESSION_TRAFFIC_OVERHEA
 /// otherwise backpressure propagates to ironwood's delivery queue which drops
 /// packets older than 25 ms.
 const RECV_CHANNEL_SIZE: usize = 512;
+
+/// LRU of recently used non-direct destination keys for remote keepalive.
+/// Most-recently-used entries sit at the back. Capacity 0 disables tracking.
+struct RemoteKeepaliveLru {
+    capacity: usize,
+    order: VecDeque<PublicKey>,
+}
+
+impl RemoteKeepaliveLru {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Record an outbound application write to `key` (MRU at back).
+    fn touch(&mut self, key: PublicKey) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Some(pos) = self.order.iter().position(|k| *k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key);
+        while self.order.len() > self.capacity {
+            self.order.pop_front();
+        }
+    }
+
+    /// Snapshot of keys currently in the LRU (oldest first).
+    fn keys(&self) -> Vec<PublicKey> {
+        self.order.iter().copied().collect()
+    }
+}
 
 /// Decrypted incoming message.
 struct DecryptedMessage {
@@ -61,6 +98,10 @@ pub struct EncryptedPacketConn {
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     /// Session cleanup task handle (wrapped in Mutex so we can await it in close()).
     cleanup_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Optional keepalive task handle (direct and/or remote LRU).
+    keepalive_handle: Mutex<Option<JoinHandle<()>>>,
+    /// LRU of recently used non-direct destinations (shared with keepalive loop).
+    remote_lru: Arc<Mutex<RemoteKeepaliveLru>>,
 }
 
 impl EncryptedPacketConn {
@@ -70,8 +111,13 @@ impl EncryptedPacketConn {
         // Build the group-password gate before `config` is moved into the inner
         // PacketConn. Empty/absent password yields a disabled GroupAuth.
         let group_auth = GroupAuth::new(config.group_password.as_deref().unwrap_or(&[]));
+        let session_timeout = config.session_timeout;
+        let keepalive_direct = config.keepalive_direct;
+        let keepalive_interval = config.keepalive_interval;
+        let keepalive_remote_count = config.keepalive_remote_count;
         let inner = Arc::new(PacketConnImpl::new(secret.clone(), config));
-        let sessions = Arc::new(ConcurrentSessionManager::new(group_auth));
+        let sessions = Arc::new(ConcurrentSessionManager::new(group_auth, session_timeout));
+        let remote_lru = Arc::new(Mutex::new(RemoteKeepaliveLru::new(keepalive_remote_count)));
         let (recv_tx, recv_rx) = mpsc::channel(RECV_CHANNEL_SIZE);
         let cancel = CancellationToken::new();
 
@@ -100,6 +146,27 @@ impl EncryptedPacketConn {
             tokio::spawn(session_cleanup_loop(sessions, cancel))
         };
 
+        // Optional proactive keepalive: direct peers and/or remote LRU destinations.
+        // Independent: either feature can run without the other.
+        let keepalive_handle = if keepalive_direct || keepalive_remote_count > 0 {
+            let inner = inner.clone();
+            let sessions = sessions.clone();
+            let cancel = cancel.clone();
+            let signing_key = secret.clone();
+            let remote_lru = remote_lru.clone();
+            Some(tokio::spawn(keepalive_loop(
+                inner,
+                sessions,
+                signing_key,
+                keepalive_interval,
+                keepalive_direct,
+                remote_lru,
+                cancel,
+            )))
+        } else {
+            None
+        };
+
         Self {
             inner,
             signing_key: secret,
@@ -110,6 +177,8 @@ impl EncryptedPacketConn {
             cancel,
             reader_handle: Mutex::new(Some(reader_handle)),
             cleanup_handle: Mutex::new(Some(cleanup_handle)),
+            keepalive_handle: Mutex::new(keepalive_handle),
+            remote_lru,
         }
     }
 
@@ -203,6 +272,85 @@ async fn session_cleanup_loop(sessions: Arc<ConcurrentSessionManager>, cancel: C
     }
 }
 
+/// Send empty encrypted traffic to `key` if a session already exists.
+/// Does not start Init/handshake for cold destinations.
+async fn keepalive_send_if_session(
+    inner: &PacketConnImpl,
+    sessions: &ConcurrentSessionManager,
+    signing_key: &SigningKey,
+    key: &PublicKey,
+) {
+    use crate::types::PacketConn;
+
+    if !sessions.has_session(key) {
+        return;
+    }
+    let actions = sessions.write_to(key, &[], signing_key);
+    for action in actions {
+        match action {
+            OutAction::SendToInner { dest, data } => {
+                let _ = inner.write_to(&data, &Addr(dest)).await;
+            }
+            OutAction::Deliver { .. } => {}
+        }
+    }
+}
+
+/// Background task that periodically sends empty encrypted traffic to:
+/// - currently connected direct peers (when `keepalive_direct` is true);
+/// - keys in the remote LRU (when capacity > 0), excluding current direct peers.
+///
+/// Only refreshes sessions that already exist (`has_session`). Path
+/// `last_refresh` on the sender is only updated when traffic is received back.
+async fn keepalive_loop(
+    inner: Arc<PacketConnImpl>,
+    sessions: Arc<ConcurrentSessionManager>,
+    signing_key: SigningKey,
+    interval: std::time::Duration,
+    keepalive_direct: bool,
+    remote_lru: Arc<Mutex<RemoteKeepaliveLru>>,
+    cancel: CancellationToken,
+) {
+    use std::collections::HashSet;
+
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await; // Skip first immediate tick
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {
+                let peers = inner.get_peers().await;
+                let mut direct_keys = HashSet::new();
+                for peer in &peers {
+                    direct_keys.insert(peer.key);
+                }
+
+                if keepalive_direct {
+                    for key in &direct_keys {
+                        keepalive_send_if_session(
+                            &inner, &sessions, &signing_key, key,
+                        ).await;
+                    }
+                }
+
+                let remote_keys = {
+                    let lru = remote_lru.lock().await;
+                    lru.keys()
+                };
+                for key in remote_keys {
+                    if direct_keys.contains(&key) {
+                        continue;
+                    }
+                    keepalive_send_if_session(
+                        &inner, &sessions, &signing_key, &key,
+                    ).await;
+                }
+            }
+        }
+    }
+}
+
 async fn encrypted_reader_loop(
     inner: Arc<PacketConnImpl>,
     sessions: Arc<ConcurrentSessionManager>,
@@ -286,6 +434,17 @@ impl crate::types::PacketConn for EncryptedPacketConn {
 
         let dest = addr.0;
 
+        // Track outbound application traffic for remote keepalive LRU.
+        // Empty payloads are keepalive probes and must not refresh the LRU.
+        // Keepalive itself calls sessions.write_to directly, not this method.
+        if !buf.is_empty() {
+            let our_key = self.signing_key.verifying_key().to_bytes();
+            if dest != our_key {
+                let mut lru = self.remote_lru.lock().await;
+                lru.touch(dest);
+            }
+        }
+
         let actions = self.sessions.write_to(&dest, buf, &self.signing_key);
 
         for action in actions {
@@ -342,6 +501,9 @@ impl crate::types::PacketConn for EncryptedPacketConn {
         if let Some(handle) = self.cleanup_handle.lock().await.take() {
             let _ = handle.await;
         }
+        if let Some(handle) = self.keepalive_handle.lock().await.take() {
+            let _ = handle.await;
+        }
 
         // Close the inner connection
         self.inner.close().await
@@ -374,6 +536,60 @@ mod tests {
         assert!(conn.is_closed());
     }
 
+    #[tokio::test]
+    async fn encrypted_create_and_close_with_keepalive_direct() {
+        let key = SigningKey::generate(&mut OsRng);
+        let config = Config::default()
+            .with_keepalive_direct(true)
+            .with_keepalive_interval(std::time::Duration::from_secs(15));
+        let conn = new_encrypted_packet_conn(key, config);
+
+        use crate::types::PacketConn;
+        assert!(!conn.is_closed());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        conn.close().await.unwrap();
+        assert!(conn.is_closed());
+    }
+
+    #[tokio::test]
+    async fn encrypted_create_and_close_with_keepalive_remote_only() {
+        let key = SigningKey::generate(&mut OsRng);
+        let config = Config::default()
+            .with_keepalive_remote_count(8)
+            .with_keepalive_interval(std::time::Duration::from_secs(15));
+        let conn = new_encrypted_packet_conn(key, config);
+
+        use crate::types::PacketConn;
+        assert!(!conn.is_closed());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        conn.close().await.unwrap();
+        assert!(conn.is_closed());
+    }
+
+    #[test]
+    fn remote_lru_evicts_oldest_and_promotes_on_touch() {
+        let mut lru = RemoteKeepaliveLru::new(2);
+        lru.touch([1u8; 32]);
+        lru.touch([2u8; 32]);
+        lru.touch([3u8; 32]); // evicts [1]
+        let keys = lru.keys();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], [2u8; 32]);
+        assert_eq!(keys[1], [3u8; 32]);
+
+        lru.touch([2u8; 32]); // promote [2] to MRU
+        let keys = lru.keys();
+        assert_eq!(keys[0], [3u8; 32]);
+        assert_eq!(keys[1], [2u8; 32]);
+    }
+
+    #[test]
+    fn remote_lru_capacity_zero_is_noop() {
+        let mut lru = RemoteKeepaliveLru::new(0);
+        lru.touch([1u8; 32]);
+        assert!(lru.keys().is_empty());
+    }
+    
     #[tokio::test]
     async fn encrypted_mtu_accounts_for_overhead() {
         let key = SigningKey::generate(&mut OsRng);

@@ -23,10 +23,20 @@ pub struct Config {
     pub path_timeout: Duration,
     /// Minimum interval between path lookups to the same destination. Default: 1 second.
     pub path_throttle: Duration,
+    /// Timeout before expiring an idle encrypted session. Default: 1 minute.
+    pub session_timeout: Duration,
     /// Optional closed-network group password. When set, only peers configured
     /// with the same password can complete an encrypted session handshake.
     /// `None`/empty = open network (no change to the handshake). Default: `None`.
     pub group_password: Option<Vec<u8>>,
+    /// When true, EncryptedPacketConn periodically sends empty encrypted traffic
+    /// to each currently connected direct peer. Default: false.
+    pub keepalive_direct: bool,
+    /// Interval between keepalive probes (direct and remote LRU). Default: 20 seconds.
+    pub keepalive_interval: Duration,
+    /// Maximum number of recently used non-direct destinations to keep alive
+    /// with empty encrypted traffic. 0 disables remote keepalive. Default: 0.
+    pub keepalive_remote_count: usize,
 }
 
 impl Default for Config {
@@ -41,7 +51,11 @@ impl Default for Config {
             path_notify: None,
             path_timeout: Duration::from_secs(60),
             path_throttle: Duration::from_secs(1),
+            session_timeout: Duration::from_secs(60),
             group_password: None,
+            keepalive_direct: false,
+            keepalive_interval: Duration::from_secs(20),
+            keepalive_remote_count: 0,
         }
     }
 }
@@ -98,6 +112,11 @@ impl Config {
         self
     }
 
+    pub fn with_session_timeout(mut self, d: Duration) -> Self {
+        self.session_timeout = d;
+        self
+    }
+
     /// Set a closed-network group password. All nodes that should be able to
     /// open sessions with each other must use the same password. An empty
     /// password leaves the network open (the handshake is unchanged).
@@ -107,6 +126,24 @@ impl Config {
         } else {
             Some(password)
         };
+        self
+    }
+
+    /// Enable or disable proactive empty-traffic keepalives to direct peers.
+    pub fn with_keepalive_direct(mut self, enable: bool) -> Self {
+        self.keepalive_direct = enable;
+        self
+    }
+
+    /// Set the interval between direct-peer keepalive probes.
+    pub fn with_keepalive_interval(mut self, d: Duration) -> Self {
+        self.keepalive_interval = d;
+        self
+    }
+
+    /// Set how many recently used non-direct destinations to keep alive (0 = off).
+    pub fn with_keepalive_remote_count(mut self, n: usize) -> Self {
+        self.keepalive_remote_count = n;
         self
     }
 }

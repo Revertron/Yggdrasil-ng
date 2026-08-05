@@ -64,6 +64,32 @@ if_mtu = 65535
 # `password` above, which only authenticates direct links.
 # group_password = ""
 
+# Timeout in seconds for both encrypted sessions and cached paths.
+# After this many seconds of inactivity a session or path expires and
+# must be re-established on the next packet (default and minimum: 60,
+# maximum: 86400). Useful for isolated private networks; leave at the
+# default for compatibility with the public Yggdrasil network.
+# session_path_timeout = 60
+
+# When true, periodically send empty encrypted traffic to each directly
+# connected peer so that the encrypted session (and the remote path) do
+# not expire during idle periods. Default: false. Compatible with 
+# yggdrasil-go and older yggdrasil-ng nodes.
+# keepalive_direct = false
+
+# Keep up to this many recently used non-direct destinations alive with
+# empty encrypted traffic after the first outbound application write
+# (LRU, range 0-1000). Default: 0 = disabled. Independent of keepalive_direct. 
+# Compatible with yggdrasil-go and older yggdrasil-ng nodes.
+# keepalive_remote_count = 0
+
+# Interval in seconds between keepalive probes for direct peers and for
+# destinations tracked by keepalive_remote_count. Clamped to the range
+# [15, session_path_timeout/2] at runtime (default: 20). Only meaningful
+# when keepalive_direct is true and/or keepalive_remote_count is greater
+# than zero.
+# keepalive_interval = 20
+
 # Custom node info that is advertised to other nodes.
 # This can be any TOML table, e.g. { name = "my-node", location = "earth" }
 [node_info]

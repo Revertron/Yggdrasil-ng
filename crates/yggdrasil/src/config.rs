@@ -111,6 +111,29 @@ pub struct Config {
     /// from the per-peer/per-multicast `password`, which gates direct peering.
     #[serde(default)]
     pub group_password: String,
+
+    /// Timeout in seconds for both encrypted sessions and cached paths.
+    /// Idle sessions and paths expire after this duration of inactivity.
+    /// Values outside the range [60, 86400] are clamped. Default: 60.
+    #[serde(default = "default_session_path_timeout")]
+    pub session_path_timeout: u64,
+
+    /// When true, periodically send empty encrypted traffic to each directly
+    /// connected peer so idle sessions (and the remote path) do not expire.
+    /// Default: false.
+    #[serde(default)]
+    pub keepalive_direct: bool,
+
+    /// Interval in seconds between direct-peer keepalive probes.
+    /// Clamped to [15, session_path_timeout/2] via `effective_keepalive_interval`.
+    /// Default: 20. Not documented in the config template yet.
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval: u64,
+
+    /// Maximum number of recently used non-direct destinations kept alive with
+    /// empty encrypted traffic. Clamped to [0, 1000]. 0 disables. Default: 0.
+    #[serde(default)]
+    pub keepalive_remote_count: u64,
 }
 
 /// Built-in stateful firewall configuration. Default-off; when enabled,
@@ -237,6 +260,14 @@ fn default_node_info() -> toml::Value {
     toml::Value::Table(toml::map::Map::new())
 }
 
+fn default_session_path_timeout() -> u64 {
+    60
+}
+
+fn default_keepalive_interval() -> u64 {
+    20
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -255,6 +286,10 @@ impl Default for Config {
             tunnel_routing: TunnelRoutingConfig::default(),
             firewall: FirewallConfig::default(),
             group_password: String::new(),
+            session_path_timeout: default_session_path_timeout(),
+            keepalive_direct: false,
+            keepalive_interval: default_keepalive_interval(),
+            keepalive_remote_count: 0,
         }
     }
 }
@@ -368,6 +403,28 @@ impl Config {
             })
             .collect()
     }
+    
+    /// Returns the effective session/path timeout as a Duration,
+    /// clamped to the allowed range [60, 86400] seconds.
+    pub fn effective_session_path_timeout(&self) -> std::time::Duration {
+        let secs = self.session_path_timeout.clamp(60, 86400);
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// Returns the effective direct-peer keepalive interval as a Duration.
+    /// Clamped to [15, max(15, session_path_timeout/2)] seconds so keepalives
+    /// always fire at least twice per session/path timeout window.
+    pub fn effective_keepalive_interval(&self) -> std::time::Duration {
+        let session_secs = self.session_path_timeout.clamp(60, 86400);
+        let upper = (session_secs / 2).max(15);
+        let secs = self.keepalive_interval.clamp(15, upper);
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// Returns the effective remote LRU capacity, clamped to [0, 1000].
+    pub fn effective_keepalive_remote_count(&self) -> usize {
+        self.keepalive_remote_count.clamp(0, 1000) as usize
+    }   
 
     /// Get node info as JSON string (for protocol responses).
     /// Automatically adds build info if node_info_privacy is false.
@@ -525,5 +582,30 @@ mod normalize_tests {
             out.contains("private_key = \"\""),
             "normalize must not mint a key:\n{out}"
         );
+    }
+    
+    #[test]
+    fn keepalive_remote_count_defaults_and_clamp() {
+        let cfg = Config::default();
+        assert_eq!(cfg.keepalive_remote_count, 0);
+        assert_eq!(cfg.effective_keepalive_remote_count(), 0);
+
+        let mut cfg = Config::default();
+        cfg.keepalive_remote_count = 50;
+        assert_eq!(cfg.effective_keepalive_remote_count(), 50);
+
+        cfg.keepalive_remote_count = 5000;
+        assert_eq!(cfg.effective_keepalive_remote_count(), 1000);
+    }
+
+    #[test]
+    fn keepalive_remote_count_parses_from_toml() {
+        let text = r#"
+            private_key = ""
+            keepalive_remote_count = 16
+        "#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.keepalive_remote_count, 16);
+        assert!(!cfg.keepalive_direct);
     }
 }
