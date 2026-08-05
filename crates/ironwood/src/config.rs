@@ -32,8 +32,11 @@ pub struct Config {
     /// When true, EncryptedPacketConn periodically sends empty encrypted traffic
     /// to each currently connected direct peer. Default: false.
     pub keepalive_direct: bool,
-    /// Interval between direct-peer keepalive probes. Default: 20 seconds.
+    /// Interval between keepalive probes (direct and remote LRU). Default: 20 seconds.
     pub keepalive_interval: Duration,
+    /// Maximum number of recently used non-direct destinations to keep alive
+    /// with empty encrypted traffic. 0 disables remote keepalive. Default: 0.
+    pub keepalive_remote_count: usize,
 }
 
 impl Default for Config {
@@ -52,6 +55,7 @@ impl Default for Config {
             group_password: None,
             keepalive_direct: false,
             keepalive_interval: Duration::from_secs(20),
+            keepalive_remote_count: 0,
         }
     }
 }
@@ -134,6 +138,12 @@ impl Config {
     /// Set the interval between direct-peer keepalive probes.
     pub fn with_keepalive_interval(mut self, d: Duration) -> Self {
         self.keepalive_interval = d;
+        self
+    }
+
+    /// Set how many recently used non-direct destinations to keep alive (0 = off).
+    pub fn with_keepalive_remote_count(mut self, n: usize) -> Self {
+        self.keepalive_remote_count = n;
         self
     }
 }

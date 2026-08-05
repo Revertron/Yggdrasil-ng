@@ -72,6 +72,7 @@ impl Core {
             .with_session_timeout(session_path_timeout)
             .with_keepalive_direct(config.keepalive_direct)
             .with_keepalive_interval(config.effective_keepalive_interval())
+            .with_keepalive_remote_count(config.effective_keepalive_remote_count())
             .with_path_notify(move |key: [u8; 32]| {
                 let rwc = {
                     let guard = slot_clone.lock().unwrap();

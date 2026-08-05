@@ -225,6 +225,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `group_password` | string |Closed-network group password for turning the mesh into a private closed network. |
 | `session_path_timeout` | integer | Timeout in seconds for both encrypted sessions and cached paths. For experienced users. |
 | `keepalive_direct` | bool | Send empty traffic to direct peers on a short interval so idle sessions do not expire (default: false). |
+| `keepalive_remote_count` | integer | LRU size for recently used non-direct destinations to keep alive (0–1000, default: 0 = off). |
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |

@@ -77,6 +77,11 @@ if_mtu = 65535
 # yggdrasil-ng nodes. Default: false.
 # keepalive_direct = false
 
+# Keep up to this many recently used non-direct destinations alive with
+# empty encrypted traffic after the first outbound application write
+# (LRU, range 0-1000). Independent of keepalive_direct. 0 = disabled.
+# keepalive_remote_count = 0
+
 # Custom node info that is advertised to other nodes.
 # This can be any TOML table, e.g. { name = "my-node", location = "earth" }
 [node_info]

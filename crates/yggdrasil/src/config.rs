@@ -129,6 +129,11 @@ pub struct Config {
     /// Default: 20. Not documented in the config template yet.
     #[serde(default = "default_keepalive_interval")]
     pub keepalive_interval: u64,
+
+    /// Maximum number of recently used non-direct destinations kept alive with
+    /// empty encrypted traffic. Clamped to [0, 1000]. 0 disables. Default: 0.
+    #[serde(default)]
+    pub keepalive_remote_count: u64,
 }
 
 /// Built-in stateful firewall configuration. Default-off; when enabled,
@@ -284,6 +289,7 @@ impl Default for Config {
             session_path_timeout: default_session_path_timeout(),
             keepalive_direct: false,
             keepalive_interval: default_keepalive_interval(),
+            keepalive_remote_count: 0,
         }
     }
 }
@@ -414,7 +420,12 @@ impl Config {
         let secs = self.keepalive_interval.clamp(15, upper);
         std::time::Duration::from_secs(secs)
     }
-    
+
+    /// Returns the effective remote LRU capacity, clamped to [0, 1000].
+    pub fn effective_keepalive_remote_count(&self) -> usize {
+        self.keepalive_remote_count.clamp(0, 1000) as usize
+    }   
+
     /// Get node info as JSON string (for protocol responses).
     /// Automatically adds build info if node_info_privacy is false.
     pub fn node_info_json(&self) -> String {
@@ -571,5 +582,30 @@ mod normalize_tests {
             out.contains("private_key = \"\""),
             "normalize must not mint a key:\n{out}"
         );
+    }
+    
+    #[test]
+    fn keepalive_remote_count_defaults_and_clamp() {
+        let cfg = Config::default();
+        assert_eq!(cfg.keepalive_remote_count, 0);
+        assert_eq!(cfg.effective_keepalive_remote_count(), 0);
+
+        let mut cfg = Config::default();
+        cfg.keepalive_remote_count = 50;
+        assert_eq!(cfg.effective_keepalive_remote_count(), 50);
+
+        cfg.keepalive_remote_count = 5000;
+        assert_eq!(cfg.effective_keepalive_remote_count(), 1000);
+    }
+
+    #[test]
+    fn keepalive_remote_count_parses_from_toml() {
+        let text = r#"
+            private_key = ""
+            keepalive_remote_count = 16
+        "#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.keepalive_remote_count, 16);
+        assert!(!cfg.keepalive_direct);
     }
 }
