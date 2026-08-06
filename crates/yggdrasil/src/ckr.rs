@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 use ipnet::IpNet;
@@ -38,6 +39,13 @@ impl CryptoKey {
     pub fn new(config: &TunnelRoutingConfig, self_key: &[u8; 32]) -> Result<Self, String> {
         let mut v4_routes = Vec::new();
         let mut v6_routes = Vec::new();
+        // Duplicate detection used to be a linear scan of the route Vec per
+        // expanded prefix, i.e. O(N^2). With country-sized lists (tens of
+        // thousands of CIDRs) that alone burns minutes of CPU before the TUN
+        // is up. Track seen prefixes in a set instead; behaviour (including
+        // the "duplicate remote subnet" error) is unchanged.
+        let mut seen_v4: HashSet<IpNet> = HashSet::new();
+        let mut seen_v6: HashSet<IpNet> = HashSet::new();
 
         if !config.enable {
             return Ok(Self {
@@ -66,7 +74,7 @@ impl CryptoKey {
                                 prefix
                             ));
                         }
-                        if v6_routes.iter().any(|r| r.prefix == prefix) {
+                        if !seen_v6.insert(prefix) {
                             return Err(format!("duplicate remote subnet: {}", prefix));
                         }
                         v6_routes.push(Route {
@@ -75,7 +83,7 @@ impl CryptoKey {
                         });
                     }
                     IpNet::V4(_) => {
-                        if v4_routes.iter().any(|r| r.prefix == prefix) {
+                        if !seen_v4.insert(prefix) {
                             return Err(format!("duplicate remote subnet: {}", prefix));
                         }
                         v4_routes.push(Route {
@@ -318,6 +326,7 @@ pub fn install_routes(
     // Skip entries whose destination is this node itself — those are handled
     // by the OS's native routing and should not be steered into the TUN.
     let mut cidrs: Vec<IpNet> = Vec::new();
+    let mut seen: HashSet<IpNet> = HashSet::new();
     for (pubkey_hex, subnet_list) in &config.remote_subnets {
         if parse_pubkey(pubkey_hex).ok().as_ref() == Some(self_key) {
             continue;
@@ -325,7 +334,11 @@ pub fn install_routes(
         let non_tilde_entries: Vec<String> = subnet_list.iter().filter(|s| !s.trim().starts_with('~')).cloned().collect();
         let route_list = normalize_subnet_entries(&non_tilde_entries);
         for prefix in expand_cidrs(&route_list)? {
-            if !cidrs.contains(&prefix) {
+            // Set-based dedup: the old `cidrs.contains(&prefix)` was a linear
+            // scan per prefix, O(N^2) over the whole config. Insertion order
+            // is preserved by keeping the Vec and using the set only as an
+            // index.
+            if seen.insert(prefix) {
                 cidrs.push(prefix);
             }
         }
@@ -366,6 +379,7 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
     }
 
     let mut cidrs: Vec<IpNet> = Vec::new();
+    let mut seen: HashSet<IpNet> = HashSet::new();
     for (pubkey_hex, subnet_list) in &config.remote_subnets {
         if parse_pubkey(pubkey_hex).ok().as_ref() == Some(self_key) {
             continue;
@@ -374,7 +388,7 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
         let route_list = normalize_subnet_entries(&non_tilde_entries);
         if let Ok(expanded) = expand_cidrs(&route_list) {
             for prefix in expanded {
-                if !cidrs.contains(&prefix) {
+                if seen.insert(prefix) {
                     cidrs.push(prefix);
                 }
             }
