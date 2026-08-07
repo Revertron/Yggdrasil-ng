@@ -99,16 +99,22 @@ impl CryptoKey {
         v4_routes.sort_by(sort_routes);
         v6_routes.sort_by(sort_routes);
 
-        if !v6_routes.is_empty() {
-            tracing::info!("Active CKR IPv6 routes:");
-            for r in &v6_routes {
-                tracing::info!("  {} via {}", r.prefix, hex::encode(r.destination));
-            }
+        // Summarise at info, list at debug: one info line per route meant
+        // >100k synchronous writes (each allocating via hex::encode) before
+        // the TUN came up.
+        if !v6_routes.is_empty() || !v4_routes.is_empty() {
+            tracing::info!(
+                "Active CKR routes: {} IPv6, {} IPv4",
+                v6_routes.len(),
+                v4_routes.len()
+            );
         }
-        if !v4_routes.is_empty() {
-            tracing::info!("Active CKR IPv4 routes:");
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for r in &v6_routes {
+                tracing::debug!("  {} via {}", r.prefix, hex::encode(r.destination));
+            }
             for r in &v4_routes {
-                tracing::info!("  {} via {}", r.prefix, hex::encode(r.destination));
+                tracing::debug!("  {} via {}", r.prefix, hex::encode(r.destination));
             }
         }
 
@@ -350,6 +356,8 @@ pub fn install_routes(
 
     let mut manager =
         RouteManager::new().map_err(|e| format!("failed to create route manager: {}", e))?;
+    let mut installed: usize = 0;
+    let mut failed: usize = 0;
 
     for cidr in &cidrs {
         let route = route_manager::Route::new(cidr.network(), cidr.prefix_len())
@@ -357,12 +365,23 @@ pub fn install_routes(
 
         match manager.add(&route) {
             Ok(()) => {
-                tracing::info!("Installed route: {} via {}", cidr, tun_name);
+                installed += 1;
+                tracing::debug!("Installed route: {} via {}", cidr, tun_name);
             }
             Err(e) => {
+                failed += 1;
                 tracing::warn!("Failed to install route {} via {}: {}", cidr, tun_name, e);
             }
         }
+    }
+
+    if failed > 0 {
+        tracing::info!(
+            "Installed {} CKR route(s) via {} ({} failed)",
+            installed, tun_name, failed
+        );
+    } else {
+        tracing::info!("Installed {} CKR route(s) via {}", installed, tun_name);
     }
 
     Ok(())
