@@ -451,6 +451,9 @@ async fn handle_router_msg(
                         priority: entry.prio,
                         latency_ms,
                         cost,
+                        liveness_timeout_ms: 0,
+                        liveness_degraded: false,
+                        liveness_ewma_ms: 0,
                     });
                 }
             }
@@ -573,6 +576,8 @@ pub struct PacketConnImpl {
     pub(crate) router_handle: RouterHandle,
     /// The peer manager (shared with peer tasks).
     peers: Arc<Mutex<Peers>>,
+    /// Durable adaptive liveness state keyed by peer public key (survives reconnect).
+    pub(crate) liveness: Arc<crate::peer_timeout::PeerLivenessRegistry>,
     /// Delivery queue for receive buffering with backpressure.
     delivery_queue: Arc<DeliveryQueue>,
     /// Inbound traffic channel (reader side).
@@ -592,6 +597,9 @@ impl PacketConnImpl {
         let pub_key = crypto.public_key;
         let router = Router::new(crypto, &config);
         let peers = Arc::new(Mutex::new(Peers::new()));
+        let liveness = Arc::new(crate::peer_timeout::PeerLivenessRegistry::new(
+            config.peer_timeout_cfg.clone(),
+        ));
         let delivery_queue = DeliveryQueue::new(config.peer_max_message_size);
         let (traffic_tx, traffic_rx) = mpsc::channel(RECV_CHANNEL_SIZE);
         let cancel = CancellationToken::new();
@@ -619,6 +627,7 @@ impl PacketConnImpl {
             config,
             router_handle,
             peers,
+            liveness,
             delivery_queue,
             traffic_rx: Mutex::new(traffic_rx),
             closed: AtomicBool::new(false),
@@ -733,6 +742,7 @@ impl crate::types::PacketConn for PacketConnImpl {
         // Shared deadline: writer arms it on non-keepalive sends;
         // reader clears it on any receive.
         let read_deadline: ReadDeadline = Arc::new(std::sync::Mutex::new(None));
+        let liveness = self.liveness.ctrl_for(peer_key);
 
         // Diagnostic only: lets the disconnect summary say whether we were
         // still writing when the link ended.
@@ -751,7 +761,7 @@ impl crate::types::PacketConn for PacketConnImpl {
             self.router_handle.clone(),
             self.peers.clone(),
             self.config.peer_keepalive_delay,
-            self.config.peer_timeout,
+            liveness.clone(),
             read_deadline.clone(),
             last_write.clone(),
             writer_cancel,
@@ -768,7 +778,7 @@ impl crate::types::PacketConn for PacketConnImpl {
             writer_tx.clone(),
             peer_cancel.clone(),
             self.config.peer_max_message_size,
-            self.config.peer_timeout,
+            liveness.clone(),
             self.config.peer_probe_count,
             self.config.peer_keepalive_delay,
             read_deadline,
@@ -886,6 +896,12 @@ pub struct PeerInfo {
     pub priority: u8,
     pub latency_ms: f64,
     pub cost: u64,
+    /// Current adaptive liveness timeout (ms), if known for this key.
+    pub liveness_timeout_ms: u64,
+    /// True if this peer key is in Degraded liveness mode.
+    pub liveness_degraded: bool,
+    /// EWMA of arm→reply samples (ms).
+    pub liveness_ewma_ms: u64,
 }
 
 /// Public tree entry returned by `get_tree()`.
@@ -916,7 +932,15 @@ impl PacketConnImpl {
 
     /// Get info about all connected peers.
     pub async fn get_peers(&self) -> Vec<PeerInfo> {
-        self.router_handle.query_peers().await
+        let mut peers = self.router_handle.query_peers().await;
+        for p in &mut peers {
+            if let Some(s) = self.liveness.snapshot(p.key) {
+                p.liveness_timeout_ms = s.timeout_ms;
+                p.liveness_degraded = s.degraded;
+                p.liveness_ewma_ms = s.ewma_ms;
+            }
+        }
+        peers
     }
 
     /// Get spanning tree entries.

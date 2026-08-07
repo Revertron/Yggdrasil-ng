@@ -62,8 +62,29 @@ impl Core {
         let path_notify_slot: PathNotifySlot = Arc::new(std::sync::Mutex::new(None));
         let slot_clone = path_notify_slot.clone();
 
+        // Peer liveness: Normal (min) / Degraded (problem_min=peer_timeout_secs).
+        // Fixed mode: peer_timeout_adaptive = false → always peer_timeout_secs.
+        use ironwood::AdaptiveTimeoutConfig;
+        use std::time::Duration;
+        let peer_timeout_cfg = AdaptiveTimeoutConfig {
+            fixed_or_initial: Duration::from_secs(config.peer_timeout_secs),
+            adaptive: config.peer_timeout_adaptive,
+            min: Duration::from_secs(config.peer_timeout_min_secs),
+            problem_min: Duration::from_secs(config.peer_timeout_secs),
+            max: Duration::from_secs(config.peer_timeout_max_secs),
+            base: Duration::from_secs(config.peer_timeout_base_secs),
+            rtt_mult: config.peer_timeout_rtt_mult,
+            penalty_step: Duration::from_secs(5),
+            penalty_decay: Duration::from_millis(500),
+            recover: Duration::from_secs(config.peer_timeout_recover_secs),
+        };
+        if let Err(e) = peer_timeout_cfg.validate() {
+            panic!("invalid peer timeout config: {e}");
+        }
+
         // Create ironwood config with bloom transform and path notify
         let iw_config = IwConfig::default()
+            .with_peer_timeout_cfg(peer_timeout_cfg)
             .with_bloom_transform(|key: [u8; 32]| -> [u8; 32] {
                 let subnet = subnet_for_key(&key);
                 subnet.get_key()
@@ -343,16 +364,19 @@ impl Core {
         self.inner.force_refresh();
     }
 
-    /// Get link-level peer info merged with ironwood RTT/cost (for admin getPeers).
+    /// Get link-level peer info merged with ironwood RTT/cost/liveness (for admin getPeers).
     /// Returns all configured peers (with up=false if disconnected) plus active inbound peers.
     pub async fn get_peers(&self) -> Vec<LinkPeerInfo> {
         let mut peers = self.active_links.get_peers().await;
-        // Merge latency/cost from ironwood router
+        // Merge latency/cost/liveness from ironwood router
         let iw_peers = self.inner.get_peers().await;
         for p in &mut peers {
             if let Some(iw) = iw_peers.iter().find(|ip| ip.key == p.key) {
                 p.latency_ms = iw.latency_ms;
                 p.cost = iw.cost;
+                p.liveness_timeout_ms = iw.liveness_timeout_ms;
+                p.liveness_degraded = iw.liveness_degraded;
+                p.liveness_ewma_ms = iw.liveness_ewma_ms;
             }
         }
 
@@ -374,6 +398,9 @@ impl Core {
                     latency_ms: 0.0,
                     cost: 0,
                     last_error,
+                    liveness_timeout_ms: 0,
+                    liveness_degraded: false,
+                    liveness_ewma_ms: 0,
                 });
             }
         }

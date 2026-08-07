@@ -204,6 +204,9 @@ async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_js
                         "tx_rate": p.tx_rate,
                         "uptime": p.uptime_secs,
                         "last_error": p.last_error,
+                        "liveness_timeout_ms": p.liveness_timeout_ms,
+                        "liveness_degraded": p.liveness_degraded,
+                        "liveness_ewma_ms": p.liveness_ewma_ms,
                     })
                 })
                 .collect();

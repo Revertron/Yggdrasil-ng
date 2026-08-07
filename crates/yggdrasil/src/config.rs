@@ -111,6 +111,39 @@ pub struct Config {
     /// from the per-peer/per-multicast `password`, which gates direct peering.
     #[serde(default)]
     pub group_password: String,
+
+    /// Peer liveness:
+    /// - fixed mode (`peer_timeout_adaptive = false`): always this many seconds;
+    /// - adaptive Degraded floor / problem_min (seconds). Default: 15.
+    #[serde(default = "default_peer_timeout_secs")]
+    pub peer_timeout_secs: u64,
+
+    /// When true (default): Normal/Degraded adaptive sizing.
+    /// Degraded is entered only on a real liveness timeout (not slow samples);
+    /// state is per peer public key and survives reconnects.
+    /// When false: always `peer_timeout_secs`.
+    #[serde(default = "default_true")]
+    pub peer_timeout_adaptive: bool,
+
+    /// Adaptive Normal-mode floor (seconds). Default: 5.
+    #[serde(default = "default_peer_timeout_min_secs")]
+    pub peer_timeout_min_secs: u64,
+
+    /// Adaptive ceiling (seconds). Default: 30.
+    #[serde(default = "default_peer_timeout_max_secs")]
+    pub peer_timeout_max_secs: u64,
+
+    /// Adaptive: base seconds added to RTT estimate. Default: 2.
+    #[serde(default = "default_peer_timeout_base_secs")]
+    pub peer_timeout_base_secs: u64,
+
+    /// Adaptive: multiplier for EWMA(arm→reply). Default: 8.
+    #[serde(default = "default_peer_timeout_rtt_mult")]
+    pub peer_timeout_rtt_mult: u32,
+
+    /// Seconds of healthy operation before leaving Degraded → Normal. Default: 600.
+    #[serde(default = "default_peer_timeout_recover_secs")]
+    pub peer_timeout_recover_secs: u64,
 }
 
 /// Built-in stateful firewall configuration. Default-off; when enabled,
@@ -230,6 +263,32 @@ fn default_node_info() -> toml::Value {
     toml::Value::Table(toml::map::Map::new())
 }
 
+fn default_peer_timeout_secs() -> u64 {
+    // Degraded floor + fixed-mode value.
+    15
+}
+
+fn default_peer_timeout_min_secs() -> u64 {
+    // Normal-mode floor (stable / DC links).
+    5
+}
+
+fn default_peer_timeout_max_secs() -> u64 {
+    30
+}
+
+fn default_peer_timeout_base_secs() -> u64 {
+    2
+}
+
+fn default_peer_timeout_rtt_mult() -> u32 {
+    8
+}
+
+fn default_peer_timeout_recover_secs() -> u64 {
+    600
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -248,6 +307,13 @@ impl Default for Config {
             tunnel_routing: TunnelRoutingConfig::default(),
             firewall: FirewallConfig::default(),
             group_password: String::new(),
+            peer_timeout_secs: default_peer_timeout_secs(),
+            peer_timeout_adaptive: true,
+            peer_timeout_min_secs: default_peer_timeout_min_secs(),
+            peer_timeout_max_secs: default_peer_timeout_max_secs(),
+            peer_timeout_base_secs: default_peer_timeout_base_secs(),
+            peer_timeout_rtt_mult: default_peer_timeout_rtt_mult(),
+            peer_timeout_recover_secs: default_peer_timeout_recover_secs(),
         }
     }
 }

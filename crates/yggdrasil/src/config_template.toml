@@ -64,6 +64,33 @@ if_mtu = 65535
 # `password` above, which only authenticates direct links.
 # group_password = ""
 
+# ---------------------------------------------------------------------------
+# Peer liveness (ironwood read-deadline after non-keepalive frames)
+# ---------------------------------------------------------------------------
+# If the remote sends no frame before the deadline, the link is torn down
+# (`ironwood: operation timed out`).
+#
+# Adaptive mode (default) — two floors:
+#   Normal:   floor = peer_timeout_min_secs (default 5)  — stable / DC links
+#   Degraded: floor = peer_timeout_secs     (default 15) — entered ONLY after a
+#             real liveness timeout (slow samples only update EWMA, no degrade);
+#             recovers after peer_timeout_recover_secs of quiet + low penalty
+#   timeout = clamp(base + rtt_mult * ewma(arm→reply) + penalty, floor, max)
+#   Enter/leave Degraded is logged once at INFO (no spam).
+#   Mode/penalty/EWMA are per peer public key and survive reconnects.
+#
+# peer_timeout_secs = 15
+# peer_timeout_adaptive = true
+# peer_timeout_min_secs = 5
+# peer_timeout_max_secs = 30
+# peer_timeout_base_secs = 2
+# peer_timeout_rtt_mult = 8
+# peer_timeout_recover_secs = 600
+#
+# Fixed mode:
+# peer_timeout_adaptive = false
+# peer_timeout_secs = 15
+
 # Custom node info that is advertised to other nodes.
 # This can be any TOML table, e.g. { name = "my-node", location = "earth" }
 [node_info]

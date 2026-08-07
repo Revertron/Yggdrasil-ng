@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bloom::BloomFilter;
 use crate::core::{RouterHandle, RouterMsg};
 use crate::crypto::{Crypto, PublicKey};
+use crate::peer_timeout::PeerTimeoutCtrl;
 use crate::router::{PeerId, PeerEntry, RouterAction, RouterAnnounce};
 use crate::traffic::{PacketQueue, TrafficPacket};
 use crate::types::Error;
@@ -377,7 +378,7 @@ pub(crate) async fn peer_reader(
     writer_tx: mpsc::Sender<PeerMessage>,
     cancel: CancellationToken,
     max_message_size: u64,
-    peer_timeout: Duration,
+    liveness: Arc<PeerTimeoutCtrl>,
     peer_probe_count: u32,
     _keepalive_delay: Duration,
     read_deadline: ReadDeadline,
@@ -417,11 +418,17 @@ pub(crate) async fn peer_reader(
                 // Time left on the outstanding deadline. `None` means it just
                 // expired; no deadline at all means idle, so wait a full
                 // interval before looking again.
+                // Interval length comes from adaptive liveness (may change after
+                // Degraded entry). Probe count is master-style: only the final
+                // miss calls on_timeout() / tears the link.
+                let interval = liveness
+                    .last_armed_timeout()
+                    .unwrap_or_else(|| liveness.current());
                 let remaining = {
                     let deadline = *read_deadline.lock().unwrap();
                     match deadline {
                         Some(d) => d.checked_duration_since(std::time::Instant::now()),
-                        None => Some(peer_timeout),
+                        None => Some(interval),
                     }
                 };
 
@@ -430,28 +437,37 @@ pub(crate) async fn peer_reader(
                     None => {
                         // The peer owes us a frame and the interval elapsed.
                         // Probe a few times before giving up: a lossy path can
-                        // stall for seconds while TCP backs off its retransmits,
-                        // and dropping the link loses far more than waiting does.
+                        // stall for seconds while TCP backs off its retransmits.
                         // `probes_sent` intervals already elapsed, plus this one.
                         if probes_sent + 1 >= peer_probe_count {
-                            tracing::debug!("peer_reader[{}]: peer timeout (no reply from {:02x?} after {} intervals of {}ms), disconnecting",
-                                peer_id, hex::encode(&peer_key[..8]), peer_probe_count, peer_timeout.as_millis());
+                            let armed_ms = interval.as_millis() as u64;
+                            tracing::debug!(
+                                peer_id,
+                                peer = %hex::encode(&peer_key[..4]),
+                                armed_timeout_ms = armed_ms,
+                                probe_count = peer_probe_count,
+                                probes_sent,
+                                "peer liveness deadline exhausted — disconnecting"
+                            );
+                            liveness.on_timeout();
                             disconnect_reason = Some(Error::Timeout);
                             break 'poll None;
                         }
                         probes_sent += 1;
+                        // Extend deadline only — do not re-arm sample epoch.
+                        let next = liveness.current();
                         *read_deadline.lock().unwrap() =
-                            Some(std::time::Instant::now() + peer_timeout);
-                        // Neither implementation answers a keepalive, so this
-                        // does not draw a reply out of the peer — the reply
-                        // comes when TCP finally delivers what we sent earlier.
-                        // It does keep us visibly alive from the peer's side, so
-                        // it does not tear the link down while we are waiting.
+                            Some(std::time::Instant::now() + next);
                         let _ = writer_tx.try_send(PeerMessage::ScheduleKeepalive);
-                        tracing::debug!("peer_reader[{}]: no reply from {:02x?} in {}ms, probe {}/{}",
-                            peer_id, hex::encode(&peer_key[..8]), peer_timeout.as_millis(),
-                            probes_sent, peer_probe_count);
-                        peer_timeout
+                        tracing::debug!(
+                            peer_id,
+                            peer = %hex::encode(&peer_key[..4]),
+                            interval_ms = next.as_millis() as u64,
+                            probes_sent,
+                            probe_count = peer_probe_count,
+                            "peer liveness interval miss — probing"
+                        );
+                        next
                     }
                 };
 
@@ -470,9 +486,11 @@ pub(crate) async fn peer_reader(
             break;
         };
 
-        // Any received frame clears the deadline (peer is alive) and forgives
-        // whatever probes it took to get here.
-        *read_deadline.lock().unwrap() = None;
+        // Any received frame clears the deadline, updates EWMA, and forgives probes.
+        {
+            let mut dl = read_deadline.lock().unwrap();
+            liveness.clear_on_reply(&mut dl);
+        }
         probes_sent = 0;
         last_recv = Some(std::time::Instant::now());
 
@@ -678,21 +696,26 @@ pub(crate) async fn peer_reader(
             _ => "io",
         };
         let last_write_at = *last_write.lock().unwrap();
+        let interval_ms = liveness
+            .last_armed_timeout()
+            .unwrap_or_else(|| liveness.current())
+            .as_millis();
+        let err_s = err.to_string();
         tracing::info!(
-            "peer_reader[{}]: disconnect from {} reason={} error=\"{}\" budget={}x{}ms probes_sent={} last_rx={} last_rx_type={} last_tx={}",
+            "peer_reader[{}]: disconnect from {} reason={} error=\"{}\" budget={}x{}ms probes_sent={} last_rx={} last_rx_type={} last_tx={} degraded={}",
             peer_id,
             hex::encode(&peer_key[..8]),
             reason,
-            err,
+            err_s,
             peer_probe_count,
-            peer_timeout.as_millis(),
+            interval_ms,
             probes_sent,
             age_of(&last_recv),
-            match last_recv_type {
-                Some(t) => format!("{:?}", t),
-                None => "none".to_string(),
-            },
+            last_recv_type
+                .map(|t| format!("{:?}", t))
+                .unwrap_or_else(|| "none".to_string()),
             age_of(&last_write_at),
+            liveness.is_degraded(),
         );
     }
 
@@ -730,11 +753,10 @@ const MAX_DRAIN_PER_ITER: usize = 96;
 /// Arm the peer read deadline unless it is already armed.
 /// Matches Go's `if m.deadlined { return }` check — once armed, the deadline
 /// stays until the reader clears it on receiving any frame.
-fn arm_read_deadline(read_deadline: &ReadDeadline, peer_timeout: Duration) {
+fn arm_read_deadline(read_deadline: &ReadDeadline, liveness: &PeerTimeoutCtrl) {
     let mut dl = read_deadline.lock().unwrap();
-    if dl.is_none() {
-        *dl = Some(std::time::Instant::now() + peer_timeout);
-    }
+    // PeerTimeoutCtrl::arm is one-shot: leaves epoch unchanged if already armed.
+    liveness.arm(&mut dl);
 }
 
 /// Outcome of one traffic-drain pass.
@@ -868,7 +890,7 @@ pub(crate) async fn peer_writer(
     router: RouterHandle,
     peers: Arc<tokio::sync::Mutex<Peers>>,
     _keepalive_delay: Duration,
-    peer_timeout: Duration,
+    liveness: Arc<PeerTimeoutCtrl>,
     read_deadline: ReadDeadline,
     last_write: LastWrite,
     cancel: CancellationToken,
@@ -975,7 +997,7 @@ pub(crate) async fn peer_writer(
                     mark_written(&last_write);
 
                     if needs_deadline {
-                        arm_read_deadline(&read_deadline, peer_timeout);
+                        arm_read_deadline(&read_deadline, &liveness);
                     }
                     // This frame is itself the answer the peer is waiting for.
                     keepalive_owed = false;
@@ -1036,7 +1058,7 @@ pub(crate) async fn peer_writer(
             // Traffic has now reached the transport, so start the peer's
             // response budget from here rather than from when we buffered it.
             if drained.wrote {
-                arm_read_deadline(&read_deadline, peer_timeout);
+                arm_read_deadline(&read_deadline, &liveness);
                 // Those frames answer the peer; no keepalive needed on top.
                 keepalive_owed = false;
             }

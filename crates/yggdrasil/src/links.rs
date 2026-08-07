@@ -393,6 +393,9 @@ pub struct LinkPeerInfo {
     pub latency_ms: f64,
     pub cost: u64,
     pub last_error: Option<String>,
+    pub liveness_timeout_ms: u64,
+    pub liveness_degraded: bool,
+    pub liveness_ewma_ms: u64,
 }
 
 /// Fired when a peer connection is established or lost.
@@ -554,6 +557,10 @@ impl ActiveLinks {
                 latency_ms: 0.0,
                 cost: 0,
                 last_error: None,
+                // Filled from ironwood liveness snapshot in Core::get_peers.
+                liveness_timeout_ms: 0,
+                liveness_degraded: false,
+                liveness_ewma_ms: 0,
             })
             .collect()
     }

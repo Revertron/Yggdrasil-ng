@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::crypto::PublicKey;
+use crate::peer_timeout::AdaptiveTimeoutConfig;
 
 /// Configuration for an ironwood PacketConn.
 pub struct Config {
@@ -11,20 +12,17 @@ pub struct Config {
     pub router_timeout: Duration,
     /// Delay before sending a keepalive to idle peer. Default: 1 second.
     pub peer_keepalive_delay: Duration,
-    /// How long a peer may stay silent, after we sent it something that expects
-    /// an answer, before we probe it. Default: 3 seconds.
-    pub peer_timeout: Duration,
-    /// How many consecutive `peer_timeout` intervals of silence a peer is
-    /// allowed before it is declared dead, so it is torn down after
-    /// `peer_timeout * peer_probe_count`. A keepalive probe is sent at the end
-    /// of every interval but the last. Default: 3, i.e. 9 seconds at the
-    /// default interval.
+    /// Peer liveness deadline policy (fixed or adaptive interval).
+    /// See [`AdaptiveTimeoutConfig`]. Each armed interval is one "probe slot";
+    /// see [`Self::peer_probe_count`].
+    pub peer_timeout_cfg: AdaptiveTimeoutConfig,
+    /// How many consecutive liveness intervals of silence a peer is allowed
+    /// before it is declared dead. A keepalive probe is sent at the end of
+    /// every interval but the last. Default: 3.
     ///
-    /// Retrying rather than dropping on the first expiry is what makes lossy or
-    /// high-RTT paths usable: a single lost segment head-of-line blocks a TCP
-    /// stream for seconds while the kernel backs off its retransmits, and a flat
-    /// deadline shorter than that recovery tears down links TCP would have
-    /// healed. A value of 1 restores the old drop-on-first-expiry behaviour.
+    /// Total silence budget ≈ `current_interval * peer_probe_count` (interval
+    /// may grow under adaptive Degraded mode). A value of 1 restores
+    /// drop-on-first-expiry behaviour.
     pub peer_probe_count: u32,
     /// Maximum size of a single peer message. Default: 1 MB.
     pub peer_max_message_size: u64,
@@ -48,7 +46,7 @@ impl Default for Config {
             router_refresh: Duration::from_secs(4 * 60),
             router_timeout: Duration::from_secs(5 * 60),
             peer_keepalive_delay: Duration::from_secs(1),
-            peer_timeout: Duration::from_secs(3),
+            peer_timeout_cfg: AdaptiveTimeoutConfig::default(),
             peer_probe_count: 3,
             peer_max_message_size: 1024 * 1024,
             bloom_transform: None,
@@ -76,12 +74,26 @@ impl Config {
         self
     }
 
+    /// Fixed peer liveness interval (disables adaptive sizing).
     pub fn with_peer_timeout(mut self, d: Duration) -> Self {
-        self.peer_timeout = d;
+        self.peer_timeout_cfg.adaptive = false;
+        self.peer_timeout_cfg.fixed_or_initial = d;
         self
     }
 
-    /// Set how many `peer_timeout` intervals may be missed before disconnecting.
+    /// Full adaptive / fixed liveness policy for the per-interval deadline.
+    pub fn with_peer_timeout_cfg(mut self, cfg: AdaptiveTimeoutConfig) -> Self {
+        self.peer_timeout_cfg = cfg;
+        self
+    }
+
+    /// Enable or disable adaptive peer liveness (default: enabled).
+    pub fn with_peer_timeout_adaptive(mut self, adaptive: bool) -> Self {
+        self.peer_timeout_cfg.adaptive = adaptive;
+        self
+    }
+
+    /// Set how many liveness intervals may be missed before disconnecting.
     /// Clamped to at least 1, since zero probes would drop every peer instantly.
     pub fn with_peer_probe_count(mut self, n: u32) -> Self {
         self.peer_probe_count = n.max(1);

@@ -1,6 +1,7 @@
 pub mod types;
 pub mod config;
 pub mod core;
+pub mod peer_timeout;
 
 pub(crate) mod crypto;
 pub(crate) mod wire;
@@ -18,3 +19,6 @@ pub use crate::encrypted::{new_encrypted_packet_conn, EncryptedPacketConn, Sessi
 pub use crate::signed::{new_signed_packet_conn, SignedPacketConn};
 pub use crate::types::{Addr, Error, PacketConn, Result};
 pub use crate::config::Config;
+pub use crate::peer_timeout::{
+    AdaptiveTimeoutConfig, LivenessSnapshot, PeerLivenessRegistry, PeerTimeoutCtrl,
+};

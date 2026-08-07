@@ -100,12 +100,27 @@ All conn types accept a `Config` with builder-style methods:
 
 ```rust
 use std::time::Duration;
-use ironwood::Config;
+use ironwood::{AdaptiveTimeoutConfig, Config};
 
+// Fixed peer liveness timeout (legacy-compatible).
 let config = Config::default()
-    .with_peer_timeout(Duration::from_secs(5))
+    .with_peer_timeout(Duration::from_secs(15))
     .with_path_timeout(Duration::from_secs(120))
     .with_peer_max_message_size(2 * 1024 * 1024);
+
+// Or full adaptive dual-mode policy (Normal min / Degraded problem_min floors).
+let adaptive = AdaptiveTimeoutConfig {
+    fixed_or_initial: Duration::from_secs(15),
+    adaptive: true,
+    min: Duration::from_secs(5),
+    problem_min: Duration::from_secs(15),
+    max: Duration::from_secs(30),
+    base: Duration::from_secs(2),
+    rtt_mult: 8,
+    ..AdaptiveTimeoutConfig::default()
+};
+adaptive.validate().expect("peer timeout config");
+let config = Config::default().with_peer_timeout_cfg(adaptive);
 ```
 
 | Option | Default | Description |
@@ -113,12 +128,29 @@ let config = Config::default()
 | `router_refresh` | 4 min | How often to refresh tree announcements |
 | `router_timeout` | 5 min | Timeout before expiring a peer's tree info |
 | `peer_keepalive_delay` | 1 sec | Delay before sending keepalive to idle peer |
-| `peer_timeout` | 3 sec | Timeout before considering a peer dead |
+| `peer_timeout_cfg` | adaptive dual-mode | Peer liveness deadline policy (see below) |
 | `peer_max_message_size` | 1 MB | Maximum size of a single wire message |
 | `path_timeout` | 1 min | Timeout before expiring a cached path |
 | `path_throttle` | 1 sec | Minimum interval between lookups to the same destination |
 | `bloom_transform` | None | Transform applied to keys before bloom filter insertion |
 | `path_notify` | None | Callback invoked when a new path is discovered |
+
+### Peer liveness (`peer_timeout_cfg`)
+
+After a non-keepalive send, ironwood arms a read deadline. If no frame arrives in time, the link is torn down (`Error::Timeout`).
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `fixed_or_initial` | 15 s | Cold-start / fixed-mode timeout; also used as `problem_min` floor when set by yggdrasil |
+| `adaptive` | true | `false` → always use `fixed_or_initial` |
+| `min` | 5 s | Normal-mode floor (good path can learn down to this) |
+| `problem_min` | 15 s | Degraded-mode floor after a real timeout |
+| `max` | 30 s | Hard ceiling |
+| `base` | 2 s | Added to `rtt_mult * EWMA` when computing |
+| `rtt_mult` | 8 | Multiplier on arm→reply EWMA |
+| `recover` | 600 s | Quiet time before leaving Degraded for Normal |
+
+Degraded mode is entered **only** on a real liveness timeout, never on a slow-but-successful sample. Mode and EWMA/penalty state are keyed by peer public key and **survive reconnects** via `PeerLivenessRegistry`. `get_peers()` exposes `liveness_timeout_ms`, `liveness_degraded`, and `liveness_ewma_ms`.
 
 ## Transports
 
