@@ -349,6 +349,11 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
         }
     }
 
+    // Sort once here so each subtract_many can binary-search instead of
+    // scanning the whole exclude list.
+    sort_excludes(&mut v4_exc);
+    sort_excludes(&mut v6_exc);
+
     let mut out = Vec::new();
     for inc in v4_inc {
         out.extend(subtract_many(inc, &v4_exc));
@@ -361,9 +366,54 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
 
 /// Subtract a set of exclude prefixes from a single include prefix.
 /// All prefixes must share an address family.
+///
+/// `excludes` must be sorted by network address (see `sort_excludes`), which
+/// lets this skip straight to the excludes that can intersect `include`.
+/// Scanning the whole list per include was O(includes × excludes) overall.
 fn subtract_many(include: IpNet, excludes: &[IpNet]) -> Vec<IpNet> {
     let mut pieces = vec![include];
-    for ex in excludes {
+
+    // An exclude that starts before `include` can still cover it, but only if
+    // it is one of the prefixes containing include.network() — at most 33
+    // (IPv4) / 129 (IPv6) of them, one per prefix length. Look those up
+    // directly; everything else that can intersect starts inside `include` and
+    // forms a contiguous run found by binary search.
+    let start = excludes.partition_point(|e| e.network() < include.network());
+    let max_len = match include {
+        IpNet::V4(_) => 32u8,
+        IpNet::V6(_) => 128u8,
+    };
+    for len in 0..=max_len {
+        let Ok(super_net) = IpNet::new(include.network(), len) else {
+            continue;
+        };
+        let super_net = super_net.trunc();
+        if super_net.network() >= include.network() {
+            continue; // handled by the sorted run below
+        }
+        // Binary-search this exact supernet among the excludes.
+        if excludes[..start]
+            .binary_search_by(|e| {
+                e.network()
+                    .cmp(&super_net.network())
+                    .then(e.prefix_len().cmp(&super_net.prefix_len()))
+            })
+            .is_ok()
+        {
+            // A containing exclude drops the include entirely.
+            return Vec::new();
+        }
+    }
+
+    for ex in &excludes[start..] {
+        if pieces.is_empty() {
+            break;
+        }
+        // Past the end of `include`: this exclude starts after it and, since
+        // the list is sorted by network address, so does everything after.
+        if ex.network() > include.network() && !include.contains(&ex.network()) {
+            break;
+        }
         let mut next = Vec::with_capacity(pieces.len());
         for p in pieces {
             if ex.contains(&p) {
@@ -378,6 +428,18 @@ fn subtract_many(include: IpNet, excludes: &[IpNet]) -> Vec<IpNet> {
         pieces = next;
     }
     pieces
+}
+
+/// Order excludes by network address so `subtract_many` can binary-search.
+/// Ties (same network, different prefix length) put the shorter — i.e. the
+/// larger, more general — prefix first, so a covering exclude is applied
+/// before the more specific ones nested inside it.
+fn sort_excludes(list: &mut [IpNet]) {
+    list.sort_by(|a, b| {
+        a.network()
+            .cmp(&b.network())
+            .then(a.prefix_len().cmp(&b.prefix_len()))
+    });
 }
 
 /// Subtract `b` from `a`, requiring `a.contains(&b)` and `a != b`.
@@ -1755,5 +1817,86 @@ mod tests {
         let expanded = expand_cidrs(&virtual_entries).unwrap();
         assert!(expanded.iter().any(|p| p.to_string() == "10.0.0.0/24"));
         assert!(expanded.iter().any(|p| p.to_string() == "192.168.0.0/16"));
+    }
+
+    /// Linear reference implementation of subtract_many (the old O(I×E) version).
+    /// Used only by the exhaustive equivalence test.
+    fn subtract_many_reference(include: IpNet, excludes: &[IpNet]) -> Vec<IpNet> {
+        let mut pieces = vec![include];
+        for ex in excludes {
+            let mut next = Vec::with_capacity(pieces.len());
+            for p in pieces {
+                if ex.contains(&p) {
+                    // fully covered → drop
+                } else if p.contains(ex) {
+                    next.extend(subtract_one(p, *ex));
+                } else {
+                    next.push(p);
+                }
+            }
+            pieces = next;
+        }
+        pieces
+    }
+
+    #[test]
+    fn test_subtract_many_matches_reference_exhaustively() {
+        let includes: Vec<IpNet> = [
+            "10.0.0.0/8",
+            "10.0.0.0/24",
+            "10.0.1.0/24",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "0.0.0.0/0",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+
+        let exclude_pool: Vec<IpNet> = [
+            "9.0.0.0/8",        // entirely before
+            "10.0.0.0/9",       // covers part
+            "10.0.0.0/25",      // nested
+            "10.0.0.128/25",    // sibling
+            "10.0.0.5/32",      // single host
+            "10.0.1.128/25",    // in a different include
+            "10.128.0.0/9",     // upper half
+            "172.16.5.0/24",    // inside 172.16/12
+            "192.168.1.0/24",   // inside 192.168/16
+            "193.0.0.0/8",      // entirely after
+            "10.0.0.0/8",       // equals one include
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+
+        // Every non-empty subset up to size 5, in the pool's original order.
+        let n = exclude_pool.len();
+        let mut checked = 0usize;
+        for mask in 1u32..(1 << n) {
+            if (mask.count_ones() as usize) > 5 {
+                continue;
+            }
+            let subset: Vec<IpNet> = (0..n)
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| exclude_pool[i])
+                .collect();
+
+            for inc in &includes {
+                let mut sorted = subset.clone();
+                sort_excludes(&mut sorted);
+                let mut got = subtract_many(*inc, &sorted);
+                let mut want = subtract_many_reference(*inc, &subset);
+                got.sort_by(|a, b| a.network().cmp(&b.network()).then(a.prefix_len().cmp(&b.prefix_len())));
+                want.sort_by(|a, b| a.network().cmp(&b.network()).then(a.prefix_len().cmp(&b.prefix_len())));
+                assert_eq!(
+                    got, want,
+                    "mismatch for include {} with excludes {:?}",
+                    inc, subset
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 5000, "expected a broad sweep, only checked {}", checked);
     }
 }
