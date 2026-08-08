@@ -62,8 +62,9 @@ impl Core {
         let path_notify_slot: PathNotifySlot = Arc::new(std::sync::Mutex::new(None));
         let slot_clone = path_notify_slot.clone();
 
-        // Peer liveness: Normal (min) / Degraded (problem_min=peer_timeout_secs).
+        // Peer liveness interval: sticky floor after real timeout (no mode thrash).
         // Fixed mode: peer_timeout_adaptive = false → always peer_timeout_secs.
+        // Total silence ≈ interval × ironwood peer_probe_count (default 3).
         use ironwood::AdaptiveTimeoutConfig;
         use std::time::Duration;
         let peer_timeout_cfg = AdaptiveTimeoutConfig {
@@ -76,7 +77,6 @@ impl Core {
             rtt_mult: config.peer_timeout_rtt_mult,
             penalty_step: Duration::from_secs(5),
             penalty_decay: Duration::from_millis(500),
-            recover: Duration::from_secs(config.peer_timeout_recover_secs),
         };
         if let Err(e) = peer_timeout_cfg.validate() {
             panic!("invalid peer timeout config: {e}");
@@ -85,6 +85,7 @@ impl Core {
         // Create ironwood config with bloom transform and path notify
         let iw_config = IwConfig::default()
             .with_peer_timeout_cfg(peer_timeout_cfg)
+            .with_peer_probe_count(config.peer_probe_count)
             .with_bloom_transform(|key: [u8; 32]| -> [u8; 32] {
                 let subnet = subnet_for_key(&key);
                 subnet.get_key()

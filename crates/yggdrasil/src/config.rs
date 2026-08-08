@@ -112,24 +112,25 @@ pub struct Config {
     #[serde(default)]
     pub group_password: String,
 
-    /// Peer liveness:
-    /// - fixed mode (`peer_timeout_adaptive = false`): always this many seconds;
-    /// - adaptive Degraded floor / problem_min (seconds). Default: 15.
+    /// Peer liveness interval (seconds):
+    /// - fixed mode (`peer_timeout_adaptive = false`): exact interval;
+    /// - adaptive: sticky floor after a real liveness timeout (`problem_min`).
+    /// Default: 15. Total silence budget ≈ interval × `peer_probe_count`.
     #[serde(default = "default_peer_timeout_secs")]
     pub peer_timeout_secs: u64,
 
-    /// When true (default): Normal/Degraded adaptive sizing.
-    /// Degraded is entered only on a real liveness timeout (not slow samples);
-    /// state is per peer public key and survives reconnects.
-    /// When false: always `peer_timeout_secs`.
+    /// When true (default): adaptive interval with sticky floor (raised to
+    /// `peer_timeout_secs` after timeout; does not snap back to min).
+    /// When false: always `peer_timeout_secs` per interval.
     #[serde(default = "default_true")]
     pub peer_timeout_adaptive: bool,
 
-    /// Adaptive Normal-mode floor (seconds). Default: 5.
+    /// Adaptive healthy floor for the interval (seconds). Default: 5.
+    /// With default `peer_probe_count=3`, cold total silence ≈ 15s.
     #[serde(default = "default_peer_timeout_min_secs")]
     pub peer_timeout_min_secs: u64,
 
-    /// Adaptive ceiling (seconds). Default: 30.
+    /// Adaptive interval ceiling (seconds). Default: 30.
     #[serde(default = "default_peer_timeout_max_secs")]
     pub peer_timeout_max_secs: u64,
 
@@ -141,9 +142,10 @@ pub struct Config {
     #[serde(default = "default_peer_timeout_rtt_mult")]
     pub peer_timeout_rtt_mult: u32,
 
-    /// Seconds of healthy operation before leaving Degraded → Normal. Default: 600.
-    #[serde(default = "default_peer_timeout_recover_secs")]
-    pub peer_timeout_recover_secs: u64,
+    /// Consecutive silent intervals before disconnect (ironwood probes).
+    /// Default: 3. Keepalive probe between misses; any frame resets the count.
+    #[serde(default = "default_peer_probe_count")]
+    pub peer_probe_count: u32,
 }
 
 /// Built-in stateful firewall configuration. Default-off; when enabled,
@@ -285,8 +287,8 @@ fn default_peer_timeout_rtt_mult() -> u32 {
     8
 }
 
-fn default_peer_timeout_recover_secs() -> u64 {
-    600
+fn default_peer_probe_count() -> u32 {
+    3
 }
 
 impl Default for Config {
@@ -313,7 +315,7 @@ impl Default for Config {
             peer_timeout_max_secs: default_peer_timeout_max_secs(),
             peer_timeout_base_secs: default_peer_timeout_base_secs(),
             peer_timeout_rtt_mult: default_peer_timeout_rtt_mult(),
-            peer_timeout_recover_secs: default_peer_timeout_recover_secs(),
+            peer_probe_count: default_peer_probe_count(),
         }
     }
 }

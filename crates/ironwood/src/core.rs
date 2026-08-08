@@ -597,6 +597,9 @@ impl PacketConnImpl {
         let pub_key = crypto.public_key;
         let router = Router::new(crypto, &config);
         let peers = Arc::new(Mutex::new(Peers::new()));
+        if let Err(e) = config.peer_timeout_cfg.validate() {
+            panic!("invalid peer_timeout_cfg: {e}");
+        }
         let liveness = Arc::new(crate::peer_timeout::PeerLivenessRegistry::new(
             config.peer_timeout_cfg.clone(),
         ));

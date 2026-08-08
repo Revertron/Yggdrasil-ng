@@ -70,14 +70,13 @@ if_mtu = 65535
 # If the remote sends no frame before the deadline, the link is torn down
 # (`ironwood: operation timed out`).
 #
-# Adaptive mode (default) — two floors:
-#   Normal:   floor = peer_timeout_min_secs (default 5)  — stable / DC links
-#   Degraded: floor = peer_timeout_secs     (default 15) — entered ONLY after a
-#             real liveness timeout (slow samples only update EWMA, no degrade);
-#             recovers after peer_timeout_recover_secs of quiet + low penalty
-#   timeout = clamp(base + rtt_mult * ewma(arm→reply) + penalty, floor, max)
-#   Enter/leave Degraded is logged once at INFO (no spam).
-#   Mode/penalty/EWMA are per peer public key and survive reconnects.
+# Adaptive mode (default) — sticky floor (no thrash back to min):
+#   healthy floor = peer_timeout_min_secs (default 5)
+#   after a real liveness timeout, floor rises to peer_timeout_secs (default 15)
+#     and stays there for that peer public key (survives reconnects)
+#   interval T = clamp(base + rtt_mult * ewma(arm→reply) + penalty, floor, max)
+#   total silence ≈ T × peer_probe_count (default 3); any frame resets probe count
+#   Slow samples only update EWMA (never raise floor).
 #
 # peer_timeout_secs = 15
 # peer_timeout_adaptive = true
@@ -85,11 +84,12 @@ if_mtu = 65535
 # peer_timeout_max_secs = 30
 # peer_timeout_base_secs = 2
 # peer_timeout_rtt_mult = 8
-# peer_timeout_recover_secs = 600
+# peer_probe_count = 3
 #
-# Fixed mode:
+# Fixed mode (exact interval, still uses peer_probe_count):
 # peer_timeout_adaptive = false
 # peer_timeout_secs = 15
+# peer_probe_count = 3
 
 # Custom node info that is advertised to other nodes.
 # This can be any TOML table, e.g. { name = "my-node", location = "earth" }

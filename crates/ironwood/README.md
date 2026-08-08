@@ -102,13 +102,14 @@ All conn types accept a `Config` with builder-style methods:
 use std::time::Duration;
 use ironwood::{AdaptiveTimeoutConfig, Config};
 
-// Fixed peer liveness timeout (legacy-compatible).
+// Fixed peer liveness interval (disables adaptive sizing).
 let config = Config::default()
     .with_peer_timeout(Duration::from_secs(15))
+    .with_peer_probe_count(3)
     .with_path_timeout(Duration::from_secs(120))
     .with_peer_max_message_size(2 * 1024 * 1024);
 
-// Or full adaptive dual-mode policy (Normal min / Degraded problem_min floors).
+// Adaptive sticky floor: cold min=5s, after timeout floor sticks at problem_min=15s.
 let adaptive = AdaptiveTimeoutConfig {
     fixed_or_initial: Duration::from_secs(15),
     adaptive: true,
@@ -120,7 +121,9 @@ let adaptive = AdaptiveTimeoutConfig {
     ..AdaptiveTimeoutConfig::default()
 };
 adaptive.validate().expect("peer timeout config");
-let config = Config::default().with_peer_timeout_cfg(adaptive);
+let config = Config::default()
+    .with_peer_timeout_cfg(adaptive)
+    .with_peer_probe_count(3);
 ```
 
 | Option | Default | Description |
@@ -128,29 +131,31 @@ let config = Config::default().with_peer_timeout_cfg(adaptive);
 | `router_refresh` | 4 min | How often to refresh tree announcements |
 | `router_timeout` | 5 min | Timeout before expiring a peer's tree info |
 | `peer_keepalive_delay` | 1 sec | Delay before sending keepalive to idle peer |
-| `peer_timeout_cfg` | adaptive dual-mode | Peer liveness deadline policy (see below) |
+| `peer_timeout_cfg` | adaptive sticky floor | Per-interval liveness policy (see below) |
+| `peer_probe_count` | 3 | Silent intervals before disconnect; keepalive between misses |
 | `peer_max_message_size` | 1 MB | Maximum size of a single wire message |
 | `path_timeout` | 1 min | Timeout before expiring a cached path |
 | `path_throttle` | 1 sec | Minimum interval between lookups to the same destination |
 | `bloom_transform` | None | Transform applied to keys before bloom filter insertion |
 | `path_notify` | None | Callback invoked when a new path is discovered |
 
-### Peer liveness (`peer_timeout_cfg`)
+### Peer liveness (`peer_timeout_cfg` × `peer_probe_count`)
 
-After a non-keepalive send, ironwood arms a read deadline. If no frame arrives in time, the link is torn down (`Error::Timeout`).
+After a non-keepalive send, ironwood arms a read deadline for one **interval**. If the peer stays silent, intermediate misses re-arm and send a keepalive probe; only after `peer_probe_count` consecutive misses is the link torn down (`Error::Timeout`). Any frame resets the probe count.
+
+**Total silence budget ≈ current interval × peer_probe_count.**
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `fixed_or_initial` | 15 s | Cold-start / fixed-mode timeout; also used as `problem_min` floor when set by yggdrasil |
+| `fixed_or_initial` | 15 s | Exact interval when `adaptive = false` |
 | `adaptive` | true | `false` → always use `fixed_or_initial` |
-| `min` | 5 s | Normal-mode floor (good path can learn down to this) |
-| `problem_min` | 15 s | Degraded-mode floor after a real timeout |
-| `max` | 30 s | Hard ceiling |
+| `min` | 5 s | Healthy sticky floor (cold start) |
+| `problem_min` | 15 s | Floor after a real final timeout; **does not snap back** |
+| `max` | 30 s | Interval ceiling |
 | `base` | 2 s | Added to `rtt_mult * EWMA` when computing |
 | `rtt_mult` | 8 | Multiplier on arm→reply EWMA |
-| `recover` | 600 s | Quiet time before leaving Degraded for Normal |
 
-Degraded mode is entered **only** on a real liveness timeout, never on a slow-but-successful sample. Mode and EWMA/penalty state are keyed by peer public key and **survive reconnects** via `PeerLivenessRegistry`. `get_peers()` exposes `liveness_timeout_ms`, `liveness_degraded`, and `liveness_ewma_ms`.
+Floor / EWMA / penalty are keyed by peer public key and **survive reconnects**. Slow-but-successful samples only update EWMA. `get_peers()` exposes `liveness_timeout_ms`, `liveness_degraded` (floor ≥ problem_min), and `liveness_ewma_ms`.
 
 ## Transports
 
