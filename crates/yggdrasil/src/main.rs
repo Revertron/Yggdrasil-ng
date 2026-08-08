@@ -413,14 +413,16 @@ async fn run_node(
     // Cleanup
     // Remove CKR routes before TUN is destroyed (critical on Windows where
     // routes don't auto-dissolve when the interface goes away).
-    #[cfg(feature = "ckr")]
-    if config.tunnel_routing.enable && config.if_name != "none" {
-        let tun_name = if config.if_name == "auto" {
-            if cfg!(windows) { "Yggdrasil" } else { "ygg0" }
-        } else {
-            &config.if_name
-        };
-        yggdrasil::ckr::remove_routes(&config.tunnel_routing, tun_name, core.public_key());
+    // Use the name the adapter got, not a second derivation of if_name.
+    #[cfg(all(feature = "ckr", feature = "tun"))]
+    if config.tunnel_routing.enable {
+        if let Some(adapter) = tun.as_ref() {
+            yggdrasil::ckr::remove_routes(
+                &config.tunnel_routing,
+                adapter.name(),
+                core.public_key(),
+            );
+        }
     }
 
     core.close_multicast().await;

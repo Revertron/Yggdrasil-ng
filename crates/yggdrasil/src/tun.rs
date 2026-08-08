@@ -32,6 +32,8 @@ static SET_INTERFACE_DNS_PTR: OnceLock<
 /// TUN adapter: bridges a TUN network device with the IPv6 RWC.
 pub struct TunAdapter {
     device: Arc<AsyncDevice>,
+    /// Interface name assigned by the OS, which may differ from the requested one.
+    name: String,
     read_handle: tokio::task::JoinHandle<()>,
     write_handle: tokio::task::JoinHandle<()>,
 }
@@ -77,10 +79,13 @@ impl TunAdapter {
 
         // Create TUN device using tun-rs DeviceBuilder
         #[allow(unused_mut)]
-        let mut builder = tun_rs::DeviceBuilder::new()
-            .name(tun_name)
-            .ipv6(ip, 7u8)
-            .mtu(mtu);
+        let mut builder = tun_rs::DeviceBuilder::new().ipv6(ip, 7u8).mtu(mtu);
+
+        // macOS only accepts utunN names and assigns the index itself, so
+        // "auto" cannot map to a fixed name there.
+        if !(cfg!(target_os = "macos") && name == "auto") {
+            builder = builder.name(tun_name);
+        }
 
         // Assign IPv4 address to TUN if configured in CKR
         #[cfg(feature = "ckr")]
@@ -146,13 +151,14 @@ impl TunAdapter {
                 .map_err(|e| format!("failed to add IPv4 address to TUN: {}", e))?;
         }
 
-        tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, mtu);
+        let actual_name = device.name().unwrap_or_else(|_| tun_name.to_string());
+        tracing::info!("TUN device '{}' created with address {} and MTU {}", actual_name, addr, mtu);
 
         // Install CKR routes if configured
         #[cfg(feature = "ckr")]
         if let Some(ckr_cfg) = ckr_config {
             if ckr_cfg.install_system_routes {
-                if let Err(e) = crate::ckr::install_routes(ckr_cfg, tun_name, self_key) {
+                if let Err(e) = crate::ckr::install_routes(ckr_cfg, &actual_name, self_key) {
                     tracing::error!("Failed to install CKR routes: {}", e);
                 }
             }
@@ -190,9 +196,15 @@ impl TunAdapter {
 
         Ok(Self {
             device,
+            name: actual_name,
             read_handle,
             write_handle,
         })
+    }
+
+    /// Interface name assigned by the OS.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Tear down the TUN adapter explicitly: abort the I/O tasks, wait for
@@ -205,7 +217,7 @@ impl TunAdapter {
     /// the Wintun adapter isn't closed by then, it gets orphaned in the
     /// device tree and the next startup can't recreate it.
     pub async fn close(self) {
-        let TunAdapter { device, read_handle, write_handle } = self;
+        let TunAdapter { device, name: _, read_handle, write_handle } = self;
         read_handle.abort();
         write_handle.abort();
         let _ = read_handle.await;
