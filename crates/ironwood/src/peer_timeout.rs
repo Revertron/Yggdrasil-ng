@@ -284,7 +284,7 @@ impl PeerTimeoutCtrl {
     /// Liveness timeout fired. `armed_timeout` should be captured before this if logging.
     pub fn on_timeout(&self) {
         let armed_t = self.armed_timeout.lock().unwrap().take();
-        self.enter_degraded("liveness_timeout");
+        // Penalty first so enter_degraded / logs see post-timeout budget.
         let step = self.cfg.penalty_step.as_millis() as u64;
         let max_ms = self.cfg.max.as_millis() as u64;
         let _ = self.durable.penalty_ms.fetch_update(
@@ -294,6 +294,7 @@ impl PeerTimeoutCtrl {
         );
         *self.armed_at.lock().unwrap() = None;
         *self.durable.last_timeout_at.lock().unwrap() = Some(Instant::now());
+        self.enter_degraded("liveness_timeout");
         tracing::debug!(
             peer = %hex_prefix(&self.key),
             armed_timeout_ms = armed_t.map(|d| d.as_millis() as u64).unwrap_or(0),
