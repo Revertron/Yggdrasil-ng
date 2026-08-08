@@ -394,6 +394,8 @@ pub(crate) async fn peer_reader(
 
     // Consecutive deadline expiries with nothing received. Reset by any frame.
     let mut probes_sent: u32 = 0;
+    // Sum of interval lengths actually spent in silence (accurate budget log).
+    let mut silence_spent = Duration::ZERO;
     // Last frame received, for the disconnect summary.
     let mut last_recv: Option<std::time::Instant> = None;
     let mut last_recv_type: Option<wire::PacketType> = None;
@@ -436,15 +438,17 @@ pub(crate) async fn peer_reader(
                     Some(remaining) => remaining,
                     None => {
                         // The peer owes us a frame and the interval elapsed.
+                        // Count this miss toward spent silence (real wall budget).
+                        silence_spent = silence_spent.saturating_add(interval);
                         // Probe a few times before giving up: a lossy path can
                         // stall for seconds while TCP backs off its retransmits.
                         // `probes_sent` intervals already elapsed, plus this one.
                         if probes_sent + 1 >= peer_probe_count {
-                            let armed_ms = interval.as_millis() as u64;
                             tracing::debug!(
                                 peer_id,
                                 peer = %hex::encode(&peer_key[..4]),
-                                armed_timeout_ms = armed_ms,
+                                interval_ms = interval.as_millis() as u64,
+                                silence_spent_ms = silence_spent.as_millis() as u64,
                                 probe_count = peer_probe_count,
                                 probes_sent,
                                 "peer liveness deadline exhausted — disconnecting"
@@ -463,6 +467,7 @@ pub(crate) async fn peer_reader(
                             peer_id,
                             peer = %hex::encode(&peer_key[..4]),
                             interval_ms = next.as_millis() as u64,
+                            silence_spent_ms = silence_spent.as_millis() as u64,
                             probes_sent,
                             probe_count = peer_probe_count,
                             "peer liveness interval miss — probing"
@@ -492,6 +497,7 @@ pub(crate) async fn peer_reader(
             liveness.clear_on_reply(&mut dl);
         }
         probes_sent = 0;
+        silence_spent = Duration::ZERO;
         last_recv = Some(std::time::Instant::now());
 
         let frame_len = match frame_result {
@@ -696,19 +702,22 @@ pub(crate) async fn peer_reader(
             _ => "io",
         };
         let last_write_at = *last_write.lock().unwrap();
-        let interval_ms = liveness
+        let last_interval_ms = liveness
             .last_armed_timeout()
             .unwrap_or_else(|| liveness.current())
             .as_millis();
         let err_s = err.to_string();
+        // `silence_spent` sums each missed interval (accurate); `budget` is the
+        // configured shape probe_count × last known interval for ops glance.
         tracing::info!(
-            "peer_reader[{}]: disconnect from {} reason={} error=\"{}\" budget={}x{}ms probes_sent={} last_rx={} last_rx_type={} last_tx={} degraded={}",
+            "peer_reader[{}]: disconnect from {} reason={} error=\"{}\" silence_spent_ms={} budget={}x{}ms probes_sent={} last_rx={} last_rx_type={} last_tx={} degraded={}",
             peer_id,
             hex::encode(&peer_key[..8]),
             reason,
             err_s,
+            silence_spent.as_millis(),
             peer_probe_count,
-            interval_ms,
+            last_interval_ms,
             probes_sent,
             age_of(&last_recv),
             last_recv_type

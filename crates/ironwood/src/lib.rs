@@ -19,6 +19,5 @@ pub use crate::encrypted::{new_encrypted_packet_conn, EncryptedPacketConn, Sessi
 pub use crate::signed::{new_signed_packet_conn, SignedPacketConn};
 pub use crate::types::{Addr, Error, PacketConn, Result};
 pub use crate::config::Config;
-pub use crate::peer_timeout::{
-    AdaptiveTimeoutConfig, LivenessSnapshot, PeerLivenessRegistry, PeerTimeoutCtrl,
-};
+// Policy + admin snapshot are public; session controllers stay crate-private.
+pub use crate::peer_timeout::{AdaptiveTimeoutConfig, LivenessSnapshot};

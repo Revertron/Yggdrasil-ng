@@ -121,6 +121,19 @@ impl AdaptiveTimeoutConfig {
         let total = from_rtt.saturating_add(penalty_ms);
         Duration::from_millis(total.clamp(floor_ms, max_ms))
     }
+
+    /// Nominal total silence budget for `probe_count` consecutive intervals at
+    /// the given state (interval × probes). Useful for docs/ops/tests.
+    pub fn total_silence_budget(
+        &self,
+        ewma_ms: u64,
+        penalty_ms: u64,
+        floor_ms: u64,
+        probe_count: u32,
+    ) -> Duration {
+        let interval = self.compute(ewma_ms, penalty_ms, floor_ms);
+        interval.saturating_mul(probe_count.max(1) as u32)
+    }
 }
 
 /// Snapshot for admin / getPeers.
@@ -159,7 +172,7 @@ impl DurableLiveness {
 }
 
 /// Process-wide (per PacketConn) registry of durable liveness state by peer key.
-pub struct PeerLivenessRegistry {
+pub(crate) struct PeerLivenessRegistry {
     cfg: AdaptiveTimeoutConfig,
     map: Mutex<HashMap<PublicKey, Arc<DurableLiveness>>>,
 }
@@ -222,7 +235,7 @@ fn snapshot_of(cfg: &AdaptiveTimeoutConfig, d: &DurableLiveness) -> LivenessSnap
 }
 
 /// Per-connection controller (session-local arm epoch + shared durable state).
-pub struct PeerTimeoutCtrl {
+pub(crate) struct PeerTimeoutCtrl {
     cfg: AdaptiveTimeoutConfig,
     key: PublicKey,
     durable: Arc<DurableLiveness>,
@@ -514,5 +527,20 @@ mod tests {
         assert!(snap.degraded);
         assert_eq!(snap.timeout_ms, 20_000);
         assert_eq!(snap.floor_ms, 15_000);
+    }
+
+    #[test]
+    fn total_silence_budget_multiplies_interval() {
+        let cfg = AdaptiveTimeoutConfig::default();
+        // Cold floor 5s × 3 probes = 15s total.
+        assert_eq!(
+            cfg.total_silence_budget(0, 0, 5_000, 3),
+            Duration::from_secs(15)
+        );
+        // Sticky problem_min 15s × 3 = 45s.
+        assert_eq!(
+            cfg.total_silence_budget(0, 0, 15_000, 3),
+            Duration::from_secs(45)
+        );
     }
 }

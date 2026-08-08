@@ -11,8 +11,8 @@ use rand::rngs::OsRng;
 use tokio::time::timeout;
 
 use ironwood::{
-    new_encrypted_packet_conn, new_packet_conn, new_signed_packet_conn, Config, PacketConn,
-    PacketConnImpl,
+    new_encrypted_packet_conn, new_packet_conn, new_signed_packet_conn, AdaptiveTimeoutConfig,
+    Config, PacketConn, PacketConnImpl,
 };
 
 /// Connect two PacketConn nodes via a duplex stream.
@@ -454,5 +454,66 @@ async fn silent_peer_is_probed_before_disconnect() {
     assert!(
         no_retry < INTERVAL * 2,
         "single-probe peer survived {no_retry:?}, expected a prompt drop"
+    );
+}
+
+/// Adaptive sticky floor still multiplies by `peer_probe_count` for total silence.
+/// Cold floor = interval; three probes must outlast two intervals and die before
+/// a generous upper bound (scheduler slack).
+#[tokio::test]
+async fn adaptive_interval_times_probe_count_wall_time() {
+    const INTERVAL: Duration = Duration::from_millis(120);
+    const PROBES: u32 = 3;
+
+    let adaptive = AdaptiveTimeoutConfig {
+        fixed_or_initial: INTERVAL,
+        adaptive: true,
+        min: INTERVAL,
+        problem_min: INTERVAL,
+        max: Duration::from_secs(2),
+        base: Duration::ZERO,
+        rtt_mult: 1,
+        penalty_step: Duration::ZERO,
+        penalty_decay: Duration::ZERO,
+    };
+    adaptive.validate().expect("test adaptive cfg");
+
+    let config = Config::default()
+        .with_peer_timeout_cfg(adaptive)
+        .with_peer_probe_count(PROBES);
+    let node = new_packet_conn(SigningKey::generate(&mut OsRng), config);
+    let peer_addr = ironwood::Addr::from(
+        SigningKey::generate(&mut OsRng).verifying_key().to_bytes(),
+    );
+
+    let (ours, theirs) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        let mut theirs = theirs;
+        let mut buf = [0u8; 4096];
+        while tokio::io::AsyncReadExt::read(&mut theirs, &mut buf)
+            .await
+            .unwrap_or(0)
+            > 0
+        {}
+    });
+
+    let start = tokio::time::Instant::now();
+    timeout(
+        Duration::from_secs(5),
+        node.handle_conn(peer_addr, Box::new(ours), 0),
+    )
+    .await
+    .expect("adaptive peer outlived probe budget")
+    .ok();
+    let elapsed = start.elapsed();
+
+    let nominal = INTERVAL * PROBES;
+    assert!(
+        elapsed >= INTERVAL * 2,
+        "adaptive gave up after {elapsed:?}; expected at least 2×{INTERVAL:?}"
+    );
+    assert!(
+        elapsed < nominal + INTERVAL * 3,
+        "adaptive took {elapsed:?}, far beyond nominal {nominal:?}"
     );
 }

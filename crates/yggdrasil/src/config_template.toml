@@ -67,29 +67,29 @@ if_mtu = 65535
 # ---------------------------------------------------------------------------
 # Peer liveness (ironwood read-deadline after non-keepalive frames)
 # ---------------------------------------------------------------------------
-# If the remote sends no frame before the deadline, the link is torn down
-# (`ironwood: operation timed out`).
+# If the remote stays silent across `probe_count` intervals, the link is torn
+# down (`ironwood: operation timed out`). Any frame resets the probe count.
 #
-# Adaptive mode (default) — sticky floor (no thrash back to min):
-#   healthy floor = peer_timeout_min_secs (default 5)
-#   after a real liveness timeout, floor rises to peer_timeout_secs (default 15)
-#     and stays there for that peer public key (survives reconnects)
-#   interval T = clamp(base + rtt_mult * ewma(arm→reply) + penalty, floor, max)
-#   total silence ≈ T × peer_probe_count (default 3); any frame resets probe count
-#   Slow samples only update EWMA (never raise floor).
+# Adaptive (default) — sticky floor (does not snap back to min):
+#   healthy floor = min_secs (5); after timeout floor → problem_min_secs (15)
+#   interval T = clamp(base + rtt_mult * ewma + penalty, floor, max)
+#   total silence budget ≈ T × probe_count  (e.g. cold 5×3=15s, sticky 15×3=45s)
 #
-# peer_timeout_secs = 15
-# peer_timeout_adaptive = true
-# peer_timeout_min_secs = 5
-# peer_timeout_max_secs = 30
-# peer_timeout_base_secs = 2
-# peer_timeout_rtt_mult = 8
-# peer_probe_count = 3
+# [peer_liveness]
+# adaptive = true
+# fixed_secs = 15          # exact interval when adaptive = false
+# min_secs = 5             # healthy adaptive floor
+# problem_min_secs = 15    # sticky floor after real timeout (independent of fixed)
+# max_secs = 30
+# base_secs = 2
+# rtt_mult = 8
+# probe_count = 3
 #
-# Fixed mode (exact interval, still uses peer_probe_count):
-# peer_timeout_adaptive = false
-# peer_timeout_secs = 15
-# peer_probe_count = 3
+# Fixed mode:
+# [peer_liveness]
+# adaptive = false
+# fixed_secs = 15
+# probe_count = 3
 
 # Custom node info that is advertised to other nodes.
 # This can be any TOML table, e.g. { name = "my-node", location = "earth" }

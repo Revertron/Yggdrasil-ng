@@ -112,40 +112,64 @@ pub struct Config {
     #[serde(default)]
     pub group_password: String,
 
-    /// Peer liveness interval (seconds):
-    /// - fixed mode (`peer_timeout_adaptive = false`): exact interval;
-    /// - adaptive: sticky floor after a real liveness timeout (`problem_min`).
-    /// Default: 15. Total silence budget ≈ interval × `peer_probe_count`.
-    #[serde(default = "default_peer_timeout_secs")]
-    pub peer_timeout_secs: u64,
+    /// Peer liveness / ironwood read-deadline policy.
+    /// Total silence budget ≈ current interval × `probe_count`.
+    #[serde(default)]
+    pub peer_liveness: PeerLivenessConfig,
+}
 
-    /// When true (default): adaptive interval with sticky floor (raised to
-    /// `peer_timeout_secs` after timeout; does not snap back to min).
-    /// When false: always `peer_timeout_secs` per interval.
+/// Nested `[peer_liveness]` table — one subsystem, one object (matches ironwood
+/// [`ironwood::AdaptiveTimeoutConfig`] + probe count).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerLivenessConfig {
+    /// When true (default): adaptive sticky floor. When false: exact `fixed_secs`.
     #[serde(default = "default_true")]
-    pub peer_timeout_adaptive: bool,
+    pub adaptive: bool,
+
+    /// Exact interval when `adaptive = false` (seconds). Default: 15.
+    #[serde(default = "default_peer_liveness_fixed_secs")]
+    pub fixed_secs: u64,
 
     /// Adaptive healthy floor for the interval (seconds). Default: 5.
-    /// With default `peer_probe_count=3`, cold total silence ≈ 15s.
-    #[serde(default = "default_peer_timeout_min_secs")]
-    pub peer_timeout_min_secs: u64,
+    /// With default `probe_count=3`, cold total silence ≈ 15s.
+    #[serde(default = "default_peer_liveness_min_secs")]
+    pub min_secs: u64,
+
+    /// Sticky floor after a real liveness timeout (seconds). Default: 15.
+    /// Independent of `fixed_secs` so fixed-mode value and sticky floor can differ.
+    #[serde(default = "default_peer_liveness_problem_min_secs")]
+    pub problem_min_secs: u64,
 
     /// Adaptive interval ceiling (seconds). Default: 30.
-    #[serde(default = "default_peer_timeout_max_secs")]
-    pub peer_timeout_max_secs: u64,
+    #[serde(default = "default_peer_liveness_max_secs")]
+    pub max_secs: u64,
 
-    /// Adaptive: base seconds added to RTT estimate. Default: 2.
-    #[serde(default = "default_peer_timeout_base_secs")]
-    pub peer_timeout_base_secs: u64,
+    /// Base seconds added to RTT estimate. Default: 2.
+    #[serde(default = "default_peer_liveness_base_secs")]
+    pub base_secs: u64,
 
-    /// Adaptive: multiplier for EWMA(arm→reply). Default: 8.
-    #[serde(default = "default_peer_timeout_rtt_mult")]
-    pub peer_timeout_rtt_mult: u32,
+    /// Multiplier for EWMA(arm→reply). Default: 8.
+    #[serde(default = "default_peer_liveness_rtt_mult")]
+    pub rtt_mult: u32,
 
-    /// Consecutive silent intervals before disconnect (ironwood probes).
-    /// Default: 3. Keepalive probe between misses; any frame resets the count.
-    #[serde(default = "default_peer_probe_count")]
-    pub peer_probe_count: u32,
+    /// Consecutive silent intervals before disconnect. Default: 3.
+    #[serde(default = "default_peer_liveness_probe_count")]
+    pub probe_count: u32,
+}
+
+impl Default for PeerLivenessConfig {
+    fn default() -> Self {
+        Self {
+            adaptive: true,
+            fixed_secs: default_peer_liveness_fixed_secs(),
+            min_secs: default_peer_liveness_min_secs(),
+            problem_min_secs: default_peer_liveness_problem_min_secs(),
+            max_secs: default_peer_liveness_max_secs(),
+            base_secs: default_peer_liveness_base_secs(),
+            rtt_mult: default_peer_liveness_rtt_mult(),
+            probe_count: default_peer_liveness_probe_count(),
+        }
+    }
 }
 
 /// Built-in stateful firewall configuration. Default-off; when enabled,
@@ -265,29 +289,31 @@ fn default_node_info() -> toml::Value {
     toml::Value::Table(toml::map::Map::new())
 }
 
-fn default_peer_timeout_secs() -> u64 {
-    // Degraded floor + fixed-mode value.
+fn default_peer_liveness_fixed_secs() -> u64 {
     15
 }
 
-fn default_peer_timeout_min_secs() -> u64 {
-    // Normal-mode floor (stable / DC links).
+fn default_peer_liveness_min_secs() -> u64 {
     5
 }
 
-fn default_peer_timeout_max_secs() -> u64 {
+fn default_peer_liveness_problem_min_secs() -> u64 {
+    15
+}
+
+fn default_peer_liveness_max_secs() -> u64 {
     30
 }
 
-fn default_peer_timeout_base_secs() -> u64 {
+fn default_peer_liveness_base_secs() -> u64 {
     2
 }
 
-fn default_peer_timeout_rtt_mult() -> u32 {
+fn default_peer_liveness_rtt_mult() -> u32 {
     8
 }
 
-fn default_peer_probe_count() -> u32 {
+fn default_peer_liveness_probe_count() -> u32 {
     3
 }
 
@@ -309,13 +335,7 @@ impl Default for Config {
             tunnel_routing: TunnelRoutingConfig::default(),
             firewall: FirewallConfig::default(),
             group_password: String::new(),
-            peer_timeout_secs: default_peer_timeout_secs(),
-            peer_timeout_adaptive: true,
-            peer_timeout_min_secs: default_peer_timeout_min_secs(),
-            peer_timeout_max_secs: default_peer_timeout_max_secs(),
-            peer_timeout_base_secs: default_peer_timeout_base_secs(),
-            peer_timeout_rtt_mult: default_peer_timeout_rtt_mult(),
-            peer_probe_count: default_peer_probe_count(),
+            peer_liveness: PeerLivenessConfig::default(),
         }
     }
 }

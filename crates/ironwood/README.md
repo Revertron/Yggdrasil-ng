@@ -110,17 +110,22 @@ let config = Config::default()
     .with_peer_max_message_size(2 * 1024 * 1024);
 
 // Adaptive sticky floor: cold min=5s, after timeout floor sticks at problem_min=15s.
+// Total silence ≈ interval × peer_probe_count (here 5s×3=15s cold, 15s×3=45s sticky).
 let adaptive = AdaptiveTimeoutConfig {
-    fixed_or_initial: Duration::from_secs(15),
+    fixed_or_initial: Duration::from_secs(15), // fixed mode only
     adaptive: true,
     min: Duration::from_secs(5),
-    problem_min: Duration::from_secs(15),
+    problem_min: Duration::from_secs(15), // independent sticky floor
     max: Duration::from_secs(30),
     base: Duration::from_secs(2),
     rtt_mult: 8,
     ..AdaptiveTimeoutConfig::default()
 };
 adaptive.validate().expect("peer timeout config");
+assert_eq!(
+    adaptive.total_silence_budget(0, 0, 5_000, 3),
+    Duration::from_secs(15)
+);
 let config = Config::default()
     .with_peer_timeout_cfg(adaptive)
     .with_peer_probe_count(3);

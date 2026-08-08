@@ -62,30 +62,29 @@ impl Core {
         let path_notify_slot: PathNotifySlot = Arc::new(std::sync::Mutex::new(None));
         let slot_clone = path_notify_slot.clone();
 
-        // Peer liveness interval: sticky floor after real timeout (no mode thrash).
-        // Fixed mode: peer_timeout_adaptive = false → always peer_timeout_secs.
-        // Total silence ≈ interval × ironwood peer_probe_count (default 3).
+        // Peer liveness: sticky floor after real timeout; total ≈ interval × probes.
         use ironwood::AdaptiveTimeoutConfig;
         use std::time::Duration;
+        let pl = &config.peer_liveness;
         let peer_timeout_cfg = AdaptiveTimeoutConfig {
-            fixed_or_initial: Duration::from_secs(config.peer_timeout_secs),
-            adaptive: config.peer_timeout_adaptive,
-            min: Duration::from_secs(config.peer_timeout_min_secs),
-            problem_min: Duration::from_secs(config.peer_timeout_secs),
-            max: Duration::from_secs(config.peer_timeout_max_secs),
-            base: Duration::from_secs(config.peer_timeout_base_secs),
-            rtt_mult: config.peer_timeout_rtt_mult,
+            fixed_or_initial: Duration::from_secs(pl.fixed_secs),
+            adaptive: pl.adaptive,
+            min: Duration::from_secs(pl.min_secs),
+            problem_min: Duration::from_secs(pl.problem_min_secs),
+            max: Duration::from_secs(pl.max_secs),
+            base: Duration::from_secs(pl.base_secs),
+            rtt_mult: pl.rtt_mult,
             penalty_step: Duration::from_secs(5),
             penalty_decay: Duration::from_millis(500),
         };
         if let Err(e) = peer_timeout_cfg.validate() {
-            panic!("invalid peer timeout config: {e}");
+            panic!("invalid peer_liveness config: {e}");
         }
 
         // Create ironwood config with bloom transform and path notify
         let iw_config = IwConfig::default()
             .with_peer_timeout_cfg(peer_timeout_cfg)
-            .with_peer_probe_count(config.peer_probe_count)
+            .with_peer_probe_count(pl.probe_count)
             .with_bloom_transform(|key: [u8; 32]| -> [u8; 32] {
                 let subnet = subnet_for_key(&key);
                 subnet.get_key()
