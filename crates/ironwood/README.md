@@ -23,7 +23,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use ironwood::{new_packet_conn, Addr, Config, PacketConn};
+use ironwood::{new_packet_conn, Addr, Config, PacketConn, PeerOptions};
 
 #[tokio::main]
 async fn main() {
@@ -39,8 +39,8 @@ async fn main() {
 
     let a = Arc::clone(&node_a);
     let b = Arc::clone(&node_b);
-    tokio::spawn(async move { a.handle_conn(addr_b, Box::new(stream_a), 0).await });
-    tokio::spawn(async move { b.handle_conn(addr_a, Box::new(stream_b), 0).await });
+    tokio::spawn(async move { a.handle_conn(addr_b, Box::new(stream_a), PeerOptions::default()).await });
+    tokio::spawn(async move { b.handle_conn(addr_a, Box::new(stream_b), PeerOptions::default()).await });
 
     // After tree convergence (~2s), send packets by public key
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -132,6 +132,18 @@ Ironwood is transport-agnostic. Any type implementing `AsyncRead + AsyncWrite + 
 - Unix sockets
 
 Each call to `handle_conn()` blocks until the peer disconnects, so it should be spawned as a separate task.
+
+`handle_conn()` takes a `PeerOptions`:
+
+- `prio` — link priority; the lowest wins when several links share a peer key.
+- `isolated` — keep the link out of the spanning tree. An isolated peer is never
+  adopted as our parent and is never granted a `SigRes` making us its parent, so it
+  can never be *on tree*. Consequently no bloom filters are exchanged over the link
+  and the peer's bloom is never redistributed, meaning the link can appear and
+  disappear without causing tree churn anywhere in the network. Forwarding is
+  unaffected — traffic still routes over the link normally. Because an isolated peer
+  gets no tree parent from us, such a link is supplementary: a node reachable only
+  through an isolated link will not be reachable through this node.
 
 ## How routing works
 

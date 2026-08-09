@@ -12,7 +12,7 @@ use tokio::time::timeout;
 
 use ironwood::{
     new_encrypted_packet_conn, new_packet_conn, new_signed_packet_conn, Config, PacketConn,
-    PacketConnImpl,
+    PacketConnImpl, PeerOptions,
 };
 
 /// Connect two PacketConn nodes via a duplex stream.
@@ -30,10 +30,10 @@ async fn connect_nodes(
     let b2 = Arc::clone(b);
 
     let ha = tokio::spawn(async move {
-        let _ = a2.handle_conn(addr_b, Box::new(stream_a), 0).await;
+        let _ = a2.handle_conn(addr_b, Box::new(stream_a), PeerOptions::default()).await;
     });
     let hb = tokio::spawn(async move {
-        let _ = b2.handle_conn(addr_a, Box::new(stream_b), 0).await;
+        let _ = b2.handle_conn(addr_a, Box::new(stream_b), PeerOptions::default()).await;
     });
 
     (ha, hb)
@@ -103,8 +103,8 @@ async fn connect_plain(a: &Arc<PacketConnImpl>, b: &Arc<PacketConnImpl>) {
     let addr_b = b.local_addr();
     let a2 = Arc::clone(a);
     let b2 = Arc::clone(b);
-    tokio::spawn(async move { let _ = a2.handle_conn(addr_b, Box::new(sa), 0).await; });
-    tokio::spawn(async move { let _ = b2.handle_conn(addr_a, Box::new(sb), 0).await; });
+    tokio::spawn(async move { let _ = a2.handle_conn(addr_b, Box::new(sa), PeerOptions::default()).await; });
+    tokio::spawn(async move { let _ = b2.handle_conn(addr_a, Box::new(sb), PeerOptions::default()).await; });
 }
 
 #[tokio::test]
@@ -430,7 +430,7 @@ async fn silent_peer_is_probed_before_disconnect() {
         let start = tokio::time::Instant::now();
         timeout(
             Duration::from_secs(5),
-            node.handle_conn(peer_addr, Box::new(ours), 0),
+            node.handle_conn(peer_addr, Box::new(ours), PeerOptions::default()),
         )
         .await
         .expect("peer outlived its probe budget entirely")
@@ -455,4 +455,198 @@ async fn silent_peer_is_probed_before_disconnect() {
         no_retry < INTERVAL * 2,
         "single-probe peer survived {no_retry:?}, expected a prompt drop"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Isolated links
+// ---------------------------------------------------------------------------
+
+/// Connect two nodes with an explicit `PeerOptions` on both ends, returning a
+/// handle that drops the link when cancelled.
+fn connect_with(
+    a: &Arc<PacketConnImpl>,
+    b: &Arc<PacketConnImpl>,
+    opts: PeerOptions,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let (sa, sb) = tokio::io::duplex(1 << 16);
+    let addr_a = a.local_addr();
+    let addr_b = b.local_addr();
+    let a2 = Arc::clone(a);
+    let b2 = Arc::clone(b);
+    vec![
+        tokio::spawn(async move {
+            let _ = a2.handle_conn(addr_b, Box::new(sa), opts).await;
+        }),
+        tokio::spawn(async move {
+            let _ = b2.handle_conn(addr_a, Box::new(sb), opts).await;
+        }),
+    ]
+}
+
+/// True if `node`'s view of the tree contains an edge between `x` and `y` in
+/// either direction.
+async fn has_tree_edge(node: &Arc<PacketConnImpl>, x: [u8; 32], y: [u8; 32]) -> bool {
+    node.get_tree()
+        .await
+        .iter()
+        .any(|e| (e.key == x && e.parent == y) || (e.key == y && e.parent == x))
+}
+
+/// Topology: `hub` peers normally with `a`, `c1` and `c2`; `a` additionally has
+/// isolated links to `c1` and `c2`. The isolated links must never become tree
+/// edges, must not perturb `a`'s coordinates when they flap, and must still
+/// carry traffic.
+#[tokio::test(flavor = "multi_thread")]
+async fn isolated_links_never_join_the_tree() {
+    let hub = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+    let a = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+    let c1 = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+    let c2 = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+
+    let (ka, kc1, kc2) = (a.local_addr().0, c1.local_addr().0, c2.local_addr().0);
+
+    // Normal backbone: everyone reaches the network through the hub.
+    let _b1 = connect_with(&hub, &a, PeerOptions::default());
+    let _b2 = connect_with(&hub, &c1, PeerOptions::default());
+    let _b3 = connect_with(&hub, &c2, PeerOptions::default());
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let baseline_coords = a.tree_coordinates().await;
+
+    let isolated = PeerOptions {
+        prio: 0,
+        isolated: true,
+    };
+
+    // Flap the isolated links a few times; none of it may reach the tree.
+    for round in 0..3 {
+        let l1 = connect_with(&a, &c1, isolated);
+        let l2 = connect_with(&a, &c2, isolated);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        for (label, node) in [("a", &a), ("hub", &hub), ("c1", &c1), ("c2", &c2)] {
+            assert!(
+                !has_tree_edge(node, ka, kc1).await,
+                "round {round}: {label} sees a tree edge a<->c1"
+            );
+            assert!(
+                !has_tree_edge(node, ka, kc2).await,
+                "round {round}: {label} sees a tree edge a<->c2"
+            );
+        }
+
+        assert_eq!(
+            a.tree_coordinates().await,
+            baseline_coords,
+            "round {round}: isolated links moved a's coordinates"
+        );
+
+        // Traffic over the isolated link still flows (both nodes reach the
+        // network through the hub, so a path to c1 exists; the direct link is
+        // then preferred because it is zero hops from the destination).
+        if round == 0 {
+            let c1_reader = {
+                let c1 = c1.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match c1.read_from(&mut buf).await {
+                            Ok((n, from)) if n > 0 && from.0 == ka => return buf[..n].to_vec(),
+                            Ok(_) => continue,
+                            Err(_) => return Vec::new(),
+                        }
+                    }
+                })
+            };
+            let sender = {
+                let a = a.clone();
+                let dest = c1.local_addr();
+                tokio::spawn(async move {
+                    loop {
+                        let _ = a.write_to(b"isolated-hello", &dest).await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                })
+            };
+            let got = timeout(Duration::from_secs(20), c1_reader).await;
+            sender.abort();
+            assert_eq!(
+                got.expect("timed out delivering over the isolated link")
+                    .expect("reader panicked"),
+                b"isolated-hello".to_vec()
+            );
+        }
+
+        for h in l1.into_iter().chain(l2) {
+            h.abort();
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        assert_eq!(
+            a.tree_coordinates().await,
+            baseline_coords,
+            "round {round}: dropping the isolated links moved a's coordinates"
+        );
+    }
+
+    for n in [&hub, &a, &c1, &c2] {
+        n.close().await.unwrap();
+    }
+}
+
+/// Deterministic control: `c1` and `c2` each have exactly one peer, `a`. The
+/// normal link must produce a tree edge; the isolated one must not, leaving
+/// `c1` the root of its own one-node tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn isolated_link_is_the_only_link_without_a_tree_edge() {
+    let a = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+    let c1 = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+    let c2 = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+
+    let (ka, kc1, kc2) = (a.local_addr().0, c1.local_addr().0, c2.local_addr().0);
+
+    let _isolated = connect_with(
+        &a,
+        &c1,
+        PeerOptions {
+            prio: 0,
+            isolated: true,
+        },
+    );
+    let _normal = connect_with(&a, &c2, PeerOptions::default());
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Control: the ordinary link is a tree edge in one direction or the other.
+    assert!(
+        has_tree_edge(&a, ka, kc2).await,
+        "the ordinary a<->c2 link never became a tree edge"
+    );
+
+    // The isolated link is not, from either end.
+    assert!(
+        !has_tree_edge(&a, ka, kc1).await,
+        "a sees a tree edge over the isolated link"
+    );
+    assert!(
+        !has_tree_edge(&c1, ka, kc1).await,
+        "c1 sees a tree edge over the isolated link"
+    );
+
+    // With no tree parent available, c1 roots its own tree.
+    assert!(
+        c1.tree_coordinates().await.is_empty(),
+        "c1 acquired coordinates through an isolated link"
+    );
+    assert!(
+        c1.get_tree()
+            .await
+            .iter()
+            .any(|e| e.key == kc1 && e.parent == kc1),
+        "c1 did not become its own root"
+    );
+
+    for n in [&a, &c1, &c2] {
+        n.close().await.unwrap();
+    }
 }

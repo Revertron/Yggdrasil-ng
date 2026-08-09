@@ -38,6 +38,8 @@ pub(crate) struct PeerHandle {
     pub key: PublicKey,
     pub port: PeerPort,
     pub prio: u8,
+    /// Control-plane isolation (see `types::PeerOptions::isolated`).
+    pub isolated: bool,
     pub order: u64,
     /// Channel for protocol-level frames only (announces, sig, bloom, keepalive).
     pub tx: mpsc::Sender<PeerMessage>,
@@ -55,6 +57,7 @@ impl PeerHandle {
             key: self.key,
             port: self.port,
             prio: self.prio,
+            isolated: self.isolated,
             order: self.order,
         }
     }
@@ -86,11 +89,12 @@ impl Peers {
     pub fn allocate_peer(
         &mut self,
         key: PublicKey,
-        prio: u8,
+        opts: crate::types::PeerOptions,
         tx: mpsc::Sender<PeerMessage>,
         cancel: CancellationToken,
         pmtu: u64,
     ) -> PeerHandle {
+        let crate::types::PeerOptions { prio, isolated } = opts;
         let id = self.next_id;
         self.next_id += 1;
 
@@ -117,6 +121,7 @@ impl Peers {
             key,
             port,
             prio,
+            isolated,
             order,
             tx,
             cancel,
@@ -132,6 +137,7 @@ impl Peers {
                 key,
                 port,
                 prio,
+                isolated,
                 order,
                 tx: handle.tx.clone(),
                 cancel: handle.cancel.clone(),

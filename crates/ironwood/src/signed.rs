@@ -193,9 +193,9 @@ impl crate::types::PacketConn for SignedPacketConn {
         &self,
         key: Addr,
         conn: Box<dyn crate::types::AsyncConn>,
-        prio: u8,
+        opts: crate::types::PeerOptions,
     ) -> Result<()> {
-        self.inner.handle_conn(key, conn, prio).await
+        self.inner.handle_conn(key, conn, opts).await
     }
 
     fn is_closed(&self) -> bool {

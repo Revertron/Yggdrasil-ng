@@ -196,6 +196,7 @@ async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_js
                         "address": address,
                         "subnet": subnet,
                         "priority": p.priority,
+                        "isolated": p.isolated,
                         "cost": p.cost,
                         "latency": p.latency_ms,
                         "bytes_recvd": p.rx_bytes,

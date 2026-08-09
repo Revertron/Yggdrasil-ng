@@ -11,6 +11,9 @@ const META_VERSION_MAJOR: u16 = 0;
 const META_VERSION_MINOR: u16 = 1;
 const META_PUBLIC_KEY: u16 = 2;
 const META_PRIORITY: u16 = 3;
+/// Control-plane isolation for this link. Optional: peers that predate the
+/// field simply omit it and are treated as not isolated.
+const META_ISOLATED: u16 = 4;
 
 const PREAMBLE: &[u8; 4] = b"meta";
 const SIGNATURE_SIZE: usize = 64;
@@ -40,6 +43,9 @@ pub struct Metadata {
     pub minor_ver: u16,
     pub public_key: [u8; 32],
     pub priority: u8,
+    /// This side wants the link kept out of the spanning tree. Either end
+    /// asking is enough — the flag is OR-ed after the handshake.
+    pub isolated: bool,
 }
 
 impl Default for Metadata {
@@ -49,18 +55,20 @@ impl Default for Metadata {
             minor_ver: PROTOCOL_VERSION_MINOR,
             public_key: [0u8; 32],
             priority: 0,
+            isolated: false,
         }
     }
 }
 
 impl Metadata {
     /// Create metadata for the local node.
-    pub fn new(public_key: [u8; 32], priority: u8) -> Self {
+    pub fn new(public_key: [u8; 32], priority: u8, isolated: bool) -> Self {
         Self {
             major_ver: PROTOCOL_VERSION_MAJOR,
             minor_ver: PROTOCOL_VERSION_MINOR,
             public_key,
             priority,
+            isolated,
         }
     }
 
@@ -107,6 +115,14 @@ impl Metadata {
         bs.extend_from_slice(&META_PRIORITY.to_be_bytes());
         bs.extend_from_slice(&1u16.to_be_bytes());
         bs.push(self.priority);
+
+        // Isolated flag. Only emitted when set, so the handshake stays
+        // byte-identical to older builds for ordinary links.
+        if self.isolated {
+            bs.extend_from_slice(&META_ISOLATED.to_be_bytes());
+            bs.extend_from_slice(&1u16.to_be_bytes());
+            bs.push(1);
+        }
 
         // BLAKE2b-512 hash of public key (keyed with password if non-empty)
         let hash = blake2b_hash(&self.public_key, password);
@@ -177,6 +193,12 @@ impl Metadata {
                     }
                     meta.priority = field[0];
                 }
+                META_ISOLATED => {
+                    if field_len != 1 {
+                        return Err(VersionError::InvalidLength);
+                    }
+                    meta.isolated = field[0] != 0;
+                }
                 _ => {} // skip unknown fields
             }
             pos += field_len;
@@ -229,7 +251,7 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key: [u8; 32] = signing_key.verifying_key().to_bytes();
 
-        let meta = Metadata::new(public_key, 0);
+        let meta = Metadata::new(public_key, 0, false);
         let encoded = meta.encode(&signing_key, b"");
 
         // Verify header
@@ -250,7 +272,7 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key: [u8; 32] = signing_key.verifying_key().to_bytes();
 
-        let meta = Metadata::new(public_key, 5);
+        let meta = Metadata::new(public_key, 5, false);
         let password = b"test-password";
         let encoded = meta.encode(&signing_key, password);
 
@@ -265,7 +287,7 @@ mod tests {
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key: [u8; 32] = signing_key.verifying_key().to_bytes();
 
-        let meta = Metadata::new(public_key, 0);
+        let meta = Metadata::new(public_key, 0, false);
         let encoded = meta.encode(&signing_key, b"correct");
 
         let mut cursor = std::io::Cursor::new(&encoded);
@@ -275,14 +297,90 @@ mod tests {
 
     #[test]
     fn test_check_valid() {
-        let meta = Metadata::new([1u8; 32], 0);
+        let meta = Metadata::new([1u8; 32], 0, false);
         assert!(meta.check());
     }
 
     #[test]
     fn test_check_invalid_version() {
-        let mut meta = Metadata::new([1u8; 32], 0);
+        let mut meta = Metadata::new([1u8; 32], 0, false);
         meta.major_ver = 1;
         assert!(!meta.check());
+    }
+
+    #[test]
+    fn test_isolated_roundtrip() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key: [u8; 32] = signing_key.verifying_key().to_bytes();
+
+        let meta = Metadata::new(public_key, 7, true);
+        let encoded = meta.encode(&signing_key, b"");
+
+        let mut cursor = std::io::Cursor::new(&encoded);
+        let decoded = Metadata::decode(&mut cursor, b"").unwrap();
+        assert!(decoded.isolated);
+        assert_eq!(decoded.priority, 7);
+        assert!(decoded.check());
+    }
+
+    /// A non-isolated handshake must stay byte-identical to builds that predate
+    /// the field, so the flag costs nothing on ordinary links.
+    #[test]
+    fn test_isolated_absent_is_wire_compatible() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key: [u8; 32] = signing_key.verifying_key().to_bytes();
+
+        let plain = Metadata::new(public_key, 3, false).encode(&signing_key, b"");
+        // 6-byte header + 4 TLVs (4+2, 4+2, 4+32, 4+1) + 64-byte signature
+        assert_eq!(plain.len(), 6 + 6 + 6 + 36 + 5 + 64);
+
+        let isolated = Metadata::new(public_key, 3, true).encode(&signing_key, b"");
+        assert_eq!(isolated.len(), plain.len() + 5);
+    }
+
+    /// An old peer's metadata (no field 4) decodes as not isolated.
+    #[test]
+    fn test_decode_without_isolated_field() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key: [u8; 32] = signing_key.verifying_key().to_bytes();
+
+        let encoded = Metadata::new(public_key, 0, false).encode(&signing_key, b"");
+        let mut cursor = std::io::Cursor::new(&encoded);
+        let decoded = Metadata::decode(&mut cursor, b"").unwrap();
+        assert!(!decoded.isolated);
+    }
+
+    /// A new peer's metadata must remain decodable by a parser that does not
+    /// know field 4 — emulated by injecting an unknown field id instead.
+    #[test]
+    fn test_decode_skips_unknown_trailing_field() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key: [u8; 32] = signing_key.verifying_key().to_bytes();
+
+        let mut encoded = Metadata::new(public_key, 0, true).encode(&signing_key, b"");
+        // Rewrite the isolated TLV id (last field before the 64-byte signature)
+        // to an id nobody knows; it must be skipped without error.
+        let id_at = encoded.len() - SIGNATURE_SIZE - 5;
+        encoded[id_at..id_at + 2].copy_from_slice(&999u16.to_be_bytes());
+
+        let mut cursor = std::io::Cursor::new(&encoded);
+        let decoded = Metadata::decode(&mut cursor, b"").unwrap();
+        assert!(!decoded.isolated);
+        assert!(decoded.check());
+    }
+
+    #[test]
+    fn test_decode_rejects_bad_isolated_length() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let public_key: [u8; 32] = signing_key.verifying_key().to_bytes();
+
+        let encoded = Metadata::new(public_key, 0, true).encode(&signing_key, b"");
+        let mut broken = encoded.clone();
+        // Claim a 2-byte isolated field while only 1 byte is present.
+        let len_at = broken.len() - SIGNATURE_SIZE - 3;
+        broken[len_at..len_at + 2].copy_from_slice(&2u16.to_be_bytes());
+
+        let mut cursor = std::io::Cursor::new(&broken);
+        assert!(Metadata::decode(&mut cursor, b"").is_err());
     }
 }

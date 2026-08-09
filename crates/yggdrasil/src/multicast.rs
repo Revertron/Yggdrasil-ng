@@ -692,6 +692,7 @@ async fn connect_to_peer(
         password: password.to_vec(),
         max_backoff: Duration::from_secs(0), // not used for ephemeral
         tls_sni: None,
+        isolated: false,
     };
 
     links::handle_connection(
@@ -763,6 +764,7 @@ async fn start_tls_listener(
                                     password,
                                     max_backoff: Duration::from_secs(0),
                                     tls_sni: None,
+                                    isolated: false,
                                 };
 
                                 let _ = links::handle_connection(

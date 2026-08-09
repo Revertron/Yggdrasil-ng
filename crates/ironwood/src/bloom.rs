@@ -118,6 +118,9 @@ pub(crate) struct BloomInfo {
     pub on_tree: bool,
     /// Whether we've set unnecessary 1 bits (need cleanup).
     pub z_dirty: bool,
+    /// Control-plane isolation: forces `on_tree` to stay false, so this peer
+    /// neither receives our bloom nor contributes its own to what we advertise.
+    pub isolated: bool,
 }
 
 impl BloomInfo {
@@ -128,6 +131,7 @@ impl BloomInfo {
             seq: 0,
             on_tree: false,
             z_dirty: false,
+            isolated: false,
         }
     }
 }
@@ -173,6 +177,13 @@ impl Blooms {
         self.blooms.remove(key);
     }
 
+    /// Mark a peer as control-plane isolated (or not).
+    pub fn set_isolated(&mut self, key: &PublicKey, isolated: bool) {
+        if let Some(info) = self.blooms.get_mut(key) {
+            info.isolated = isolated;
+        }
+    }
+
     /// Handle receiving a bloom filter from a peer.
     pub fn handle_bloom(&mut self, peer_key: &PublicKey, filter: BloomFilter) {
         if let Some(info) = self.blooms.get_mut(peer_key) {
@@ -195,14 +206,17 @@ impl Blooms {
             let was_on = pbi.on_tree;
             pbi.on_tree = false;
 
-            // Our parent is on tree
-            if self_parent == pk {
-                pbi.on_tree = true;
-            }
-            // Children: nodes whose parent is us
-            else if let Some(parent) = infos.get(pk) {
-                if parent == self_key {
+            // Isolated peers are never on the tree, whatever the tree says.
+            if !pbi.isolated {
+                // Our parent is on tree
+                if self_parent == pk {
                     pbi.on_tree = true;
+                }
+                // Children: nodes whose parent is us
+                else if let Some(parent) = infos.get(pk) {
+                    if parent == self_key {
+                        pbi.on_tree = true;
+                    }
                 }
             }
 

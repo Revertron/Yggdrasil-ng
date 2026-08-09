@@ -277,8 +277,8 @@ impl Core {
     }
 
     /// Handle a new peer connection (delegate to ironwood).
-    pub async fn handle_conn(&self, key: [u8; 32], conn: Box<dyn ironwood::types::AsyncConn>, priority: u8) -> Result<(), ironwood::Error> {
-        self.inner.handle_conn(Addr(key), conn, priority).await
+    pub async fn handle_conn(&self, key: [u8; 32], conn: Box<dyn ironwood::types::AsyncConn>, opts: ironwood::PeerOptions) -> Result<(), ironwood::Error> {
+        self.inner.handle_conn(Addr(key), conn, opts).await
     }
 
     /// Initialize the links with a reference to this core.
@@ -366,6 +366,7 @@ impl Core {
                     inbound: false,
                     key: [0u8; 32],
                     priority: 0,
+                    isolated: false,
                     rx_bytes: 0,
                     tx_bytes: 0,
                     rx_rate: 0,

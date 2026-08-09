@@ -21,6 +21,7 @@ private_key = "{{PRIVATE_KEY}}"
 #                      (default: 4096s ≈ 68 min, minimum: 5s)
 #   sni=HOSTNAME     - override TLS SNI hostname, useful when connecting via IP
 #                      or through a reverse proxy (TLS only)
+#   isolated=1       - keep this link out of the spanning tree (see below)
 #
 # Examples:
 #   "tcp://192.0.2.1:12345"
@@ -34,11 +35,36 @@ peers = []
 #
 # Optional query parameters:
 #   password=SECRET  - require a shared password from connecting peers (max 64 chars)
+#   isolated=1       - accept peers on this listener as isolated links (see below)
 #
 # Examples:
 #   "tcp://[::]:12345"
 #   "tls://[::]:443?password=s3cr3t"
+#   "tls://[::]:12346?isolated=1"
 listen = ["tcp://0.0.0.0:0"]
+
+# About `isolated=1`
+#
+# An isolated link never becomes a spanning tree edge: this node will not ask
+# the peer to be its parent, and will not let the peer make this node its
+# parent. Because the link is therefore never "on tree", no bloom filters are
+# exchanged over it and the peer's bloom is never redistributed to anyone else.
+# Connecting and disconnecting an isolated peer causes no tree churn anywhere
+# in the network, which is what makes it suitable for temporary or unreliable
+# links and for public ingress ports serving many short-lived third parties.
+#
+# The data plane is NOT affected: traffic is still routed over the link
+# normally, including transit traffic the peer sends. This is a routing-
+# topology feature, not a firewall.
+#
+# The flag is negotiated in the handshake, so declaring it on either end is
+# enough. Peers running builds without the flag simply omit it and are treated
+# as not isolated.
+#
+# Because an isolated peer gets no tree parent here, such a link is
+# supplementary: a node whose ONLY link is isolated will not reach the wider
+# network through this node. Run a second, non-isolated listener (optionally
+# firewalled to trusted sources) for peers that need full transit.
 
 # Listen address for the admin socket.
 # This is used by yggdrasil to query and control the node by default.

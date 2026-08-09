@@ -94,7 +94,7 @@ pub async fn run_ctl(
                 } else {
                     let header = vec![
                         "URI", "State", "Dir", "IP Address", "Latency", "Cost",
-                        "Uptime", "RX", "TX", "RX Rate", "TX Rate", "Pr", "Last Error",
+                        "Uptime", "RX", "TX", "RX Rate", "TX Rate", "Pr", "Iso", "Last Error",
                     ];
                     let rows: Vec<Vec<String>> = peers.iter().map(|peer| {
                         let uri = json_str(peer, "uri");
@@ -135,10 +135,15 @@ pub async fn run_ctl(
                             .and_then(|v| v.as_u64())
                             .map(|p| p.to_string())
                             .unwrap_or_else(|| "-".into());
+                        let isolated: String = if peer.get("isolated").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            "Yes".into()
+                        } else {
+                            "-".into()
+                        };
                         let last_error = json_str(peer, "last_error");
                         let last_error = if last_error.is_empty() { "-".into() } else { last_error };
                         vec![uri, state, dir, address, latency, cost, uptime,
-                             rx_bytes, tx_bytes, rx_rate, tx_rate, priority, last_error]
+                             rx_bytes, tx_bytes, rx_rate, tx_rate, priority, isolated, last_error]
                     }).collect();
                     print_table(&header, &rows);
                 }

@@ -78,6 +78,19 @@ pub trait AsyncConn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin
 impl<T> AsyncConn for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static
 {}
 
+/// Per-link options supplied by the transport layer when a peer connects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerOptions {
+    /// Link priority: lower wins when several links share the same peer key.
+    pub prio: u8,
+    /// Control-plane isolation. An isolated link never becomes a spanning tree
+    /// edge: we neither ask the peer to be our parent nor let it make us its
+    /// parent. As a consequence it is never `on_tree`, so no bloom filters are
+    /// exchanged over it and its bloom is never redistributed. The data plane
+    /// is unaffected — traffic is still routed over the link as usual.
+    pub isolated: bool,
+}
+
 /// The main packet connection trait.
 #[async_trait::async_trait]
 pub trait PacketConn: Send + Sync {
@@ -87,12 +100,12 @@ pub trait PacketConn: Send + Sync {
     /// Send a packet to the given address.
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize>;
 
-    /// Accept a peer connection with the given public key and priority.
+    /// Accept a peer connection with the given public key and link options.
     async fn handle_conn(
         &self,
         key: Addr,
         conn: Box<dyn AsyncConn>,
-        prio: u8,
+        opts: PeerOptions,
     ) -> Result<()>;
 
     /// Check if the connection is closed.

@@ -267,14 +267,16 @@ Both `peers` entries and `listen` addresses support optional query-string parame
 | `priority=N` | Connection priority (0-255, lower = higher priority) when multiple connections exist to the same peer | `?priority=10` |
 | `maxbackoff=DURATION` | Maximum reconnect backoff interval if the peer goes down (min 5s, default 68m) | `?maxbackoff=30s` |
 | `sni=HOSTNAME` | Override TLS SNI hostname (TLS only; ignored for plain TCP) | `?sni=example.com` |
+| `isolated=1` | Keep the link out of the spanning tree (see [Isolated links](#isolated-links)) | `?isolated=1` |
 
 **Inbound listeners** (`listen`):
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
 | `password=PASSWORD` | Require this password from connecting peers (max 64 chars) | `?password=secret` |
+| `isolated=1` | Accept every peer on this listener as an isolated link (see [Isolated links](#isolated-links)) | `?isolated=1` |
 
-Duration values for `maxbackoff` accept plain seconds (`30`) or human-readable format (`30s`, `5m`, `1h`, `1h30m`).
+Duration values for `maxbackoff` accept plain seconds (`30`) or human-readable format (`30s`, `5m`, `1h`, `1h30m`). Boolean values (`isolated`) accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`; a bare `?isolated` means true.
 
 **Example with multiple parameters:**
 
@@ -290,6 +292,52 @@ peers = [
     "tcp://peer.example.com:12345?password=mysecret",
 ]
 ```
+
+### Isolated links
+
+An **isolated** link never becomes a spanning tree edge. This node will not ask the peer to
+be its parent, and will not sign the response that would let the peer make this node its
+parent. Since the link is therefore never *on tree*:
+
+- no bloom filters are sent over it, and
+- the peer's bloom filter is never merged into what this node advertises to anyone else.
+
+Connecting or dropping an isolated peer causes **no tree churn anywhere in the network** —
+no coordinate changes, no announcement storm, no bloom recomputation. That is the point of
+the feature: temporary or unreliable links, and public ingress ports serving many
+short-lived third parties, stop rewriting global routing state every time they flap. It
+also means two isolated peers of the same node do not learn a route to each other through
+it.
+
+The **data plane is unaffected**. Traffic is still routed over the link as usual, including
+transit traffic the peer sends. This is a routing-topology feature, not a firewall — use
+the built-in firewall (`[firewall]`) or your OS packet filter if you need to restrict what
+peers may send.
+
+The flag is negotiated in the handshake (metadata field `4`), so setting it on either end
+is enough — the strictest side wins. Peers running builds without the field simply omit it
+and are treated as not isolated, so the change is backward compatible in both directions.
+
+Because an isolated peer gets no tree parent here, such a link is **supplementary**: a node
+whose only link is isolated will not reach the wider network through this node. Run a
+second, non-isolated listener for peers that need full transit — typically firewalled to
+trusted sources:
+
+```toml
+listen = [
+    # Public ingress: anyone may connect, but never disturbs the tree
+    "tls://[::]:2021?isolated=1",
+
+    # Full peering, restricted by firewall to known networks
+    "tls://[::]:2020",
+]
+```
+
+`yggdrasilctl getpeers` reports the negotiated state in the `Iso` column (`isolated` in the
+JSON output). Isolated peers show the "unknown latency" placeholder (5000ms, cost 5000)
+because round-trip time is measured from the tree signature exchange, which these links do
+not perform. This does not affect delivery over the link: the direct link is zero hops from
+its own peer and so always wins that route.
 
 ### Differences from Go Version
 

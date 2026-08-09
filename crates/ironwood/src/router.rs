@@ -124,6 +124,8 @@ pub(crate) struct PeerEntry {
     pub key: PublicKey,
     pub port: PeerPort,
     pub prio: u8,
+    /// Control-plane isolation (see `types::PeerOptions::isolated`).
+    pub isolated: bool,
     pub order: u64,
 }
 
@@ -441,6 +443,20 @@ impl Router {
             .insert(entry.id, entry);
         self.lags.insert(peer_id, UNKNOWN_LATENCY);
 
+        let isolated = self.is_isolated_key(&key);
+        self.blooms.set_isolated(&key, isolated);
+
+        // Isolated links never become tree edges: we don't ask the peer to be
+        // our parent, and (in `handle_request`) we don't let it make us its
+        // parent. Since it can then never be `on_tree`, blooms are pointless.
+        if isolated {
+            tracing::debug!(
+                "add_peer: {:?} is isolated, skipping SigReq/bloom",
+                hex::encode(&key[..8])
+            );
+            return actions;
+        }
+
         // Send sig request
         if !self.requests.contains_key(&key) {
             self.requests.insert(key, self.new_req());
@@ -467,6 +483,14 @@ impl Router {
         actions
     }
 
+    /// A peer key is isolated only if *every* live connection to it is isolated.
+    /// A single normal link to the same key restores full control-plane peering.
+    pub(crate) fn is_isolated_key(&self, key: &PublicKey) -> bool {
+        self.peers
+            .get(key)
+            .map_or(false, |ps| !ps.is_empty() && ps.values().all(|e| e.isolated))
+    }
+
     /// Remove a peer connection. Returns actions to execute.
     pub fn remove_peer(&mut self, peer_id: PeerId, key: PublicKey, port: PeerPort) -> Vec<RouterAction> {
         let mut actions = Vec::new();
@@ -487,8 +511,16 @@ impl Router {
                 self.cache.remove(&key);
                 self.blooms.remove_info(&key);
             } else {
-                // Resend bloom to remaining peers
-                if let Some(bloom) = self.blooms.get_send_bloom(&key) {
+                // Resend bloom to remaining peers, unless the key is now
+                // isolated (dropping the last normal link can flip it).
+                let isolated = !peers.is_empty() && peers.values().all(|e| e.isolated);
+                self.blooms.set_isolated(&key, isolated);
+                let bloom = if isolated {
+                    None
+                } else {
+                    self.blooms.get_send_bloom(&key)
+                };
+                if let Some(bloom) = bloom {
                     for (_, entry) in peers.iter() {
                         actions.push(RouterAction::SendBloom {
                             peer_id: entry.id,
@@ -756,6 +788,10 @@ impl Router {
             if !self.infos.contains_key(&pk) {
                 continue;
             }
+            // Never adopt an isolated peer as our parent.
+            if self.is_isolated_key(&pk) {
+                continue;
+            }
             let (p_root, p_dists) = self.get_root_and_dists(&pk);
             if p_dists.contains_key(&self_key) {
                 continue; // would loop
@@ -831,9 +867,13 @@ impl Router {
     fn send_reqs(&mut self) -> Vec<RouterAction> {
         let mut actions = Vec::new();
         self.clear_reqs();
+        // Isolated peers are skipped: without a SigReq they never send us a
+        // SigRes, so they never enter `responses` and `fix` can never adopt
+        // them as our parent.
         let peer_keys: Vec<(PublicKey, Vec<PeerId>)> = self
             .peers
             .iter()
+            .filter(|(_, ps)| ps.is_empty() || ps.values().any(|e| !e.isolated))
             .map(|(k, ps)| (*k, ps.keys().copied().collect()))
             .collect();
 

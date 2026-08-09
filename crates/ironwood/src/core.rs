@@ -376,6 +376,15 @@ async fn handle_router_msg(
             dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
         }
         RouterMsg::HandleRequest { peer_id, peer_key, req } => {
+            // Never sign a SigRes for an isolated peer: that is what would let
+            // it announce us as its parent and pull the link into the tree.
+            if router.is_isolated_key(&peer_key) {
+                tracing::debug!(
+                    "Ignoring SigReq from isolated peer {:?}",
+                    hex::encode(&peer_key[..8])
+                );
+                return;
+            }
             // Look up peer entry and compute SigRes response
             if let Some(peers_map) = router.peers.get(&peer_key) {
                 if let Some(entry) = peers_map.get(&peer_id) {
@@ -674,7 +683,7 @@ impl crate::types::PacketConn for PacketConnImpl {
         Ok(buf.len())
     }
 
-    async fn handle_conn(&self, key: Addr, conn: Box<dyn AsyncConn>, prio: u8) -> Result<()> {
+    async fn handle_conn(&self, key: Addr, conn: Box<dyn AsyncConn>, opts: crate::types::PeerOptions) -> Result<()> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
@@ -699,7 +708,7 @@ impl crate::types::PacketConn for PacketConnImpl {
             let mut peers = self.peers.lock().await;
             peers.allocate_peer(
                 peer_key,
-                prio,
+                opts,
                 writer_tx.clone(),
                 peer_cancel.clone(),
                 self.config.peer_max_message_size,

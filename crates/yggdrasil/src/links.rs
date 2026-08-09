@@ -192,6 +192,8 @@ pub struct LinkOptions {
     pub password: Vec<u8>,
     pub max_backoff: Duration,
     pub tls_sni: Option<String>,
+    /// Keep this link out of the spanning tree. See `ironwood::PeerOptions`.
+    pub isolated: bool,
 }
 
 impl Default for LinkOptions {
@@ -202,6 +204,7 @@ impl Default for LinkOptions {
             password: Vec::new(),
             max_backoff: DEFAULT_BACKOFF_LIMIT,
             tls_sni: None,
+            isolated: false,
         }
     }
 }
@@ -385,6 +388,8 @@ pub struct LinkPeerInfo {
     pub inbound: bool,
     pub key: [u8; 32],
     pub priority: u8,
+    /// Link is kept out of the spanning tree (see `ironwood::PeerOptions`).
+    pub isolated: bool,
     pub rx_bytes: usize,
     pub tx_bytes: usize,
     pub rx_rate: usize,
@@ -421,6 +426,7 @@ struct ActiveConn {
     inbound: bool,
     key: [u8; 32],
     priority: u8,
+    isolated: bool,
     rx: Arc<AtomicUsize>,
     tx: Arc<AtomicUsize>,
     rx_rate: Arc<AtomicUsize>,
@@ -443,7 +449,7 @@ impl ActiveLinks {
         }
     }
 
-    async fn register(&self, uri: String, inbound: bool, key: [u8; 32], priority: u8) -> Option<(u64, Arc<AtomicUsize>, Arc<AtomicUsize>)> {
+    async fn register(&self, uri: String, inbound: bool, key: [u8; 32], priority: u8, isolated: bool) -> Option<(u64, Arc<AtomicUsize>, Arc<AtomicUsize>)> {
         let mut inner = self.inner.lock().await;
         // Reject duplicate: same key + same direction
         if inner.connections.values().any(|c| c.key == key && c.inbound == inbound) {
@@ -460,6 +466,7 @@ impl ActiveLinks {
                 inbound,
                 key,
                 priority,
+                isolated,
                 rx: rx.clone(),
                 tx: tx.clone(),
                 rx_rate: Arc::new(AtomicUsize::new(0)),
@@ -546,6 +553,7 @@ impl ActiveLinks {
                 inbound: c.inbound,
                 key: c.key,
                 priority: c.priority,
+                isolated: c.isolated,
                 rx_bytes: c.rx.load(Ordering::Relaxed),
                 tx_bytes: c.tx.load(Ordering::Relaxed),
                 rx_rate: c.rx_rate.load(Ordering::Relaxed),
@@ -1061,7 +1069,7 @@ pub(crate) async fn handle_connection(
 
     // 6 second handshake timeout
     let result = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let meta = Metadata::new(core.public_key, options.priority);
+        let meta = Metadata::new(core.public_key, options.priority, options.isolated);
         let encoded = meta.encode(&core.signing_key, &options.password);
         stream
             .write_all(&encoded)
@@ -1198,6 +1206,8 @@ pub(crate) async fn handle_connection(
     }
 
     let priority = options.priority.max(remote_meta.priority);
+    // Either end may declare the link isolated; the strictest wins.
+    let isolated = options.isolated || remote_meta.isolated;
 
     let remote_addr = crate::address::addr_for_key(&remote_meta.public_key);
     let direction = if link_type == LinkType::Incoming {
@@ -1207,18 +1217,19 @@ pub(crate) async fn handle_connection(
     };
     let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     tracing::info!(
-        "Connected {}: {} @ {} (v{}.{})",
+        "Connected {}: {} @ {} (v{}.{}){}",
         direction,
         remote_addr,
         peer_addr,
         remote_meta.major_ver,
-        remote_meta.minor_ver
+        remote_meta.minor_ver,
+        if isolated { " [isolated]" } else { "" }
     );
 
     // Register in active links (rejects duplicate key+direction)
     let inbound = link_type == LinkType::Incoming;
     let (conn_id, rx_counter, tx_counter) = match active
-        .register(uri.to_string(), inbound, remote_meta.public_key, priority)
+        .register(uri.to_string(), inbound, remote_meta.public_key, priority, isolated)
         .await
     {
         Some(r) => r,
@@ -1232,7 +1243,14 @@ pub(crate) async fn handle_connection(
 
     // Hand off to ironwood (blocks until peer disconnects)
     let result = core
-        .handle_conn(remote_meta.public_key, Box::new(counting_stream), priority)
+        .handle_conn(
+            remote_meta.public_key,
+            Box::new(counting_stream),
+            ironwood::PeerOptions {
+                prio: priority,
+                isolated,
+            },
+        )
         .await
         .map_err(|e| format!("ironwood: {}", e));
 
@@ -1419,6 +1437,16 @@ fn parse_duration_string(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(total_secs))
 }
 
+/// Parse a boolean query-parameter value. A bare flag (`?isolated`) counts as
+/// true, matching the usual URI convention.
+fn parse_bool_string(s: &str) -> Result<bool, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "" | "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!("expected a boolean, got '{}'", other)),
+    }
+}
+
 /// Parse link options from a URL's query parameters.
 fn parse_link_options(url: &Url) -> Result<LinkOptions, String> {
     let mut opts = LinkOptions::default();
@@ -1456,6 +1484,10 @@ fn parse_link_options(url: &Url) -> Result<LinkOptions, String> {
                     ));
                 }
                 opts.max_backoff = dur;
+            }
+            "isolated" => {
+                opts.isolated = parse_bool_string(value.as_ref())
+                    .map_err(|e| format!("invalid isolated: {}", e))?;
             }
             "sni" => {
                 let sni = value.as_ref();
@@ -1505,6 +1537,40 @@ mod tests {
         assert!(parse_duration_string("abc").is_err());
         assert!(parse_duration_string("5x").is_err());
         assert!(parse_duration_string("5m30").is_err()); // trailing number without unit
+    }
+
+    #[test]
+    fn test_parse_link_options_isolated() {
+        for (query, expected) in [
+            ("?isolated=1", true),
+            ("?isolated=true", true),
+            ("?isolated=YES", true),
+            ("?isolated=on", true),
+            ("?isolated", true), // bare flag
+            ("?isolated=0", false),
+            ("?isolated=false", false),
+            ("?isolated=off", false),
+            ("", false), // absent
+        ] {
+            let url = Url::parse(&format!("tls://example.com:12345{}", query)).unwrap();
+            let opts = parse_link_options(&url).unwrap();
+            assert_eq!(opts.isolated, expected, "query {:?}", query);
+        }
+    }
+
+    #[test]
+    fn test_parse_link_options_isolated_invalid() {
+        let url = Url::parse("tls://example.com:12345?isolated=maybe").unwrap();
+        assert!(parse_link_options(&url).is_err());
+    }
+
+    #[test]
+    fn test_parse_link_options_isolated_on_listen_uri() {
+        // Listen URIs go through the same parser.
+        let url = Url::parse("tls://[::]:2021?isolated=1&password=s3cr3t").unwrap();
+        let opts = parse_link_options(&url).unwrap();
+        assert!(opts.isolated);
+        assert_eq!(opts.password, b"s3cr3t".to_vec());
     }
 
     #[test]
