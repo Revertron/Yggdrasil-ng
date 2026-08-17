@@ -6,6 +6,7 @@
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::sync::OnceLock;
@@ -255,14 +256,46 @@ async fn tun_read_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
     }
 }
 
+/// Returns true for transient TUN write failures caused by kernel buffer exhaustion
+/// (ENOBUFS / EAGAIN / WouldBlock). In these cases the packet should be dropped
+/// instead of tearing down the write path.
+fn is_tun_write_overflow(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    // Linux: ENOBUFS=105, EAGAIN=11
+    // macOS / BSD: ENOBUFS=55, EAGAIN=35
+    // Windows (WSAENOBUFS): 10055
+    matches!(err.raw_os_error(), Some(105) | Some(11) | Some(55) | Some(35) | Some(10055))
+}
+
 /// Read packets from the network (RWC) and write them straight into the TUN device.
 async fn tun_write_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
     let mut buf = vec![0u8; 65535];
+    // Rate-limit overflow warnings so a sustained overload does not flood the log.
+    let mut last_overflow_log = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
+    const OVERFLOW_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
     loop {
         match rwc.read(&mut buf).await {
             Ok(n) => {
                 tracing::debug!("TUN write {} bytes, version={:#x}", n, buf[0] >> 4);
                 if let Err(e) = device.send(&buf[..n]).await {
+                    if is_tun_write_overflow(&e) {
+                        // Drop on overflow: better to lose some packets under load
+                        // than to stop delivering traffic entirely.
+                        let now = Instant::now();
+                        if now.duration_since(last_overflow_log) >= OVERFLOW_LOG_INTERVAL {
+                            tracing::warn!(
+                                "TUN write overflow, dropping packet: {}",
+                                e
+                            );
+                            last_overflow_log = now;
+                        }
+                        continue;
+                    }
                     tracing::error!("TUN write error: {}", e);
                     return;
                 }
