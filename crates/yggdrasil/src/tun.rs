@@ -257,16 +257,27 @@ async fn tun_read_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
 }
 
 /// Returns true for transient TUN write failures caused by kernel buffer exhaustion
-/// (ENOBUFS / EAGAIN / WouldBlock). In these cases the packet should be dropped
-/// instead of tearing down the write path.
+/// (ENOBUFS / WouldBlock, and EQFULL on Apple). In these cases the packet should
+/// be dropped instead of tearing down the write path.
+#[cfg(unix)]
 fn is_tun_write_overflow(err: &std::io::Error) -> bool {
     if err.kind() == std::io::ErrorKind::WouldBlock {
         return true;
     }
-    // Linux: ENOBUFS=105, EAGAIN=11
-    // macOS / BSD: ENOBUFS=55, EAGAIN=35
-    // Windows (WSAENOBUFS): 10055
-    matches!(err.raw_os_error(), Some(105) | Some(11) | Some(55) | Some(35) | Some(10055))
+    match err.raw_os_error() {
+        Some(code) if code == libc::ENOBUFS => true,
+        // macOS-only: the interface output queue is full.
+        #[cfg(target_vendor = "apple")]
+        Some(code) if code == libc::EQFULL => true,
+        _ => false,
+    }
+}
+
+/// Windows counterpart: wintun reports a full ring buffer as ERROR_BUFFER_OVERFLOW,
+/// which tun-rs already translates into `ErrorKind::WouldBlock`.
+#[cfg(not(unix))]
+fn is_tun_write_overflow(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::WouldBlock
 }
 
 /// Read packets from the network (RWC) and write them straight into the TUN device.
