@@ -15,10 +15,12 @@ use tun_rs::AsyncDevice;
 
 use crate::ipv6rwc::ReadWriteCloser;
 
-/// Fixed GUID we register the wintun adapter with. Reused to target the same
-/// interface when assigning DNS servers via `SetInterfaceDnsSettings`.
+/// Base GUID we register the wintun adapter with. The current address prefix
+/// is added so multiple instances with different prefix/port can coexist.
+/// Reused to target the same interface when assigning DNS servers via
+/// `SetInterfaceDnsSettings`.
 #[cfg(windows)]
-const TUN_DEVICE_GUID: u128 = 0x8f59971a78724aa6b2eb061fc4e9d0a7;
+const TUN_DEVICE_GUID_BASE: u128 = 0x8f59971a78724aa6b2eb061fc4e9d0a7;
 
 #[cfg(windows)]
 static SET_INTERFACE_DNS_PTR: OnceLock<
@@ -136,8 +138,10 @@ impl TunAdapter {
 
         #[cfg(windows)]
         {
-            // Only call device_guid on Windows
-            builder = builder.device_guid(TUN_DEVICE_GUID);
+            // Add the current address prefix to the base GUID so multiple
+            // instances with different prefix/port can coexist.
+            let guid = TUN_DEVICE_GUID_BASE.wrapping_add(crate::address::address_prefix() as u128);
+            builder = builder.device_guid(guid);
         }
 
         let device = builder
@@ -418,9 +422,11 @@ fn set_interface_dns(servers: &[String]) -> Result<(), String> {
     use std::net::IpAddr;
     use std::str::FromStr;
 
-    // Same GUID we registered the wintun adapter with. tun-rs converts the u128
-    // via GUID::from_u128, so this matches the interface GUID exactly.
-    let guid = windows::core::GUID::from_u128(TUN_DEVICE_GUID);
+    // Same GUID we registered the wintun adapter with (base + current address prefix).
+    // tun-rs converts the u128 via GUID::from_u128, so this matches the interface GUID exactly.
+    let guid = windows::core::GUID::from_u128(
+        TUN_DEVICE_GUID_BASE.wrapping_add(crate::address::address_prefix() as u128),
+    );
 
     // SetInterfaceDnsSettings configures one address family per call, and IPv6
     // nameservers require the DNS_SETTING_IPV6 flag — without it the addresses are

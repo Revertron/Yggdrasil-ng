@@ -1,4 +1,5 @@
 use std::fs::{File, OpenOptions};
+use std::path::Path;
 use ed25519_dalek::SigningKey;
 use getopts::Options;
 use time::macros::format_description;
@@ -48,7 +49,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut opts = Options::new();
     opts.optflagopt("g", "genconf", "Generate a new configuration (optionally save to FILE)", "FILE");
     opts.optflagopt("", "normalize", "Normalize a config: read from FILE (or stdin if absent), add any missing fields with defaults while preserving user values and comments, and print to stdout", "FILE");
-    opts.optopt("c", "config", "Config file path (default: yggdrasil.toml)", "FILE");
+    opts.optopt("c", "config", "Config file path (default: yggdrasil.toml, then system path)", "FILE");
     opts.optflag("", "autoconf", "Run without a configuration file (use ephemeral keys)");
     opts.optflag("a", "address", "Print the IPv6 address for the given config and exit");
     opts.optflag("s", "subnet", "Print the IPv6 subnet for the given config and exit");
@@ -85,11 +86,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Resolve prefix/port early from binary/symlink/hardlink name suffix
+    // so --address / --subnet and control-mode endpoint see the correct values.
+    // Config mutation and the info message happen later (after logging is ready).
+    if let Some((prefix, port)) = resolve_prefix_port() {
+        yggdrasil::address::set_address_prefix(prefix);
+        yggdrasil::multicast::set_multicast_port(port);
+    }
+
     // If there are free (positional) arguments, treat as a control command
     #[cfg(feature = "ctl")]
     if !matches.free.is_empty() {
         let endpoint = matches.opt_str("endpoint")
-            .unwrap_or_else(|| "tcp://localhost:9001".to_string());
+            .unwrap_or_else(|| format!("tcp://localhost:{}", yggdrasil::multicast::multicast_port()));
         let json_output = matches.opt_present("json");
         let command = matches.free[0].clone();
 
@@ -110,7 +119,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         return service::run_as_service();
     }
 
-    let config_path = matches.opt_str("config").unwrap_or_else(|| "yggdrasil.toml".to_string());
+    let config_path = resolve_config_path(&matches);
     let autoconf = matches.opt_present("autoconf");
     let address = matches.opt_present("address");
     let subnet = matches.opt_present("subnet");
@@ -253,7 +262,7 @@ async fn run_node(
         opts.parse(Vec::<String>::new()).unwrap()
     });
 
-    let config_path = matches.opt_str("config").unwrap_or_else(|| "yggdrasil.toml".to_string());
+    let config_path = resolve_config_path(&matches);
     let autoconf = matches.opt_present("autoconf");
     let loglevel = matches.opt_str("loglevel").unwrap_or_else(|| "info".to_string());
     let logto = matches.opt_str("logto");
@@ -262,7 +271,7 @@ async fn run_node(
     init_logging(&loglevel, logto.as_deref());
 
     // Load config
-    let config = if autoconf {
+    let mut config = if autoconf {
         Config::default()
     } else if !config_path.is_empty() {
         let file = File::open(&config_path)?;
@@ -271,6 +280,10 @@ async fn run_node(
     } else {
         return Err("No configuration: specify --config or --autoconf".into());
     };
+
+    if let Some((prefix, port)) = resolve_prefix_port() {
+        apply_prefix_port(prefix, port, &mut config);
+    }
 
     // Parse or generate signing key
     let signing_key = if !config.private_key.is_empty() {
@@ -547,4 +560,199 @@ fn print_ctl_commands() {
     println!("    debug_remoteGetPeers key=<hex>, debug_remoteGetTree key=<hex>");
     println!("  Path diagnostics:");
     println!("    getLookup key=<hex>, forceLookup key=<hex>");
+}
+
+/// Parse a prefix-port value according to the required format.
+/// Used for the suffix after the last '_' in the binary/symlink/hardlink name.
+/// Returns (prefix_u8, port_u16) on success, None on failure.
+fn parse_prefix_port(s: &str) -> Option<(u8, u16)> {
+    // Manual implementation of the given regex (no extra dependency).
+    if s.len() < 6 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    // First two characters must be a valid prefix from the allowed set
+    let p0 = bytes[0] as char;
+    let p1 = bytes[1] as char;
+    let valid_prefix = matches!(
+        (p0, p1),
+        ('0', '2' | '4' | '6' | '8' | 'a' | 'c' | 'e' | 'A' | 'C' | 'E')
+            | ('1'..='9' | 'a'..='e' | 'A'..='E', '0' | '2' | '4' | '6' | '8' | 'a' | 'c' | 'e' | 'A' | 'C' | 'E')
+            | ('f' | 'F', '0' | '2' | '4' | '6' | '8' | 'a' | 'c' | 'A' | 'C')
+    );
+    if !valid_prefix {
+        return None;
+    }
+    let prefix = u8::from_str_radix(&s[..2], 16).ok()?;
+
+    // Optional separator: any char that is not space and not hex digit
+    let rest = &s[2..];
+    let numeric_start = if rest.is_empty() {
+        return None;
+    } else if rest.as_bytes()[0].is_ascii_hexdigit() {
+        0
+    } else if rest.as_bytes()[0] != b' ' {
+        1
+    } else {
+        return None;
+    };
+    let num_str: String = rest[numeric_start..]
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    if num_str.is_empty() {
+        return None;
+    }
+    let port: u16 = num_str.parse().ok()?;
+    if !(1024..=65535).contains(&port) {
+        return None;
+    }
+    Some((prefix, port))
+}
+
+fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
+    yggdrasil::address::set_address_prefix(prefix);
+    yggdrasil::multicast::set_multicast_port(port);
+
+    tracing::info!(
+        "Using address prefix 0x{:02x} and port {}",
+        prefix, port
+    );
+
+    // Override admin_listen only when it still has the default value
+    // (i.e. was absent/commented in the config file).
+    if config.admin_listen == "tcp://localhost:9001" {
+        config.admin_listen = format!("tcp://localhost:{}", port);
+    }
+
+    // Override if_name only when it is the default "auto"
+    // (absent/commented in config). macOS is left as "auto".
+    if config.if_name == "auto" {
+        let suffix = format!("{:02x}{}", prefix, port);
+        if cfg!(windows) {
+            config.if_name = format!("Yggdrasil{}", suffix);
+        } else if !cfg!(target_os = "macos") {
+            // Linux / BSD: strip the trailing "0" from "ygg0"
+            config.if_name = format!("ygg{}", suffix);
+        }
+        // macOS: keep "auto" — kernel assigns utunN
+    }
+}
+
+/// Return the basename of the program as invoked (argv[0]).
+/// Works for renamed binaries, symlinks and hardlinks.
+fn program_basename() -> String {
+    std::env::args()
+        .next()
+        .map(|a| {
+            Path::new(&a)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&a)
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract prefix and port from the binary/symlink/hardlink name.
+/// The last '_' in the name is the marker; everything after it is parsed
+/// with parse_prefix_port (e.g. "029001", "02-9001", "02.9001.exe").
+fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
+    let idx = name.rfind('_')?;
+    let suffix = &name[idx + 1..];
+    parse_prefix_port(suffix)
+}
+
+/// Resolve the configuration file path.
+///
+/// When `--config` / `-c` is not given:
+/// 1. Determine the config filename:
+///    - If the binary/symlink/hardlink name contains a recognised prefix+port
+///      suffix (via `prefix_port_from_name`), use `<stem>.toml`
+///      (stem = filename without extension, e.g. `ygg_029001.exe` → `ygg_029001.toml`).
+///    - Otherwise fall back to the historic default `yggdrasil.toml`.
+/// 2. Try that filename in the current working directory.
+/// 3. If absent, try the OS-specific system directory with the same filename:
+///    - Unix-like (Linux except Android, BSD, macOS, …): `/etc/yggdrasil/<filename>`
+///    - Windows: `C:\ProgramData\Yggdrasil-ng\<filename>`
+/// 4. If still not found, return the filename so that the subsequent
+///    `File::open` produces the same style of error message as before.
+fn resolve_config_path(matches: &getopts::Matches) -> String {
+    if let Some(path) = matches.opt_str("config") {
+        return path;
+    }
+
+    // Compute the config filename based on the binary name (if prefix/port recognised)
+    let name = program_basename();
+    let local = if prefix_port_from_name(&name).is_some() {
+        let stem = Path::new(&name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&name);
+        format!("{}.toml", stem)
+    } else {
+        "yggdrasil.toml".to_string()
+    };
+
+    if Path::new(&local).exists() {
+        return local;
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        let system = format!("/etc/yggdrasil/{}", local);
+        if Path::new(&system).exists() {
+            return system;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let system = format!(r"C:\ProgramData\Yggdrasil-ng\{}", local);
+        if Path::new(&system).exists() {
+            return system;
+        }
+    }
+
+    // File not found anywhere — return the computed filename so open() fails
+    // with the same style of error message as before.
+    local
+}
+
+/// Resolve (prefix, port) from the binary/symlink/hardlink name.
+/// Valid suffix after the last '_' is used; otherwise None (keep defaults).
+fn resolve_prefix_port() -> Option<(u8, u16)> {
+    prefix_port_from_name(&program_basename())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_prefix_port_existing_cases() {
+        assert_eq!(parse_prefix_port("02:9001"), Some((0x02, 9001)));
+        assert_eq!(parse_prefix_port("02-9001"), Some((0x02, 9001)));
+        assert_eq!(parse_prefix_port("029001"), Some((0x02, 9001)));
+        assert_eq!(parse_prefix_port("fc.65535"), Some((0xfc, 65535)));
+        assert_eq!(parse_prefix_port("02"), None);
+        assert_eq!(parse_prefix_port("02:1023"), None); // port too low
+        assert_eq!(parse_prefix_port("gg:9001"), None); // invalid prefix
+    }
+
+    #[test]
+    fn test_prefix_port_from_name() {
+        assert_eq!(prefix_port_from_name("yggdrasil_029001"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("yggdrasil_02-9001"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("yggdrasil_02.9001"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("yggdrasil_02-9001.exe"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("Yggdrasil_0a.12345"), Some((0x0a, 12345)));
+        assert_eq!(prefix_port_from_name("yggdrasil"), None);
+        assert_eq!(prefix_port_from_name("yggdrasil_"), None);
+        assert_eq!(prefix_port_from_name("yggdrasil_foo"), None);
+        assert_eq!(prefix_port_from_name("yggdrasil_02"), None);
+        assert_eq!(prefix_port_from_name("yggdrasil_02-999"), None); // port < 1024
+        // last '_' is the marker
+        assert_eq!(prefix_port_from_name("my_ygg_02-9001"), Some((0x02, 9001)));
+    }
 }
