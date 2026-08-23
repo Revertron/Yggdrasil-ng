@@ -103,20 +103,23 @@ impl ReadWriteCloser {
     }
 
     /// Read a packet from the network (Core) destined for the TUN.
-    /// Returns the number of bytes written to `buf`.
-    pub async fn read(&self, buf: &mut [u8]) -> Result<usize, String> {
-        loop {
-            let (n, from_addr) = self
+    /// Returns the slice of `buf` holding the packet.
+    pub async fn read<'a>(&self, buf: &'a mut [u8]) -> Result<&'a [u8], String> {
+        // The loop yields an owned range rather than a slice: a borrow of `buf`
+        // cannot outlive an iteration that reborrows it mutably.
+        let range = loop {
+            let (range, from_addr) = self
                 .core
-                .read_from(buf)
+                .read_from(&mut *buf)
                 .await
                 .map_err(|e| format!("core read: {}", e))?;
 
+            let n = range.len();
             if n == 0 {
                 continue;
             }
 
-            let packet = &buf[..n];
+            let packet = &buf[range.clone()];
             tracing::debug!("RWC read {} bytes from {:?}, first byte={:#x}", n, from_addr, packet[0]);
 
             let is_ip4 = packet[0] & 0xf0 == 0x40;
@@ -171,7 +174,7 @@ impl ReadWriteCloser {
                         continue;
                     }
                 }
-                return Ok(n);
+                break range;
             }
 
             // Standard (non-CKR) path: IPv6 only validation
@@ -218,8 +221,10 @@ impl ReadWriteCloser {
             }
 
             tracing::debug!("RWC delivering {} bytes to TUN", n);
-            return Ok(n);
-        }
+            break range;
+        };
+
+        Ok(&buf[range])
     }
 
     /// Write a packet from the TUN to the network (Core).

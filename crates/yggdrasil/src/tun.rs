@@ -288,7 +288,9 @@ fn is_tun_write_overflow(err: &std::io::Error) -> bool {
 
 /// Read packets from the network (RWC) and write them straight into the TUN device.
 async fn tun_write_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
-    let mut buf = vec![0u8; 65535];
+    // One byte larger than the largest payload: the session frame is read in
+    // place, so it needs room for the leading session type byte too.
+    let mut buf = vec![0u8; 65536];
     // Rate-limit overflow warnings so a sustained overload does not flood the log,
     // but count the drops in between so the warning says how bad it actually is.
     let mut last_overflow_log = Instant::now()
@@ -299,9 +301,9 @@ async fn tun_write_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
 
     loop {
         match rwc.read(&mut buf).await {
-            Ok(n) => {
-                tracing::debug!("TUN write {} bytes, version={:#x}", n, buf[0] >> 4);
-                if let Err(e) = device.send(&buf[..n]).await {
+            Ok(packet) => {
+                tracing::debug!("TUN write {} bytes, version={:#x}", packet.len(), packet[0] >> 4);
+                if let Err(e) = device.send(packet).await {
                     if is_tun_write_overflow(&e) {
                         // Drop on overflow: better to lose some packets under load
                         // than to stop delivering traffic entirely.

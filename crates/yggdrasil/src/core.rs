@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
@@ -175,20 +176,26 @@ impl Core {
         *slot = Some(rwc);
     }
 
-    /// Read a traffic packet from ironwood, stripping the session type byte.
-    pub async fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr), ironwood::Error> {
-        let mut inner_buf = vec![0u8; buf.len() + 1];
+    /// Read a traffic packet from ironwood into `buf`, returning the range of
+    /// `buf` holding the payload (i.e. the frame minus the session type byte).
+    ///
+    /// The frame is read in place, so the largest payload this can deliver is
+    /// `buf.len() - 1`. A range is returned rather than a slice because the
+    /// caller loops over this and would otherwise hold a borrow of `buf`
+    /// across an iteration that reborrows it mutably.
+    pub async fn read_from(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<(Range<usize>, Addr), ironwood::Error> {
         loop {
-            let (n, addr) = self.inner.read_from(&mut inner_buf).await?;
-            tracing::debug!("Core read: {n} bytes with {} from {}", inner_buf[0], &addr);
+            let (n, addr) = self.inner.read_from(buf).await?;
             if n == 0 {
                 continue;
             }
-            match inner_buf[0] {
+            tracing::debug!("Core read: {n} bytes with {} from {}", buf[0], &addr);
+            match buf[0] {
                 TYPE_SESSION_TRAFFIC => {
-                    let payload_len = n - 1;
-                    buf[..payload_len].copy_from_slice(&inner_buf[1..n]);
-                    return Ok((payload_len, addr));
+                    return Ok((1..n, addr));
                 }
                 TYPE_SESSION_PROTO => {
                     // Hand the message off to the proto task. This must never
@@ -198,7 +205,7 @@ impl Core {
                     // queries time out on the requester side.
                     if self
                         .proto_in_tx
-                        .try_send((addr.0, inner_buf[1..n].to_vec()))
+                        .try_send((addr.0, buf[1..n].to_vec()))
                         .is_err()
                     {
                         tracing::debug!("proto queue full, dropping message from {}", &addr);
