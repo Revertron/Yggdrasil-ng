@@ -84,7 +84,13 @@ optional = true
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.0"
-windows = { version = "0.62.2", features = ["Win32_NetworkManagement_IpHelper", "Win32_System_LibraryLoader", "Win32_Foundation"] }
+windows = { version = "0.62.2", features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_System_LibraryLoader",
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+] }
 
 # Used only for portable ENOBUFS / EQFULL constants in tun write overflow detection.
 # Already present transitively via socket2/tun-rs; declaring it does not grow the graph.

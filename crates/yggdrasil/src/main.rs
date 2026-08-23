@@ -674,7 +674,8 @@ fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
 /// 2. Try that filename in the current working directory.
 /// 3. If absent, try the OS-specific system directory with the same filename:
 ///    - Unix-like (Linux except Android, BSD, macOS, …): `/etc/yggdrasil/<filename>`
-///    - Windows: `C:\ProgramData\Yggdrasil-ng\<filename>`
+///    - Windows: `<ProgramData>\Yggdrasil-ng\<filename>`, where ProgramData is
+///      obtained via SHGetKnownFolderPath(FOLDERID_ProgramData)
 /// 4. If still not found, return the filename so that the subsequent
 ///    `File::open` produces the same style of error message as before.
 fn resolve_config_path(matches: &getopts::Matches) -> String {
@@ -708,15 +709,41 @@ fn resolve_config_path(matches: &getopts::Matches) -> String {
 
     #[cfg(windows)]
     {
-        let system = format!(r"C:\ProgramData\Yggdrasil-ng\{}", local);
-        if Path::new(&system).exists() {
-            return system;
+        if let Some(program_data) = windows_program_data_dir() {
+            let system = program_data.join("Yggdrasil-ng").join(&local);
+            if system.exists() {
+                return system.to_string_lossy().into_owned();
+            }
         }
     }
 
     // File not found anywhere — return the computed filename so open() fails
     // with the same style of error message as before.
     local
+}
+
+/// Return the real ProgramData directory via SHGetKnownFolderPath(FOLDERID_ProgramData).
+/// Returns None if the API call fails (no fallback to a hardcoded path).
+#[cfg(windows)]
+fn windows_program_data_dir() -> Option<std::path::PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath};
+
+    unsafe {
+        let pwstr = SHGetKnownFolderPath(
+            &FOLDERID_ProgramData,
+            KNOWN_FOLDER_FLAG(0),
+            None,
+        )
+        .ok()?;
+        // PWSTR is a null-terminated wide string allocated by CoTaskMemAlloc.
+        let wide = pwstr.as_wide();
+        let path = std::path::PathBuf::from(OsString::from_wide(wide));
+        CoTaskMemFree(Some(pwstr.0 as _));
+        Some(path)
+    }
 }
 
 /// Resolve (prefix, port) from the binary/symlink/hardlink name.
