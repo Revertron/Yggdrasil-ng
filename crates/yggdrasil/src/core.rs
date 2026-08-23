@@ -217,10 +217,25 @@ impl Core {
     /// Handle one inbound protocol message. Runs on the dedicated proto task,
     /// off the traffic read path, so blocking here is harmless.
     async fn handle_inbound_proto(&self, from_key: [u8; 32], payload: &[u8]) {
-        let routing_entries = self.routing_entries().await;
+        // Each query below is a round-trip to the single router actor task, so
+        // only ask for what this particular message will use.
+        let needs = crate::proto::proto_needs(payload);
+        let routing_entries = if needs.routing_entries {
+            self.routing_entries().await
+        } else {
+            0
+        };
+        let peer_keys = if needs.peer_keys {
+            self.get_peer_keys().await
+        } else {
+            Vec::new()
+        };
+        let tree_keys = if needs.tree_keys {
+            self.get_tree_keys().await
+        } else {
+            Vec::new()
+        };
         let our_key = self.public_key;
-        let peer_keys = self.get_peer_keys().await;
-        let tree_keys = self.get_tree_keys().await;
         let nodeinfo_json = self.config.node_info_json();
 
         if let Some((target, response)) = self.proto_handler.handle_proto_message(
