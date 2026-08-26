@@ -306,11 +306,18 @@ impl Core {
             }
         }
 
-        for uri in &config.peers {
-            if let Err(e) = self.add_peer(uri).await {
-                tracing::error!("Failed to add peer {}: {}", uri, e);
+        // Connect to configured peers in the background. Per-peer DNS resolution (see Links::add_peer) has no timeout of its own,
+        // so doing it here synchronously stacks one resolver latency per domain-name peer and delays this function
+        // returning -- which in turn delays the Type=notify readiness signal sent by run_node(). Spawning keeps the node
+        // from being held up on startup while a peer resolves.
+        let core = self.clone();
+        tokio::spawn(async move {
+            for uri in &config.peers {
+                if let Err(e) = core.add_peer(uri).await {
+                    tracing::error!("Failed to add peer {}: {}", uri, e);
+                }
             }
-        }
+        });
     }
 
     /// Start listening on the given address.
