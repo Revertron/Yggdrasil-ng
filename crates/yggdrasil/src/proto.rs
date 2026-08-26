@@ -40,6 +40,32 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Pending request callback.
 type Callback = oneshot::Sender<Vec<u8>>;
 
+/// Which pieces of router state `handle_proto_message` will actually use for a
+/// given payload. Each one costs a round-trip to the single router actor task,
+/// so the caller queries only what the message subtype needs.
+#[derive(Default, Clone, Copy)]
+pub struct ProtoNeeds {
+    pub routing_entries: bool,
+    pub peer_keys: bool,
+    pub tree_keys: bool,
+}
+
+/// Inspect a protocol payload and report the router state its handler needs.
+/// Responses and unknown subtypes need nothing at all.
+pub fn proto_needs(payload: &[u8]) -> ProtoNeeds {
+    let needs = ProtoNeeds::default();
+    if payload.first() != Some(&TYPE_PROTO_DEBUG) {
+        // NodeInfo request/response are served from config and callbacks only.
+        return needs;
+    }
+    match payload.get(1) {
+        Some(&TYPE_DEBUG_GET_SELF_REQUEST) => ProtoNeeds { routing_entries: true, ..needs },
+        Some(&TYPE_DEBUG_GET_PEERS_REQUEST) => ProtoNeeds { peer_keys: true, ..needs },
+        Some(&TYPE_DEBUG_GET_TREE_REQUEST) => ProtoNeeds { tree_keys: true, ..needs },
+        _ => needs,
+    }
+}
+
 /// Protocol handler for remote queries.
 pub struct ProtoHandler {
     /// Callbacks for GetSelf requests (indexed by target key).

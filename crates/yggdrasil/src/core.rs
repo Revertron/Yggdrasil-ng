@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
@@ -39,6 +40,9 @@ pub struct Core {
     pub(crate) tls_client_config: Arc<RwLock<Arc<rustls::ClientConfig>>>,
     pub(crate) tls_cert_expiry: Arc<RwLock<time::OffsetDateTime>>,
     proto_tx: mpsc::Sender<(Addr, Vec<u8>)>,
+    /// Queue of inbound protocol messages, drained by a dedicated task so that
+    /// handling them never blocks the traffic read path.
+    proto_in_tx: mpsc::Sender<([u8; 32], Vec<u8>)>,
     pub(crate) multicast: Mutex<Option<Arc<Multicast>>>,
     /// Name and MTU of the TUN interface, as assigned by the OS. Filled in
     /// after the adapter is created; `None` means there is no TUN.
@@ -122,6 +126,9 @@ impl Core {
             }
         });
 
+        // Create inbound protocol message channel
+        let (proto_in_tx, mut proto_in_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(64);
+
         let core = Arc::new(Self {
             inner,
             links: Mutex::new(Links::new(active_links.clone())),
@@ -138,10 +145,19 @@ impl Core {
             tls_client_config,
             tls_cert_expiry,
             proto_tx,
+            proto_in_tx,
             multicast: Mutex::new(None),
             tun_info: std::sync::Mutex::new(None),
             external_ifaces_tx,
             external_ifaces_rx,
+        });
+
+        // Spawn inbound proto handler task
+        let core_clone = core.clone();
+        tokio::spawn(async move {
+            while let Some((from_key, payload)) = proto_in_rx.recv().await {
+                core_clone.handle_inbound_proto(from_key, &payload).await;
+            }
         });
 
         // Spawn TLS certificate renewal task
@@ -160,44 +176,39 @@ impl Core {
         *slot = Some(rwc);
     }
 
-    /// Read a traffic packet from ironwood, stripping the session type byte.
-    pub async fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr), ironwood::Error> {
-        let mut inner_buf = vec![0u8; buf.len() + 1];
+    /// Read a traffic packet from ironwood into `buf`, returning the range of
+    /// `buf` holding the payload (i.e. the frame minus the session type byte).
+    ///
+    /// The frame is read in place, so the largest payload this can deliver is
+    /// `buf.len() - 1`. A range is returned rather than a slice because the
+    /// caller loops over this and would otherwise hold a borrow of `buf`
+    /// across an iteration that reborrows it mutably.
+    pub async fn read_from(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<(Range<usize>, Addr), ironwood::Error> {
         loop {
-            let (n, addr) = self.inner.read_from(&mut inner_buf).await?;
-            tracing::debug!("Core read: {n} bytes with {} from {}", inner_buf[0], &addr);
+            let (n, addr) = self.inner.read_from(buf).await?;
             if n == 0 {
                 continue;
             }
-            match inner_buf[0] {
+            tracing::debug!("Core read: {n} bytes with {} from {}", buf[0], &addr);
+            match buf[0] {
                 TYPE_SESSION_TRAFFIC => {
-                    let payload_len = n - 1;
-                    buf[..payload_len].copy_from_slice(&inner_buf[1..n]);
-                    return Ok((payload_len, addr));
+                    return Ok((1..n, addr));
                 }
                 TYPE_SESSION_PROTO => {
-                    // Handle protocol message
-                    let from_key = addr.0;
-                    let payload = &inner_buf[1..n];
-
-                    // Get data needed for proto handlers
-                    let routing_entries = self.routing_entries().await;
-                    let our_key = self.public_key;
-                    let peer_keys = self.get_peer_keys().await;
-                    let tree_keys = self.get_tree_keys().await;
-                    let nodeinfo_json = self.config.node_info_json();
-
-                    if let Some((target, response)) = self.proto_handler.handle_proto_message(
-                        from_key,
-                        payload,
-                        &our_key,
-                        routing_entries,
-                        || peer_keys.clone(),
-                        || tree_keys.clone(),
-                        &nodeinfo_json,
-                    ).await {
-                        // Send response back through proto channel
-                        let _ = self.proto_tx.send((target, response)).await;
+                    // Hand the message off to the proto task. This must never
+                    // block: proto handling talks to the router actor and can
+                    // wait on session setup, while this loop is the only source
+                    // of inbound traffic for the TUN. Dropping is safe, remote
+                    // queries time out on the requester side.
+                    if self
+                        .proto_in_tx
+                        .try_send((addr.0, buf[1..n].to_vec()))
+                        .is_err()
+                    {
+                        tracing::debug!("proto queue full, dropping message from {}", &addr);
                     }
 
                     // Continue reading, don't return proto messages to caller
@@ -207,6 +218,44 @@ impl Core {
                     continue;
                 }
             }
+        }
+    }
+
+    /// Handle one inbound protocol message. Runs on the dedicated proto task,
+    /// off the traffic read path, so blocking here is harmless.
+    async fn handle_inbound_proto(&self, from_key: [u8; 32], payload: &[u8]) {
+        // Each query below is a round-trip to the single router actor task, so
+        // only ask for what this particular message will use.
+        let needs = crate::proto::proto_needs(payload);
+        let routing_entries = if needs.routing_entries {
+            self.routing_entries().await
+        } else {
+            0
+        };
+        let peer_keys = if needs.peer_keys {
+            self.get_peer_keys().await
+        } else {
+            Vec::new()
+        };
+        let tree_keys = if needs.tree_keys {
+            self.get_tree_keys().await
+        } else {
+            Vec::new()
+        };
+        let our_key = self.public_key;
+        let nodeinfo_json = self.config.node_info_json();
+
+        if let Some((target, response)) = self.proto_handler.handle_proto_message(
+            from_key,
+            payload,
+            &our_key,
+            routing_entries,
+            || peer_keys.clone(),
+            || tree_keys.clone(),
+            &nodeinfo_json,
+        ).await {
+            // Send response back through proto channel
+            let _ = self.proto_tx.send((target, response)).await;
         }
     }
 
