@@ -331,6 +331,22 @@ const GSO_WRITE_BUF_CAP: usize = 2 * VIRTIO_NET_HDR_LEN + 65535;
 #[cfg(target_os = "linux")]
 const GSO_MAX_AGGREGATE: usize = 65535;
 
+/// Smallest segment size a standards-compliant peer can impose on us: IPv6's
+/// 1280-byte minimum link MTU less 40 bytes of IPv6 and 20 of TCP header.
+#[cfg(target_os = "linux")]
+const GSO_MIN_SEGMENT: usize = 1220;
+
+/// Slots the read batch must have at every MTU: enough for the segments a
+/// full aggregate splits into when the peer's MSS sits on the floor above.
+#[cfg(target_os = "linux")]
+const GSO_MIN_READ_SLOTS: usize = GSO_MAX_AGGREGATE.div_ceil(GSO_MIN_SEGMENT);
+
+/// Headroom every read slot carries for the headers tun-rs writes in front of
+/// each segment it splits out (the aggregate's `hdr_len`): 40 bytes of IPv6
+/// plus a maximum-length 60-byte TCP header, rounded up.
+#[cfg(target_os = "linux")]
+const GSO_SEGMENT_HDR_CAP: usize = 128;
+
 /// How often the offloaded read loop is allowed to report read failures.
 #[cfg(target_os = "linux")]
 const GSO_READ_LOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -345,13 +361,50 @@ const GSO_READ_BACKOFF_AFTER: u32 = 8;
 #[cfg(target_os = "linux")]
 const GSO_READ_BACKOFF: Duration = Duration::from_millis(1);
 
-/// Number of batch slots for `mtu`-sized packets under the budget above,
-/// never fewer than the `65535 / mtu` segments a single aggregate can split
-/// into and never more than the batch size the kernel is happy with.
+/// Number of write batch slots under the budget above, never fewer than the
+/// `65535 / mtu` packets a coalesced write can carry and never more than the
+/// batch size the kernel is happy with.
+///
+/// The read path sizes its batch with [`gso_read_slot_sizes`] instead: it
+/// splits kernel aggregates, whose segment count follows the remote peer's
+/// MSS rather than anything local.
 #[cfg(target_os = "linux")]
 fn gso_batch_size(mtu: u16, slot_bytes: usize) -> usize {
     let min_slots = 65535 / mtu.max(1) as usize + 2;
     (GSO_BATCH_BUDGET / slot_bytes).clamp(min_slots, IDEAL_BATCH_SIZE.max(min_slots))
+}
+
+/// Per-slot byte sizes for the offloaded read batch.
+///
+/// The kernel splits an aggregate by `virtio_net_hdr.gso_size`, which is the
+/// *remote* peer's MSS — unrelated to the local MTU, which only bounds a
+/// segment from above. Sizing every slot at `mtu` therefore has to pay for
+/// the largest segment in each of the slots needed for the smallest, and the
+/// byte budget resolved that tradeoff by cutting the slot count: 16 slots at
+/// the 65535-byte default MTU, against the 54 segments an ordinary IPv6 peer
+/// produces.
+///
+/// The tradeoff is not real. Slot `i` only ever receives a segment when the
+/// aggregate split into more than `i` of them, which bounds that segment at
+/// `65535 / i` bytes plus its headers — so the slots shrink as the index
+/// grows, and a full `IDEAL_BATCH_SIZE` batch costs ~427 KiB even at 65535.
+#[cfg(target_os = "linux")]
+fn gso_read_slot_sizes(mtu: u16) -> Vec<usize> {
+    let mtu = mtu.max(1) as usize;
+    let mut sizes = Vec::with_capacity(IDEAL_BATCH_SIZE);
+    let mut total = 0usize;
+    for i in 0..IDEAL_BATCH_SIZE {
+        let slot = (GSO_SEGMENT_HDR_CAP + GSO_MAX_AGGREGATE / i.max(1)).min(mtu);
+        // The leading slots are the expensive ones, and going short of
+        // GSO_MIN_READ_SLOTS is what breaks ordinary peers, so the budget
+        // only ever trims the cheap tail.
+        if total + slot > GSO_BATCH_BUDGET && sizes.len() >= GSO_MIN_READ_SLOTS {
+            break;
+        }
+        total += slot;
+        sizes.push(slot);
+    }
+    sizes
 }
 
 /// Rate-limited accounting for offloaded read failures.
@@ -467,10 +520,11 @@ async fn gso_read_loop<D: GsoSource, S: PacketSink>(device: D, rwc: S, mtu: u16)
     // Holds the virtio header and the un-split aggregate the kernel hands over.
     let mut aggregate = vec![0u8; VIRTIO_NET_HDR_LEN + GSO_MAX_AGGREGATE];
     // Receives the individual packets the aggregate splits into.
-    let slot = mtu.max(1) as usize;
-    let batch = gso_batch_size(mtu, slot);
-    let mut bufs: Vec<Vec<u8>> = vec![vec![0u8; slot]; batch];
-    let mut sizes = vec![0usize; batch];
+    let mut bufs: Vec<Vec<u8>> = gso_read_slot_sizes(mtu)
+        .into_iter()
+        .map(|n| vec![0u8; n])
+        .collect();
+    let mut sizes = vec![0usize; bufs.len()];
     let mut errors = GsoReadErrors::new();
 
     loop {
@@ -935,16 +989,58 @@ mod tests {
     use super::*;
     use tun_rs::ExpandBuffer;
 
+    /// Slots the batch offers for an aggregate the kernel split at `gso_size`:
+    /// a slot only counts if it can hold one whole segment.
+    fn usable_slots(sizes: &[usize], gso_size: usize) -> usize {
+        let segment = GSO_SEGMENT_HDR_CAP + gso_size;
+        sizes.iter().take_while(|&&s| s >= segment).count()
+    }
+
     #[test]
-    fn batch_covers_the_segments_one_aggregate_can_split_into() {
+    fn read_batch_covers_the_segments_one_aggregate_can_split_into() {
         for mtu in [1280u16, 1420, 1500, 9000, 65535] {
-            let slot = mtu as usize;
-            let batch = gso_batch_size(mtu, slot);
+            let sizes = gso_read_slot_sizes(mtu);
+            for gso_size in [1220usize, 1400, mtu as usize] {
+                // A segment cannot exceed the MTU, headers included.
+                let gso_size = gso_size.min(mtu as usize - GSO_SEGMENT_HDR_CAP);
+                let segments = GSO_MAX_AGGREGATE.div_ceil(gso_size);
+                let usable = usable_slots(&sizes, gso_size);
+                assert!(
+                    usable >= segments,
+                    "mtu {mtu}, gso_size {gso_size}: {usable} usable slot(s) \
+                     for {segments} segment(s)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_batch_holds_a_minimum_mtu_peers_aggregate_at_the_default_mtu() {
+        // The regression: an IPv6 peer on the 1280-byte minimum link MTU
+        // splits a full aggregate into 54 segments, against the 16 slots the
+        // old byte-budget sizing left at the default 65535-byte MTU.
+        let sizes = gso_read_slot_sizes(65535);
+        const { assert!(GSO_MIN_READ_SLOTS >= 54) };
+        assert!(
+            usable_slots(&sizes, GSO_MIN_SEGMENT) >= GSO_MIN_READ_SLOTS,
+            "{} usable slot(s) for {GSO_MIN_READ_SLOTS} segment(s)",
+            usable_slots(&sizes, GSO_MIN_SEGMENT)
+        );
+    }
+
+    #[test]
+    fn read_batch_stays_within_the_per_direction_budget() {
+        for mtu in [1280u16, 1420, 1500, 9000, 65535] {
+            let sizes = gso_read_slot_sizes(mtu);
+            let total: usize = sizes.iter().sum();
             assert!(
-                batch > 65535 / slot,
-                "mtu {mtu}: batch {batch} cannot hold a full aggregate"
+                total <= GSO_BATCH_BUDGET,
+                "mtu {mtu}: read batch of {total} B exceeds the budget"
             );
-            assert!(batch * slot <= GSO_BATCH_BUDGET.max(slot * (65535 / slot + 2)));
+            assert!(sizes.len() >= GSO_MIN_READ_SLOTS);
+            assert!(sizes.len() <= IDEAL_BATCH_SIZE);
+            // A single un-segmented packet still has to fit slot zero.
+            assert_eq!(sizes[0], mtu as usize);
         }
     }
 
