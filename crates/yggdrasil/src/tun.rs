@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use std::sync::OnceLock;
 
 use tun_rs::AsyncDevice;
+#[cfg(target_os = "linux")]
+use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 use crate::ipv6rwc::ReadWriteCloser;
 
@@ -231,8 +233,8 @@ impl TunAdapter {
         #[cfg(target_os = "linux")]
         let (read_handle, write_handle) = if gso_enabled {
             (
-                tokio::spawn(async move { tun_read_loop_gso(device_read, rwc_read).await }),
-                tokio::spawn(async move { tun_write_loop_gso(device_write, rwc_write).await }),
+                tokio::spawn(async move { tun_read_loop_gso(device_read, rwc_read, actual_mtu).await }),
+                tokio::spawn(async move { tun_write_loop_gso(device_write, rwc_write, actual_mtu).await }),
             )
         } else {
             (
@@ -312,15 +314,168 @@ async fn tun_read_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
     }
 }
 
+/// Batch buffers each direction is allowed to hold, in bytes. The batch is
+/// sized from this and the MTU rather than always taking `IDEAL_BATCH_SIZE`
+/// slots: with the default 65535-byte MTU that would reserve 8 MiB per
+/// direction.
+#[cfg(target_os = "linux")]
+const GSO_BATCH_BUDGET: usize = 1 << 20;
+
+/// Largest packet an offloaded write may coalesce into, plus the virtio header
+/// in front of it and the same again in slack, which is what the GRO coalescer
+/// requires of a buffer's capacity before it will merge into it.
+#[cfg(target_os = "linux")]
+const GSO_WRITE_BUF_CAP: usize = 2 * VIRTIO_NET_HDR_LEN + 65535;
+
+/// Number of batch slots for `mtu`-sized packets under the budget above,
+/// never fewer than the `65535 / mtu` segments a single aggregate can split
+/// into and never more than the batch size the kernel is happy with.
+#[cfg(target_os = "linux")]
+fn gso_batch_size(mtu: u16, slot_bytes: usize) -> usize {
+    let min_slots = 65535 / mtu.max(1) as usize + 2;
+    (GSO_BATCH_BUDGET / slot_bytes).clamp(min_slots, IDEAL_BATCH_SIZE.max(min_slots))
+}
+
 /// Read from the TUN device with GRO enabled: a single read yields one virtio
 /// header plus a possibly-aggregated buffer, which is split back into
 /// individual IP packets before being handed to the RWC.
 ///
 /// Linux-only; only spawned when the kernel granted the offload mask.
 #[cfg(target_os = "linux")]
-async fn tun_read_loop_gso(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
-    let _ = (device, rwc);
-    todo!("GSO read path: device.recv_multiple()")
+async fn tun_read_loop_gso(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>, mtu: u16) {
+    let slot = mtu.max(1) as usize;
+    let batch = gso_batch_size(mtu, slot);
+    // Holds the virtio header and the un-split aggregate the kernel hands over.
+    let mut aggregate = vec![0u8; VIRTIO_NET_HDR_LEN + 65535];
+    // Receives the individual packets the aggregate splits into.
+    let mut bufs: Vec<Vec<u8>> = vec![vec![0u8; slot]; batch];
+    let mut sizes = vec![0usize; batch];
+
+    loop {
+        match device
+            .recv_multiple(&mut aggregate, &mut bufs, &mut sizes, 0)
+            .await
+        {
+            Ok(count) => {
+                for (buf, &len) in bufs.iter().zip(sizes.iter()).take(count) {
+                    if len == 0 {
+                        continue;
+                    }
+                    if let Err(e) = rwc.write(&buf[..len]).await {
+                        tracing::trace!("Unable to send packet to network: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("TUN read error: {}", e);
+                return;
+            }
+        }
+    }
+}
+
+/// A batch slot for the offloaded write path.
+///
+/// The packet body sits at `VIRTIO_NET_HDR_LEN`, leaving the coalescer room to
+/// write the virtio header in front of it, and `len` tracks how much of the
+/// slot is live. The backing `Vec` keeps its full length between packets, so
+/// reusing a slot costs an integer assignment instead of the memset that
+/// growing a `Vec` back to MTU size would cost on every packet.
+#[cfg(target_os = "linux")]
+struct GsoWriteBuf {
+    data: Vec<u8>,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl GsoWriteBuf {
+    fn new() -> Self {
+        Self {
+            data: vec![0u8; GSO_WRITE_BUF_CAP],
+            len: 0,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsRef<[u8]> for GsoWriteBuf {
+    fn as_ref(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsMut<[u8]> for GsoWriteBuf {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.data[..self.len]
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl tun_rs::ExpandBuffer for GsoWriteBuf {
+    fn buf_capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    fn buf_resize(&mut self, new_len: usize, value: u8) {
+        if new_len > self.data.len() {
+            self.data.resize(new_len, value);
+        }
+        self.len = new_len;
+    }
+
+    fn buf_extend_from_slice(&mut self, src: &[u8]) {
+        let end = self.len + src.len();
+        if end > self.data.len() {
+            self.data.resize(end, 0);
+        }
+        self.data[self.len..end].copy_from_slice(src);
+        self.len = end;
+    }
+}
+
+/// Place a packet the RWC returned into `slot`, positioned so its body starts
+/// at `VIRTIO_NET_HDR_LEN`.
+///
+/// The RWC returns the packet as a subslice of the buffer it was given —
+/// currently one byte in, past the session type byte — which is why the buffer
+/// is offered starting one byte early. Should it ever land somewhere else, the
+/// packet is moved into place rather than the offset being guessed.
+#[cfg(target_os = "linux")]
+fn place_packet(slot_data: &mut [u8], start: usize, len: usize) -> usize {
+    if start != VIRTIO_NET_HDR_LEN {
+        slot_data.copy_within(start..start + len, VIRTIO_NET_HDR_LEN);
+    }
+    VIRTIO_NET_HDR_LEN + len
+}
+
+/// Read one packet from the RWC into `slot`, waiting for one to arrive.
+#[cfg(target_os = "linux")]
+async fn read_packet_into_slot(
+    rwc: &ReadWriteCloser,
+    slot: &mut GsoWriteBuf,
+) -> Result<(), String> {
+    let base = slot.data.as_ptr() as usize;
+    let packet = rwc.read(&mut slot.data[VIRTIO_NET_HDR_LEN - 1..]).await?;
+    let (start, len) = (packet.as_ptr() as usize - base, packet.len());
+    slot.len = place_packet(&mut slot.data, start, len);
+    Ok(())
+}
+
+/// Read a packet into `slot` only if the RWC already has one, reporting
+/// whether it did. Never waits for the network.
+#[cfg(target_os = "linux")]
+async fn try_read_packet_into_slot(
+    rwc: &ReadWriteCloser,
+    slot: &mut GsoWriteBuf,
+) -> Result<bool, String> {
+    let base = slot.data.as_ptr() as usize;
+    let Some(packet) = rwc.try_read(&mut slot.data[VIRTIO_NET_HDR_LEN - 1..]).await? else {
+        return Ok(false);
+    };
+    let (start, len) = (packet.as_ptr() as usize - base, packet.len());
+    slot.len = place_packet(&mut slot.data, start, len);
+    Ok(true)
 }
 
 /// Write to the TUN device with GSO enabled: coalesce consecutive packets of
@@ -328,9 +483,78 @@ async fn tun_read_loop_gso(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) 
 ///
 /// Linux-only; only spawned when the kernel granted the offload mask.
 #[cfg(target_os = "linux")]
-async fn tun_write_loop_gso(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
-    let _ = (device, rwc);
-    todo!("GSO write path: device.send_multiple()")
+async fn tun_write_loop_gso(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>, mtu: u16) {
+    let batch = gso_batch_size(mtu, GSO_WRITE_BUF_CAP);
+    let mut bufs: Vec<GsoWriteBuf> = (0..batch).map(|_| GsoWriteBuf::new()).collect();
+    // Reused across batches; it only holds coalescing bookkeeping.
+    let mut gro_table = GROTable::default();
+    // Rate-limit overflow warnings so a sustained overload does not flood the log,
+    // but count what happened in between so the warning says how bad it is.
+    let mut last_overflow_log = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
+    let mut overflow_batches: u64 = 0;
+    let mut at_risk_since_log: u64 = 0;
+    const OVERFLOW_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+    loop {
+        // Wait for the first packet, then take only what is already queued
+        // behind it: batching must never hold a packet back for a partner
+        // that has not arrived yet.
+        if let Err(e) = read_packet_into_slot(&rwc, &mut bufs[0]).await {
+            tracing::error!("Exiting TUN write loop due to RWC read error: {}", e);
+            return;
+        }
+        let mut count = 1;
+        while count < bufs.len() {
+            match try_read_packet_into_slot(&rwc, &mut bufs[count]).await {
+                Ok(true) => count += 1,
+                // Nothing else queued: send what we have rather than wait.
+                Ok(false) => break,
+                Err(e) => {
+                    tracing::error!("Exiting TUN write loop due to RWC read error: {}", e);
+                    return;
+                }
+            }
+        }
+
+        tracing::debug!("TUN write batch of {} packet(s)", count);
+        match device
+            .send_multiple(&mut gro_table, &mut bufs[..count], VIRTIO_NET_HDR_LEN)
+            .await
+        {
+            Ok(_) => {}
+            // `send_multiple` attempts every frame in the batch and reports
+            // the last failure it saw, so an overflow means at least one of
+            // these `count` packets was dropped — not that the batch was lost.
+            // Report the batch as what it is, an upper bound, rather than
+            // inflating the count by the packets that did get through.
+            Err(e) if is_tun_write_overflow(&e) => {
+                // Drop on overflow: better to lose some packets under load
+                // than to stop delivering traffic entirely.
+                overflow_batches += 1;
+                at_risk_since_log += count as u64;
+                let now = Instant::now();
+                if now.duration_since(last_overflow_log) >= OVERFLOW_LOG_INTERVAL {
+                    tracing::warn!(
+                        "TUN write overflow in {} batch(es), up to {} packet(s) dropped \
+                         since last report: {}",
+                        overflow_batches,
+                        at_risk_since_log,
+                        e
+                    );
+                    last_overflow_log = now;
+                    overflow_batches = 0;
+                    at_risk_since_log = 0;
+                }
+                continue;
+            }
+            Err(e) => {
+                tracing::error!("TUN write error: {}", e);
+                return;
+            }
+        }
+    }
 }
 
 /// Returns true for transient TUN write failures caused by kernel buffer exhaustion
@@ -579,4 +803,49 @@ fn apply_interface_dns(guid: windows::core::GUID, addrs: &[&str], ipv6: bool) ->
 
     call_set_interface_dns_settings(guid, &settings as *const _)
         .map_err(|e| format!("SetInterfaceDnsSettings (ipv6={}): {}", ipv6, e))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use tun_rs::ExpandBuffer;
+
+    #[test]
+    fn batch_covers_the_segments_one_aggregate_can_split_into() {
+        for mtu in [1280u16, 1420, 1500, 9000, 65535] {
+            let slot = mtu as usize;
+            let batch = gso_batch_size(mtu, slot);
+            assert!(
+                batch > 65535 / slot,
+                "mtu {mtu}: batch {batch} cannot hold a full aggregate"
+            );
+            assert!(batch * slot <= GSO_BATCH_BUDGET.max(slot * (65535 / slot + 2)));
+        }
+    }
+
+    #[test]
+    fn write_buf_tracks_length_without_reallocating() {
+        let mut buf = GsoWriteBuf::new();
+        let cap = buf.buf_capacity();
+
+        buf.buf_resize(VIRTIO_NET_HDR_LEN + 100, 0);
+        assert_eq!(buf.as_ref().len(), VIRTIO_NET_HDR_LEN + 100);
+
+        buf.buf_extend_from_slice(&[7u8; 50]);
+        assert_eq!(buf.as_ref().len(), VIRTIO_NET_HDR_LEN + 150);
+        assert_eq!(&buf.as_ref()[VIRTIO_NET_HDR_LEN + 100..], &[7u8; 50]);
+
+        // Reusing the slot for a shorter packet must not shrink the allocation.
+        buf.buf_resize(VIRTIO_NET_HDR_LEN + 20, 0);
+        assert_eq!(buf.as_ref().len(), VIRTIO_NET_HDR_LEN + 20);
+        assert_eq!(buf.buf_capacity(), cap);
+    }
+
+    #[test]
+    fn write_buf_has_room_for_a_fully_coalesced_frame() {
+        // The GRO coalescer refuses to merge into a buffer whose capacity is
+        // below `2 * offset + coalesced_len`.
+        let buf = GsoWriteBuf::new();
+        assert!(buf.buf_capacity() >= 2 * VIRTIO_NET_HDR_LEN + 65535);
+    }
 }
