@@ -53,6 +53,11 @@ if_name = "auto"
 # Maximum Transmission Unit (MTU) for the TUN interface.
 if_mtu = 65535
 
+# Enable GSO (generic segmentation offload) on the TUN interface. This lets the
+# kernel hand over large segmented buffers in a single read/write, which reduces
+# per-packet overhead and improves throughput. Linux only; ignored elsewhere.
+# if_gso = false
+
 # DNS servers to assign to the TUN interface (Windows only). Useful when you use
 # DNS servers inside the Yggdrasil network. Ignored on other platforms.
 # if_dns_servers = ["308:84:68:55::", "308:62:45:62::"]

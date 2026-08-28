@@ -75,6 +75,11 @@ pub struct Config {
     #[serde(default = "default_mtu")]
     pub if_mtu: u64,
 
+    /// Enable GSO (generic segmentation offload) on the TUN interface.
+    /// Linux only; ignored elsewhere.
+    #[serde(default)]
+    pub if_gso: bool,
+
     /// DNS servers to assign to the TUN interface. Windows only; ignored elsewhere.
     /// IP address strings, e.g. ["201:abcd::1", "201:abcd::2"]. Empty = leave unchanged.
     #[serde(default)]
@@ -239,6 +244,7 @@ impl Default for Config {
             admin_listen: "tcp://localhost:9001".to_string(),
             if_name: default_if_name(),
             if_mtu: default_mtu(),
+            if_gso: false,
             if_dns_servers: Vec::new(),
             node_info: toml::Value::Table(toml::map::Map::new()),
             node_info_privacy: false,
