@@ -327,6 +327,24 @@ const GSO_BATCH_BUDGET: usize = 1 << 20;
 #[cfg(target_os = "linux")]
 const GSO_WRITE_BUF_CAP: usize = 2 * VIRTIO_NET_HDR_LEN + 65535;
 
+/// Largest buffer a single offloaded read can hand back, virtio header aside.
+#[cfg(target_os = "linux")]
+const GSO_MAX_AGGREGATE: usize = 65535;
+
+/// How often the offloaded read loop is allowed to report read failures.
+#[cfg(target_os = "linux")]
+const GSO_READ_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Consecutive read failures after which the loop starts pausing between
+/// attempts, so a device that only ever fails cannot spin a core.
+#[cfg(target_os = "linux")]
+const GSO_READ_BACKOFF_AFTER: u32 = 8;
+
+/// How long to pause once reads have failed `GSO_READ_BACKOFF_AFTER` times
+/// in a row.
+#[cfg(target_os = "linux")]
+const GSO_READ_BACKOFF: Duration = Duration::from_millis(1);
+
 /// Number of batch slots for `mtu`-sized packets under the budget above,
 /// never fewer than the `65535 / mtu` segments a single aggregate can split
 /// into and never more than the batch size the kernel is happy with.
@@ -336,6 +354,100 @@ fn gso_batch_size(mtu: u16, slot_bytes: usize) -> usize {
     (GSO_BATCH_BUDGET / slot_bytes).clamp(min_slots, IDEAL_BATCH_SIZE.max(min_slots))
 }
 
+/// Rate-limited accounting for offloaded read failures.
+///
+/// A failed read is never fatal. `recv_multiple` rejects a whole aggregate for
+/// reasons that are specific to that aggregate — more segments than the batch
+/// has slots, a segment larger than its slot, a header it cannot parse — and
+/// tearing the read loop down for one of those silently stops the node from
+/// sending any TUN traffic until it is restarted.
+#[cfg(target_os = "linux")]
+struct GsoReadErrors {
+    last_log: Instant,
+    since_log: u64,
+    consecutive: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl GsoReadErrors {
+    fn new() -> Self {
+        Self {
+            last_log: Instant::now()
+                .checked_sub(GSO_READ_LOG_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            since_log: 0,
+            consecutive: 0,
+        }
+    }
+
+    /// Record a failed read, reporting it if the interval has elapsed, and
+    /// return how long to pause before trying again.
+    fn record(&mut self, err: &std::io::Error) -> Duration {
+        self.consecutive = self.consecutive.saturating_add(1);
+        self.since_log += 1;
+        let now = Instant::now();
+        if now.duration_since(self.last_log) >= GSO_READ_LOG_INTERVAL {
+            tracing::warn!(
+                "TUN read error, {} aggregate(s) dropped since last report: {}",
+                self.since_log,
+                err
+            );
+            self.last_log = now;
+            self.since_log = 0;
+        }
+        if self.consecutive >= GSO_READ_BACKOFF_AFTER {
+            GSO_READ_BACKOFF
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// Record a successful read, ending any backoff.
+    fn record_success(&mut self) {
+        self.consecutive = 0;
+    }
+}
+
+/// The device side of the offloaded read loop, named as a trait so the loop's
+/// error handling can be exercised without a TUN device.
+#[cfg(target_os = "linux")]
+trait GsoSource {
+    /// Read one aggregate and split it into `bufs`/`sizes`, as `recv_multiple`.
+    async fn recv_split(
+        &self,
+        aggregate: &mut [u8],
+        bufs: &mut [Vec<u8>],
+        sizes: &mut [usize],
+    ) -> std::io::Result<usize>;
+}
+
+#[cfg(target_os = "linux")]
+impl GsoSource for Arc<AsyncDevice> {
+    async fn recv_split(
+        &self,
+        aggregate: &mut [u8],
+        bufs: &mut [Vec<u8>],
+        sizes: &mut [usize],
+    ) -> std::io::Result<usize> {
+        self.recv_multiple(aggregate, bufs, sizes, 0).await
+    }
+}
+
+/// Where the split packets go; the counterpart of [`GsoSource`].
+#[cfg(target_os = "linux")]
+trait PacketSink {
+    async fn send_packet(&self, packet: &[u8]);
+}
+
+#[cfg(target_os = "linux")]
+impl PacketSink for Arc<ReadWriteCloser> {
+    async fn send_packet(&self, packet: &[u8]) {
+        if let Err(e) = self.write(packet).await {
+            tracing::trace!("Unable to send packet to network: {}", e);
+        }
+    }
+}
+
 /// Read from the TUN device with GRO enabled: a single read yields one virtio
 /// header plus a possibly-aggregated buffer, which is split back into
 /// individual IP packets before being handed to the RWC.
@@ -343,32 +455,45 @@ fn gso_batch_size(mtu: u16, slot_bytes: usize) -> usize {
 /// Linux-only; only spawned when the kernel granted the offload mask.
 #[cfg(target_os = "linux")]
 async fn tun_read_loop_gso(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>, mtu: u16) {
+    gso_read_loop(device, rwc, mtu).await
+}
+
+/// The body of [`tun_read_loop_gso`], over the device and sink traits.
+///
+/// It has no exit: every read error is recoverable, so the loop drops the
+/// aggregate and reads again. It runs until the task is aborted.
+#[cfg(target_os = "linux")]
+async fn gso_read_loop<D: GsoSource, S: PacketSink>(device: D, rwc: S, mtu: u16) {
+    // Holds the virtio header and the un-split aggregate the kernel hands over.
+    let mut aggregate = vec![0u8; VIRTIO_NET_HDR_LEN + GSO_MAX_AGGREGATE];
+    // Receives the individual packets the aggregate splits into.
     let slot = mtu.max(1) as usize;
     let batch = gso_batch_size(mtu, slot);
-    // Holds the virtio header and the un-split aggregate the kernel hands over.
-    let mut aggregate = vec![0u8; VIRTIO_NET_HDR_LEN + 65535];
-    // Receives the individual packets the aggregate splits into.
     let mut bufs: Vec<Vec<u8>> = vec![vec![0u8; slot]; batch];
     let mut sizes = vec![0usize; batch];
+    let mut errors = GsoReadErrors::new();
 
     loop {
         match device
-            .recv_multiple(&mut aggregate, &mut bufs, &mut sizes, 0)
+            .recv_split(&mut aggregate, &mut bufs, &mut sizes)
             .await
         {
             Ok(count) => {
+                errors.record_success();
                 for (buf, &len) in bufs.iter().zip(sizes.iter()).take(count) {
                     if len == 0 {
                         continue;
                     }
-                    if let Err(e) = rwc.write(&buf[..len]).await {
-                        tracing::trace!("Unable to send packet to network: {}", e);
-                    }
+                    rwc.send_packet(&buf[..len]).await;
                 }
             }
+            // Drop the aggregate and carry on: one unreadable read must not
+            // take the interface down for the lifetime of the process.
             Err(e) => {
-                tracing::error!("TUN read error: {}", e);
-                return;
+                let backoff = errors.record(&e);
+                if !backoff.is_zero() {
+                    tokio::time::sleep(backoff).await;
+                }
             }
         }
     }
@@ -821,6 +946,113 @@ mod tests {
             );
             assert!(batch * slot <= GSO_BATCH_BUDGET.max(slot * (65535 / slot + 2)));
         }
+    }
+
+    #[test]
+    fn read_errors_are_reported_at_an_interval_and_backed_off() {
+        let mut errors = GsoReadErrors::new();
+        let err = || {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "too many GSO segments")
+        };
+
+        // Isolated failures cost nothing.
+        for _ in 0..GSO_READ_BACKOFF_AFTER - 1 {
+            assert_eq!(errors.record(&err()), Duration::ZERO);
+        }
+        // A run of them starts pausing between attempts.
+        assert_eq!(errors.record(&err()), GSO_READ_BACKOFF);
+        // A good read ends the backoff.
+        errors.record_success();
+        assert_eq!(errors.record(&err()), Duration::ZERO);
+        // Reporting is rate-limited: the first failure logged, the rest counted.
+        assert!(errors.since_log > 0);
+    }
+
+    /// A source that fails a fixed number of times, then yields one packet per
+    /// read; `reads` counts every attempt so the test can tell how far the
+    /// loop got.
+    ///
+    /// It stops after `packets` of them and parks forever. The loop under test
+    /// has no exit and allocates per packet, so an unbounded source turns any
+    /// mistake that starves the assertions into an out-of-memory hang rather
+    /// than a failing test.
+    struct FlakySource {
+        failures: std::sync::atomic::AtomicUsize,
+        packets: std::sync::atomic::AtomicUsize,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl GsoSource for FlakySource {
+        async fn recv_split(
+            &self,
+            _aggregate: &mut [u8],
+            bufs: &mut [Vec<u8>],
+            sizes: &mut [usize],
+        ) -> std::io::Result<usize> {
+            use std::sync::atomic::Ordering;
+            // A real device read suspends when there is nothing to read; the
+            // fake one has to yield in its place or it starves the runtime.
+            tokio::task::yield_now().await;
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.failures.load(Ordering::SeqCst) > 0 {
+                self.failures.fetch_sub(1, Ordering::SeqCst);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "too many GSO segments",
+                ));
+            }
+            if self.packets.fetch_sub(1, Ordering::SeqCst) == 0 {
+                std::future::pending::<()>().await;
+            }
+            bufs[0][..4].copy_from_slice(&[1, 2, 3, 4]);
+            sizes[0] = 4;
+            Ok(1)
+        }
+    }
+
+    struct CollectingSink(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    impl PacketSink for CollectingSink {
+        async fn send_packet(&self, packet: &[u8]) {
+            self.0.lock().unwrap().push(packet.to_vec());
+        }
+    }
+
+    #[tokio::test]
+    async fn read_loop_survives_read_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = FlakySource {
+            // Enough failures in a row to go through the backoff path.
+            failures: AtomicUsize::new(GSO_READ_BACKOFF_AFTER as usize + 2),
+            // A handful more than the test waits for, so it never starves.
+            packets: AtomicUsize::new(16),
+            reads: reads.clone(),
+        };
+        let packets = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = CollectingSink(packets.clone());
+
+        // The loop has no exit, so it is raced against the condition it must
+        // reach: packets still being delivered on the far side of the errors.
+        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = gso_read_loop(source, sink, 1500) => {
+                    panic!("read loop exited on a recoverable read error")
+                }
+                _ = async {
+                    while packets.lock().unwrap().len() < 3 {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        })
+        .await;
+
+        assert!(delivered.is_ok(), "read loop stopped delivering packets");
+        // It read past every failure and kept delivering afterwards.
+        assert!(reads.load(Ordering::SeqCst) > GSO_READ_BACKOFF_AFTER as usize + 2);
+        assert_eq!(packets.lock().unwrap()[0], vec![1, 2, 3, 4]);
     }
 
     #[test]
