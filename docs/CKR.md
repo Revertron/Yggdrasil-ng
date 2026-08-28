@@ -294,3 +294,13 @@ ping6 2001:db8:0:1::5
 ```
 
 If large transfers stall while small pings work, suspect MTU — the tunnel adds overhead, and PMTUD (ICMPv6 Packet Too Big) must be allowed to pass.
+
+## Performance on forwarding nodes
+
+A node that forwards CKR traffic handles other people's packets, which arrive at
+whatever MSS the far end negotiated — usually small, and usually back to back.
+That is the traffic shape [TUN segmentation offload](GSO.md) exists for, so
+`if_gso = true` (Linux only) is worth enabling on exit nodes and site-to-site
+gateways: it cut CPU per gigabit by roughly a third in testing. It is inert for
+bulk transfer between two default-MTU nodes, so it is not worth enabling
+everywhere by reflex.

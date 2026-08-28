@@ -77,6 +77,10 @@ pub struct Config {
 
     /// Enable GSO (generic segmentation offload) on the TUN interface.
     /// Linux only; ignored elsewhere.
+    ///
+    /// Worth enabling when many small packets arrive back to back (1500-byte-MTU
+    /// peers, CKR forwarding); inert for bulk transfer at the default MTU. See
+    /// `docs/GSO.md`.
     #[serde(default)]
     pub if_gso: bool,
 

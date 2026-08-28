@@ -54,8 +54,15 @@ if_name = "auto"
 if_mtu = 65535
 
 # Enable GSO (generic segmentation offload) on the TUN interface. This lets the
-# kernel hand over large segmented buffers in a single read/write, which reduces
-# per-packet overhead and improves throughput. Linux only; ignored elsewhere.
+# kernel hand over large segmented buffers in a single read/write instead of one
+# syscall per packet. Linux only; ignored elsewhere.
+#
+# It pays off when many small packets arrive back to back -- peering with
+# 1500-byte-MTU meshes, or forwarding CKR/VPN traffic -- where it cut CPU per
+# gigabit by about a third in testing. It does nothing for bulk transfer at the
+# default MTU (segments already arrive at ~64 KB, so there is nothing to
+# coalesce) and nothing for sparse traffic, and it costs about 0.6 ms of loaded
+# latency. See docs/GSO.md.
 # if_gso = false
 
 # DNS servers to assign to the TUN interface (Windows only). Useful when you use
