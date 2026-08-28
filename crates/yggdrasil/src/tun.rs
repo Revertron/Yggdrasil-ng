@@ -37,6 +37,9 @@ pub struct TunAdapter {
     name: String,
     /// MTU the interface ended up with, which the OS may have clamped.
     mtu: u16,
+    /// Whether the kernel actually granted TSO/GSO on this device. Linux only;
+    /// always false elsewhere.
+    gso: bool,
     read_handle: tokio::task::JoinHandle<()>,
     write_handle: tokio::task::JoinHandle<()>,
 }
@@ -48,14 +51,19 @@ impl TunAdapter {
     /// `addr`: the Yggdrasil IPv6 address string
     /// `subnet`: the /64 subnet string (for routing)
     /// `mtu`: the MTU for the TUN interface
+    /// `gso`: enable TSO/GSO segmentation offload (Linux only)
     /// `dns_servers`: DNS server IPs to assign to the interface (Windows only)
     /// `ckr_config`: optional CKR tunnel routing config (for route installation)
+    // Argument count is platform-dependent: the cfg'd knobs push it past the
+    // clippy threshold on Linux.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         name: &str,
         rwc: Arc<ReadWriteCloser>,
         addr: &str,
         _subnet: &str,
         mtu: u16,
+        #[cfg(target_os = "linux")] gso: bool,
         #[cfg(windows)] dns_servers: &[String],
         #[cfg(feature = "ckr")] ckr_config: Option<&crate::config::TunnelRoutingConfig>,
         #[cfg(feature = "ckr")] self_key: &[u8; 32],
@@ -140,9 +148,30 @@ impl TunAdapter {
             builder = builder.device_guid(TUN_DEVICE_GUID);
         }
 
+        // Offload asks the kernel for IFF_VNET_HDR, so segmented buffers cross
+        // the device in one read/write instead of one syscall per MTU-sized
+        // packet. The kernel may still refuse the offload mask (pre-2.6, or a
+        // restricted container); tun-rs then falls back to plain packet mode,
+        // which `tcp_gso()` below reports.
+        #[cfg(target_os = "linux")]
+        if gso {
+            builder = builder.offload(true);
+        }
+
         let device = builder
             .build_async()
             .map_err(|e| format!("failed to create TUN device: {}", e))?;
+
+        #[cfg(target_os = "linux")]
+        let gso_enabled = {
+            let granted = device.tcp_gso();
+            if gso && !granted {
+                tracing::warn!("if_gso is set but the kernel refused TUN offload; continuing without GSO");
+            }
+            granted
+        };
+        #[cfg(not(target_os = "linux"))]
+        let gso_enabled = false;
 
         let device = Arc::new(device);
 
@@ -155,7 +184,13 @@ impl TunAdapter {
 
         let actual_name = device.name().unwrap_or_else(|_| tun_name.to_string());
         let actual_mtu = device.mtu().unwrap_or(mtu);
-        tracing::info!("TUN device '{}' created with address {} and MTU {}", actual_name, addr, actual_mtu);
+        tracing::info!(
+            "TUN device '{}' created with address {} and MTU {} (GSO {})",
+            actual_name,
+            addr,
+            actual_mtu,
+            if gso_enabled { "enabled" } else { "disabled" }
+        );
 
         // Install CKR routes if configured
         #[cfg(feature = "ckr")]
@@ -184,23 +219,39 @@ impl TunAdapter {
         }
 
         // Task 1: TUN → network (read from TUN, write to RWC)
+        // Task 2: network → TUN (read from RWC directly into TUN; no intermediate queue)
+        // With offload granted the device speaks virtio headers and aggregated
+        // buffers, so both directions take the recv_multiple/send_multiple path
+        // instead.
         let device_read = device.clone();
         let rwc_read = rwc.clone();
-        let read_handle = tokio::spawn(async move {
-            tun_read_loop(device_read, rwc_read).await;
-        });
-
-        // Task 2: network → TUN (read from RWC directly into TUN; no intermediate queue)
         let device_write = device.clone();
         let rwc_write = rwc.clone();
-        let write_handle = tokio::spawn(async move {
-            tun_write_loop(device_write, rwc_write).await;
-        });
+
+        #[cfg(target_os = "linux")]
+        let (read_handle, write_handle) = if gso_enabled {
+            (
+                tokio::spawn(async move { tun_read_loop_gso(device_read, rwc_read).await }),
+                tokio::spawn(async move { tun_write_loop_gso(device_write, rwc_write).await }),
+            )
+        } else {
+            (
+                tokio::spawn(async move { tun_read_loop(device_read, rwc_read).await }),
+                tokio::spawn(async move { tun_write_loop(device_write, rwc_write).await }),
+            )
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let (read_handle, write_handle) = (
+            tokio::spawn(async move { tun_read_loop(device_read, rwc_read).await }),
+            tokio::spawn(async move { tun_write_loop(device_write, rwc_write).await }),
+        );
 
         Ok(Self {
             device,
             name: actual_name,
             mtu: actual_mtu,
+            gso: gso_enabled,
             read_handle,
             write_handle,
         })
@@ -216,6 +267,11 @@ impl TunAdapter {
         self.mtu
     }
 
+    /// Whether TSO/GSO is active on this device.
+    pub fn gso(&self) -> bool {
+        self.gso
+    }
+
     /// Tear down the TUN adapter explicitly: abort the I/O tasks, wait for
     /// them to drop their `Arc<AsyncDevice>` references, then drop the device
     /// so the OS-level interface is removed before this function returns.
@@ -226,7 +282,7 @@ impl TunAdapter {
     /// the Wintun adapter isn't closed by then, it gets orphaned in the
     /// device tree and the next startup can't recreate it.
     pub async fn close(self) {
-        let TunAdapter { device, name: _, mtu: _, read_handle, write_handle } = self;
+        let TunAdapter { device, read_handle, write_handle, .. } = self;
         read_handle.abort();
         write_handle.abort();
         let _ = read_handle.await;
@@ -254,6 +310,27 @@ async fn tun_read_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
             }
         }
     }
+}
+
+/// Read from the TUN device with GRO enabled: a single read yields one virtio
+/// header plus a possibly-aggregated buffer, which is split back into
+/// individual IP packets before being handed to the RWC.
+///
+/// Linux-only; only spawned when the kernel granted the offload mask.
+#[cfg(target_os = "linux")]
+async fn tun_read_loop_gso(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
+    let _ = (device, rwc);
+    todo!("GSO read path: device.recv_multiple()")
+}
+
+/// Write to the TUN device with GSO enabled: coalesce consecutive packets of
+/// the same flow into one segmented buffer so the kernel does the splitting.
+///
+/// Linux-only; only spawned when the kernel granted the offload mask.
+#[cfg(target_os = "linux")]
+async fn tun_write_loop_gso(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
+    let _ = (device, rwc);
+    todo!("GSO write path: device.send_multiple()")
 }
 
 /// Returns true for transient TUN write failures caused by kernel buffer exhaustion
