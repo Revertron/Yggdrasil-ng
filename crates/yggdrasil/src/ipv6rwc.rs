@@ -114,117 +114,158 @@ impl ReadWriteCloser {
                 .await
                 .map_err(|e| format!("core read: {}", e))?;
 
-            let n = range.len();
-            if n == 0 {
-                continue;
+            if let Some(accepted) = self.accept_inbound(&*buf, range, from_addr).await {
+                break accepted;
             }
-
-            let packet = &buf[range.clone()];
-            tracing::debug!("RWC read {} bytes from {:?}, first byte={:#x}", n, from_addr, packet[0]);
-
-            let is_ip4 = packet[0] & 0xf0 == 0x40;
-            let is_ip6 = packet[0] & 0xf0 == 0x60;
-
-            #[cfg(feature = "ckr")]
-            let ckr_active = self.ckr.is_some();
-            #[cfg(not(feature = "ckr"))]
-            let ckr_active = false;
-
-            if !ckr_active {
-                // Standard mode: IPv6 only
-                if !is_ip6 {
-                    tracing::debug!("RWC dropping non-IPv6 packet (version={})", packet[0] >> 4);
-                    continue;
-                }
-            } else if !is_ip4 && !is_ip6 {
-                // CKR mode: IPv4 or IPv6
-                tracing::debug!("RWC dropping non-IP packet (version={})", packet[0] >> 4);
-                continue;
-            }
-
-            if is_ip6 && n < IPV6_HEADER_LEN {
-                tracing::debug!("RWC dropping short packet ({} < {})", n, IPV6_HEADER_LEN);
-                continue;
-            }
-
-            // MTU enforcement
-            if n as u64 > self.mtu {
-                if is_ip6 {
-                    let ptb = build_icmpv6_ptb(packet, self.mtu as u32);
-                    if let Some(ptb) = ptb {
-                        let _ = self.core.write_to(&ptb, &from_addr).await;
-                    }
-                }
-                continue;
-            }
-
-            let from_key = from_addr.0;
-            self.update_key(from_key).await;
-
-            // CKR path: dual-mode validation
-            #[cfg(feature = "ckr")]
-            if let Some(ref ckr) = self.ckr {
-                let accepted = self.ckr_read_validate(ckr, packet, is_ip4, is_ip6, &from_key).await;
-                if !accepted {
-                    continue;
-                }
-                if let Some(fw) = &self.firewall {
-                    if fw.enabled() && is_ip6 && !fw.check_inbound(packet) {
-                        tracing::debug!("RWC firewall: drop inbound (CKR path)");
-                        continue;
-                    }
-                }
-                break range;
-            }
-
-            // Standard (non-CKR) path: IPv6 only validation
-            let mut src_ip = [0u8; 16];
-            let mut dst_ip = [0u8; 16];
-            src_ip.copy_from_slice(&packet[8..24]);
-            dst_ip.copy_from_slice(&packet[24..40]);
-
-            // Verify destination is us
-            let dst_is_addr = dst_ip == self.address.0;
-            let mut dst_subnet_bytes = [0u8; 8];
-            dst_subnet_bytes.copy_from_slice(&dst_ip[..8]);
-            let dst_is_subnet = dst_subnet_bytes == self.subnet.0;
-
-            if !dst_is_addr && !dst_is_subnet {
-                tracing::debug!("RWC dropping: dst {:x?} is neither our addr nor subnet", &dst_ip[..4]);
-                continue;
-            }
-
-            // Verify source address matches the key we got it from
-            let src_valid = {
-                let lookups = self.lookups.load();
-                if let Some(info) = lookups.key_to_info.get(&from_key) {
-                    let src_addr_match = src_ip == info.address.0;
-                    let mut src_subnet_bytes = [0u8; 8];
-                    src_subnet_bytes.copy_from_slice(&src_ip[..8]);
-                    let src_subnet_match = src_subnet_bytes == info.subnet.0;
-                    src_addr_match || src_subnet_match
-                } else {
-                    false
-                }
-            };
-
-            if !src_valid {
-                tracing::debug!("RWC dropping: src addr doesn't match sender key");
-                continue;
-            }
-
-            if let Some(fw) = &self.firewall {
-                if fw.enabled() && !fw.check_inbound(packet) {
-                    tracing::debug!("RWC firewall: drop inbound");
-                    continue;
-                }
-            }
-
-            tracing::debug!("RWC delivering {} bytes to TUN", n);
-            break range;
         };
 
         Ok(&buf[range])
+    }
+
+    /// Non-blocking counterpart to [`read`](Self::read): delivers a packet only
+    /// if one has already arrived, `Ok(None)` otherwise.
+    ///
+    /// This still awaits — validating a packet can take a lock or flush a
+    /// buffered packet — but it never waits on the network, so a caller
+    /// batching whatever is queued does not have to cancel a `read` to find
+    /// out that nothing is left. Cancelling one would drop any packet that
+    /// read had already dequeued.
+    pub async fn try_read<'a>(&self, buf: &'a mut [u8]) -> Result<Option<&'a [u8]>, String> {
+        let range = loop {
+            let Some((range, from_addr)) = self
+                .core
+                .try_read_from(&mut *buf)
+                .map_err(|e| format!("core read: {}", e))?
+            else {
+                return Ok(None);
+            };
+
+            if let Some(accepted) = self.accept_inbound(&*buf, range, from_addr).await {
+                break accepted;
+            }
+        };
+
+        Ok(Some(&buf[range]))
+    }
+
+    /// Validate one inbound packet occupying `range` of `buf`. Returns the
+    /// range to deliver to the TUN, or `None` if the packet was dropped or
+    /// handled here (an oversized packet answered with an ICMPv6 PTB), meaning
+    /// the caller should read again.
+    async fn accept_inbound(
+        &self,
+        buf: &[u8],
+        range: std::ops::Range<usize>,
+        from_addr: Addr,
+    ) -> Option<std::ops::Range<usize>> {
+        let n = range.len();
+        if n == 0 {
+            return None;
+        }
+
+        let packet = &buf[range.clone()];
+        tracing::debug!("RWC read {} bytes from {:?}, first byte={:#x}", n, from_addr, packet[0]);
+
+        let is_ip4 = packet[0] & 0xf0 == 0x40;
+        let is_ip6 = packet[0] & 0xf0 == 0x60;
+
+        #[cfg(feature = "ckr")]
+        let ckr_active = self.ckr.is_some();
+        #[cfg(not(feature = "ckr"))]
+        let ckr_active = false;
+
+        if !ckr_active {
+            // Standard mode: IPv6 only
+            if !is_ip6 {
+                tracing::debug!("RWC dropping non-IPv6 packet (version={})", packet[0] >> 4);
+                return None;
+            }
+        } else if !is_ip4 && !is_ip6 {
+            // CKR mode: IPv4 or IPv6
+            tracing::debug!("RWC dropping non-IP packet (version={})", packet[0] >> 4);
+            return None;
+        }
+
+        if is_ip6 && n < IPV6_HEADER_LEN {
+            tracing::debug!("RWC dropping short packet ({} < {})", n, IPV6_HEADER_LEN);
+            return None;
+        }
+
+        // MTU enforcement
+        if n as u64 > self.mtu {
+            if is_ip6 {
+                let ptb = build_icmpv6_ptb(packet, self.mtu as u32);
+                if let Some(ptb) = ptb {
+                    let _ = self.core.write_to(&ptb, &from_addr).await;
+                }
+            }
+            return None;
+        }
+
+        let from_key = from_addr.0;
+        self.update_key(from_key).await;
+
+        // CKR path: dual-mode validation
+        #[cfg(feature = "ckr")]
+        if let Some(ref ckr) = self.ckr {
+            let accepted = self.ckr_read_validate(ckr, packet, is_ip4, is_ip6, &from_key).await;
+            if !accepted {
+                return None;
+            }
+            if let Some(fw) = &self.firewall {
+                if fw.enabled() && is_ip6 && !fw.check_inbound(packet) {
+                    tracing::debug!("RWC firewall: drop inbound (CKR path)");
+                    return None;
+                }
+            }
+            return Some(range);
+        }
+
+        // Standard (non-CKR) path: IPv6 only validation
+        let mut src_ip = [0u8; 16];
+        let mut dst_ip = [0u8; 16];
+        src_ip.copy_from_slice(&packet[8..24]);
+        dst_ip.copy_from_slice(&packet[24..40]);
+
+        // Verify destination is us
+        let dst_is_addr = dst_ip == self.address.0;
+        let mut dst_subnet_bytes = [0u8; 8];
+        dst_subnet_bytes.copy_from_slice(&dst_ip[..8]);
+        let dst_is_subnet = dst_subnet_bytes == self.subnet.0;
+
+        if !dst_is_addr && !dst_is_subnet {
+            tracing::debug!("RWC dropping: dst {:x?} is neither our addr nor subnet", &dst_ip[..4]);
+            return None;
+        }
+
+        // Verify source address matches the key we got it from
+        let src_valid = {
+            let lookups = self.lookups.load();
+            if let Some(info) = lookups.key_to_info.get(&from_key) {
+                let src_addr_match = src_ip == info.address.0;
+                let mut src_subnet_bytes = [0u8; 8];
+                src_subnet_bytes.copy_from_slice(&src_ip[..8]);
+                let src_subnet_match = src_subnet_bytes == info.subnet.0;
+                src_addr_match || src_subnet_match
+            } else {
+                false
+            }
+        };
+
+        if !src_valid {
+            tracing::debug!("RWC dropping: src addr doesn't match sender key");
+            return None;
+        }
+
+        if let Some(fw) = &self.firewall {
+            if fw.enabled() && !fw.check_inbound(packet) {
+                tracing::debug!("RWC firewall: drop inbound");
+                return None;
+            }
+        }
+
+        tracing::debug!("RWC delivering {} bytes to TUN", n);
+        Some(range)
     }
 
     /// Write a packet from the TUN to the network (Core).

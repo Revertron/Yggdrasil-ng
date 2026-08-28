@@ -592,6 +592,14 @@ impl DeliveryQueue {
         self.queue.lock().unwrap().size()
     }
 
+    /// Pop a queued packet if one is ready, without registering a waiting
+    /// reader. Unlike [`try_pop_or_wait`](Self::try_pop_or_wait) this leaves
+    /// `recv_ready` untouched, so a caller that is only polling (and will not
+    /// go on to wait on the channel) does not leave a phantom waiter behind.
+    pub fn try_pop(&self) -> Option<TrafficPacket> {
+        self.queue.lock().unwrap().pop_codel(std::time::Instant::now())
+    }
+
     /// Called by read_from() before waiting on channel. Returns Some(packet)
     /// if one is already queued, or None if the reader should wait (recv_ready incremented).
     pub fn try_pop_or_wait(&self) -> Option<TrafficPacket> {
