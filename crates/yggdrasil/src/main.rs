@@ -211,10 +211,25 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Console mode: Ctrl+C triggers shutdown
+    // Shutdown on Ctrl+C, or on SIGTERM from a service manager.
     let (watch_tx, watch_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+                _ = sigint.recv()  => tracing::info!("Received SIGINT"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
         let _ = watch_tx.send(true);
     });
 
