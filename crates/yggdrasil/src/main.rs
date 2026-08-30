@@ -376,6 +376,8 @@ async fn run_node(
             &addr_str,
             &subnet_str,
             tun_mtu,
+            #[cfg(target_os = "linux")]
+            config.if_gso,
             #[cfg(windows)]
             &config.if_dns_servers,
             #[cfg(feature = "ckr")]

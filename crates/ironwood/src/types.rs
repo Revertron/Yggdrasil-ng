@@ -84,6 +84,15 @@ pub trait PacketConn: Send + Sync {
     /// Receive a packet. Returns (bytes_read, source_address).
     async fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)>;
 
+    /// Receive a packet if one is already available, without waiting for the
+    /// network. Returns `Ok(None)` when nothing is queued.
+    ///
+    /// This is the non-blocking counterpart to [`read_from`](Self::read_from):
+    /// it lets a caller drain what has already arrived without having to
+    /// cancel an in-flight `read_from`, which would discard any packet that
+    /// read had already taken off the queue.
+    fn try_read_from(&self, buf: &mut [u8]) -> Result<Option<(usize, Addr)>>;
+
     /// Send a packet to the given address.
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize>;
 

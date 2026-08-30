@@ -658,6 +658,33 @@ impl crate::types::PacketConn for PacketConnImpl {
         Ok((n, addr))
     }
 
+    fn try_read_from(&self, buf: &mut [u8]) -> Result<Option<(usize, Addr)>> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Error::Closed);
+        }
+
+        // Same two sources as read_from: the delivery queue first, then
+        // packets handed straight to a waiting reader over the channel.
+        let traffic = match self.delivery_queue.try_pop() {
+            Some(pkt) => pkt,
+            None => match self.traffic_rx.try_lock() {
+                Ok(mut rx) => match rx.try_recv() {
+                    Ok(pkt) => pkt,
+                    Err(mpsc::error::TryRecvError::Empty) => return Ok(None),
+                    Err(mpsc::error::TryRecvError::Disconnected) => return Err(Error::Closed),
+                },
+                // Another reader holds the receiver; treat it as "nothing for
+                // us right now" rather than blocking on the lock.
+                Err(_) => return Ok(None),
+            },
+        };
+
+        let n = buf.len().min(traffic.payload.len());
+        buf[..n].copy_from_slice(&traffic.payload[..n]);
+        let addr = Addr(traffic.source);
+        Ok(Some((n, addr)))
+    }
+
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
@@ -1037,6 +1064,49 @@ mod tests {
         assert_eq!(result.unwrap(), 5);
 
         conn.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn try_read_from_is_empty_until_a_packet_arrives() {
+        let key = SigningKey::generate(&mut OsRng);
+        let config = Config::default();
+        let conn = new_packet_conn(key, config);
+
+        use crate::types::PacketConn;
+        let mut buf = [0u8; 1024];
+        assert!(conn.try_read_from(&mut buf).unwrap().is_none());
+
+        // A packet sent to ourselves is delivered back through the same path
+        // read_from serves, so try_read_from must now hand it over.
+        let addr = conn.local_addr();
+        conn.write_to(b"hello", &addr).await.unwrap();
+
+        let (n, from) = loop {
+            if let Some(got) = conn.try_read_from(&mut buf).unwrap() {
+                break got;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(&buf[..n], b"hello");
+        assert_eq!(from, addr);
+
+        // Drained again.
+        assert!(conn.try_read_from(&mut buf).unwrap().is_none());
+
+        conn.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn try_read_from_closed_errors() {
+        let key = SigningKey::generate(&mut OsRng);
+        let config = Config::default();
+        let conn = new_packet_conn(key, config);
+
+        use crate::types::PacketConn;
+        conn.close().await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        assert!(conn.try_read_from(&mut buf).is_err());
     }
 
     #[tokio::test]

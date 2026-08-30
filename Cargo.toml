@@ -15,6 +15,15 @@ lto = true          # Link-time optimization
 codegen-units = 1   # Better optimization, slower compile
 strip = true        # Strip symbols
 
+# Same codegen as release, but keeps the symbols perf/samply need. Build with
+#   RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
+# (frame pointers aren't a profile key, so they go through RUSTFLAGS; without
+# them use `perf record --call-graph dwarf` instead of `fp`.)
+[profile.profiling]
+inherits = "release"
+debug = 1           # line tables: enough for symbol + line attribution
+strip = false
+
 [profile.small]
 inherits = "release"
 opt-level = "z"      # Оптимизация строго по размеру (лучше, чем 2)

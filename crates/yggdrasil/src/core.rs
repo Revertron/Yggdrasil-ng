@@ -189,35 +189,57 @@ impl Core {
     ) -> Result<(Range<usize>, Addr), ironwood::Error> {
         loop {
             let (n, addr) = self.inner.read_from(buf).await?;
-            if n == 0 {
-                continue;
+            if let Some(range) = self.dispatch_frame(buf, n, &addr) {
+                return Ok((range, addr));
             }
-            tracing::debug!("Core read: {n} bytes with {} from {}", buf[0], &addr);
-            match buf[0] {
-                TYPE_SESSION_TRAFFIC => {
-                    return Ok((1..n, addr));
-                }
-                TYPE_SESSION_PROTO => {
-                    // Hand the message off to the proto task. This must never
-                    // block: proto handling talks to the router actor and can
-                    // wait on session setup, while this loop is the only source
-                    // of inbound traffic for the TUN. Dropping is safe, remote
-                    // queries time out on the requester side.
-                    if self
-                        .proto_in_tx
-                        .try_send((addr.0, buf[1..n].to_vec()))
-                        .is_err()
-                    {
-                        tracing::debug!("proto queue full, dropping message from {}", &addr);
-                    }
+        }
+    }
 
-                    // Continue reading, don't return proto messages to caller
-                    continue;
-                }
-                _ => {
-                    continue;
-                }
+    /// Non-blocking counterpart to [`read_from`](Self::read_from): returns the
+    /// next traffic packet only if one has already arrived, `Ok(None)`
+    /// otherwise. Protocol messages found along the way are dispatched exactly
+    /// as they are on the blocking path.
+    pub fn try_read_from(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<Option<(Range<usize>, Addr)>, ironwood::Error> {
+        loop {
+            let Some((n, addr)) = self.inner.try_read_from(buf)? else {
+                return Ok(None);
+            };
+            if let Some(range) = self.dispatch_frame(buf, n, &addr) {
+                return Ok(Some((range, addr)));
             }
+        }
+    }
+
+    /// Classify one session frame of `n` bytes sitting in `buf`. Returns the
+    /// payload range for traffic; returns `None` for a frame consumed here (a
+    /// protocol message, handed to the proto task) or ignored, meaning the
+    /// caller should read again.
+    fn dispatch_frame(&self, buf: &[u8], n: usize, addr: &Addr) -> Option<Range<usize>> {
+        if n == 0 {
+            return None;
+        }
+        tracing::debug!("Core read: {n} bytes with {} from {}", buf[0], addr);
+        match buf[0] {
+            TYPE_SESSION_TRAFFIC => Some(1..n),
+            TYPE_SESSION_PROTO => {
+                // Hand the message off to the proto task. This must never
+                // block: proto handling talks to the router actor and can
+                // wait on session setup, while this loop is the only source
+                // of inbound traffic for the TUN. Dropping is safe, remote
+                // queries time out on the requester side.
+                if self
+                    .proto_in_tx
+                    .try_send((addr.0, buf[1..n].to_vec()))
+                    .is_err()
+                {
+                    tracing::debug!("proto queue full, dropping message from {}", addr);
+                }
+                None
+            }
+            _ => None,
         }
     }
 
