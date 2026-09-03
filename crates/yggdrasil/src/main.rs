@@ -591,7 +591,7 @@ fn parse_prefix_port(s: &str) -> Option<(u8, u16)> {
         return None;
     } else if rest.as_bytes()[0].is_ascii_hexdigit() {
         0
-    } else if rest.as_bytes()[0] != b' ' {
+    } else if rest.as_bytes()[0].is_ascii() && rest.as_bytes()[0] != b' ' {
         1
     } else {
         return None;
@@ -610,6 +610,34 @@ fn parse_prefix_port(s: &str) -> Option<(u8, u16)> {
     Some((prefix, port))
 }
 
+const DEFAULT_ADMIN_PORT: u16 = 9001;
+
+/// Rewrite a default-style TCP admin URI so its port matches the prefix-port
+/// taken from the binary name. Only loopback hosts with the historic port
+/// 9001 are treated as "still default". The host is preserved.
+///
+/// Recognized: tcp://localhost:9001, tcp://127.0.0.1:9001, tcp://[::1]:9001.
+fn rewrite_default_admin_listen(listen: &str, port: u16) -> Option<String> {
+    let rest = listen.strip_prefix("tcp://")?;
+    let (host, listen_port) = if let Some(inner) = rest.strip_prefix('[') {
+        let (host_inner, after) = inner.split_once(']')?;
+        let p = after.strip_prefix(':')?.parse::<u16>().ok()?;
+        (format!("[{}]", host_inner), p)
+    } else {
+        let (host, pstr) = rest.rsplit_once(':')?;
+        (host.to_string(), pstr.parse::<u16>().ok()?)
+    };
+    if listen_port != DEFAULT_ADMIN_PORT {
+        return None;
+    }
+    match host.as_str() {
+        "localhost" | "127.0.0.1" | "[::1]" => {
+            Some(format!("tcp://{}:{}", host, port))
+        }
+        _ => None,
+    }
+}
+
 fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
     yggdrasil::address::set_address_prefix(prefix);
     yggdrasil::multicast::set_multicast_port(port);
@@ -619,10 +647,10 @@ fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
         prefix, port
     );
 
-    // Override admin_listen only when it still has the default value
-    // (i.e. was absent/commented in the config file).
-    if config.admin_listen == "tcp://localhost:9001" {
-        config.admin_listen = format!("tcp://localhost:{}", port);
+    // Override admin_listen only when it still looks like the historic
+    // default (loopback + port 9001). Preserve the configured host.
+    if let Some(rewritten) = rewrite_default_admin_listen(&config.admin_listen, port) {
+        config.admin_listen = rewritten;
     }
 
     // Override if_name only when it is the default "auto"
@@ -654,6 +682,33 @@ fn program_basename() -> String {
         .unwrap_or_default()
 }
 
+/// Strip a trailing Windows ".exe" (any ASCII case). Any other suffix,
+/// including a dotted prefix-port like "02.9001", is kept so two
+/// networks do not collapse onto one config file.
+#[cfg(windows)]
+fn strip_exe_suffix(name: &str) -> &str {
+    if name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
+}
+
+/// On non-Windows the binary name has no `.exe`; return it unchanged.
+#[cfg(not(windows))]
+fn strip_exe_suffix(name: &str) -> &str {
+    name
+}
+
+/// Config filename derived from argv[0] when `--config` is absent.
+fn config_filename_from_program_name(name: &str) -> String {
+    if prefix_port_from_name(name).is_some() {
+        format!("{}.toml", strip_exe_suffix(name))
+    } else {
+        "yggdrasil.toml".to_string()
+    }
+}
+
 /// Extract prefix and port from the binary/symlink/hardlink name.
 /// The last '_' in the name is the marker; everything after it is parsed
 /// with parse_prefix_port (e.g. "029001", "02-9001", "02.9001.exe").
@@ -668,8 +723,9 @@ fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
 /// When `--config` / `-c` is not given:
 /// 1. Determine the config filename:
 ///    - If the binary/symlink/hardlink name contains a recognised prefix+port
-///      suffix (via `prefix_port_from_name`), use `<stem>.toml`
-///      (stem = filename without extension, e.g. `ygg_029001.exe` → `ygg_029001.toml`).
+///      suffix (via `prefix_port_from_name`), use `<name>.toml`, stripping only
+///      a trailing `.exe` (e.g. `ygg_029001.exe` → `ygg_029001.toml`,
+///      `yggdrasil_02.9001` → `yggdrasil_02.9001.toml`).
 ///    - Otherwise fall back to the historic default `yggdrasil.toml`.
 /// 2. Try that filename in the current working directory.
 /// 3. If absent, try the OS-specific system directory with the same filename:
@@ -685,15 +741,7 @@ fn resolve_config_path(matches: &getopts::Matches) -> String {
 
     // Compute the config filename based on the binary name (if prefix/port recognised)
     let name = program_basename();
-    let local = if prefix_port_from_name(&name).is_some() {
-        let stem = Path::new(&name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&name);
-        format!("{}.toml", stem)
-    } else {
-        "yggdrasil.toml".to_string()
-    };
+    let local = config_filename_from_program_name(&name);
 
     if Path::new(&local).exists() {
         return local;
@@ -765,6 +813,10 @@ mod tests {
         assert_eq!(parse_prefix_port("02"), None);
         assert_eq!(parse_prefix_port("02:1023"), None); // port too low
         assert_eq!(parse_prefix_port("gg:9001"), None); // invalid prefix
+        // Multi-byte separator must not panic; it is not a valid suffix.
+        assert_eq!(parse_prefix_port("02€9001"), None);
+        assert_eq!(parse_prefix_port("02—9001"), None);
+        assert_eq!(parse_prefix_port("02я9001"), None);
     }
 
     #[test]
@@ -781,5 +833,78 @@ mod tests {
         assert_eq!(prefix_port_from_name("yggdrasil_02-999"), None); // port < 1024
         // last '_' is the marker
         assert_eq!(prefix_port_from_name("my_ygg_02-9001"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("yggdrasil_02€9001"), None);
+    }
+
+    #[test]
+    fn test_config_filename_from_program_name() {
+        assert_eq!(
+            config_filename_from_program_name("yggdrasil"),
+            "yggdrasil.toml"
+        );
+        assert_eq!(
+            config_filename_from_program_name("ygg_029001"),
+            "ygg_029001.toml"
+        );
+        assert_eq!(
+            config_filename_from_program_name("yggdrasil_02.9001"),
+            "yggdrasil_02.9001.toml"
+        );
+        assert_eq!(
+            config_filename_from_program_name("yggdrasil_02.9002"),
+            "yggdrasil_02.9002.toml"
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_02-9001.exe"),
+                "yggdrasil_02-9001.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_02.9001.exe"),
+                "yggdrasil_02.9001.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("YGGDRASIL_02.9001.EXE"),
+                "YGGDRASIL_02.9001.toml"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_02-9001.exe"),
+                "yggdrasil_02-9001.exe.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_02.9001.exe"),
+                "yggdrasil_02.9001.exe.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("YGGDRASIL_02.9001.EXE"),
+                "YGGDRASIL_02.9001.EXE.toml"
+            );
+        }
+
+    }
+
+    #[test]
+    fn test_rewrite_default_admin_listen() {
+        assert_eq!(
+            rewrite_default_admin_listen("tcp://localhost:9001", 15001).as_deref(),
+            Some("tcp://localhost:15001")
+        );
+        assert_eq!(
+            rewrite_default_admin_listen("tcp://127.0.0.1:9001", 15001).as_deref(),
+            Some("tcp://127.0.0.1:15001")
+        );
+        assert_eq!(
+            rewrite_default_admin_listen("tcp://[::1]:9001", 15001).as_deref(),
+            Some("tcp://[::1]:15001")
+        );
+        // Not the historic default port, or not loopback: leave as-is.
+        assert_eq!(rewrite_default_admin_listen("tcp://localhost:15001", 16000), None);
+        assert_eq!(rewrite_default_admin_listen("tcp://0.0.0.0:9001", 15001), None);
+        assert_eq!(rewrite_default_admin_listen("none", 15001), None);
+        assert_eq!(rewrite_default_admin_listen("unix:///var/run/ygg.sock", 15001), None);
     }
 }
