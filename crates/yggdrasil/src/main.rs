@@ -125,7 +125,17 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let text = Config::generate_config_text();
-            std::fs::write(path_ref, &text)?;
+            {
+                use std::io::Write;
+                let mut opts = OpenOptions::new();
+                opts.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                opts.open(path_ref)?.write_all(text.as_bytes())?;
+            }
             eprintln!("Configuration saved to {}", display_abs_path(path_ref));
         } else {
             print!("{}", Config::generate_config_text());
@@ -636,8 +646,7 @@ fn parse_prefix_port(s: &str) -> Option<(u8, u16)> {
     let p1 = bytes[1] as char;
     let valid_prefix = matches!(
         (p0, p1),
-        ('0', '2' | '4' | '6' | '8' | 'a' | 'c' | 'e' | 'A' | 'C' | 'E')
-            | ('1'..='9' | 'a'..='e' | 'A'..='E', '0' | '2' | '4' | '6' | '8' | 'a' | 'c' | 'e' | 'A' | 'C' | 'E')
+        ('0'..='9' | 'a'..='e' | 'A'..='E', '0' | '2' | '4' | '6' | '8' | 'a' | 'c' | 'e' | 'A' | 'C' | 'E')
             | ('f' | 'F', '0' | '2' | '4' | '6' | '8' | 'a' | 'c' | 'A' | 'C')
     );
     if !valid_prefix {
@@ -720,7 +729,7 @@ fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
         if cfg!(windows) {
             config.if_name = format!("Yggdrasil{}", suffix);
         } else if !cfg!(target_os = "macos") {
-            // Linux / BSD: strip the trailing "0" from "ygg0"
+            // Linux / BSD: ygg0-style name with prefix and port, e.g. ygg0615001
             config.if_name = format!("ygg{}", suffix);
         }
         // macOS: keep "auto" — kernel assigns utunN
@@ -747,7 +756,9 @@ fn program_basename() -> String {
 /// networks do not collapse onto one config file.
 #[cfg(windows)]
 fn strip_exe_suffix(name: &str) -> &str {
-    if name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe") {
+        // ".exe" is ASCII, so len-4 is always a char boundary here.
         &name[..name.len() - 4]
     } else {
         name
@@ -806,11 +817,11 @@ fn system_config_path(filename: &str) -> String {
 /// (the path they passed with `-c`/`--config`, or the system default when
 /// no path was given). Other I/O and TOML errors are left unchanged.
 fn load_config_file(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
-    let file = match File::open(path) {
+    let open_path = expand_genconf_path(path);
+    let file = match File::open(&open_path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
-                // "Error: Can't find the configuration file {}\n{}",
                 "Error: Can't find the configuration file. Create a configuration file with:\n    yggdrasil --genconf={}\n\n{}",
                 path,
                 make_cli_options().usage(&usage_string())
@@ -976,6 +987,19 @@ mod tests {
                 config_filename_from_program_name("YGGDRASIL_02.9001.EXE"),
                 "YGGDRASIL_02.9001.toml"
             );
+            // Non-ASCII tail: must not panic, and must not strip anything.
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_029001é€"),
+                "yggdrasil_029001é€.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_029001é€.exe"),
+                "yggdrasil_029001é€.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_029001é€.EXE"),
+                "yggdrasil_029001é€.toml"
+            );
         }
         #[cfg(not(windows))]
         {
@@ -990,6 +1014,10 @@ mod tests {
             assert_eq!(
                 config_filename_from_program_name("YGGDRASIL_02.9001.EXE"),
                 "YGGDRASIL_02.9001.EXE.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_029001é€"),
+                "yggdrasil_029001é€.toml"
             );
         }
 
@@ -1083,14 +1111,18 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_expand_genconf_path_windows_env() {
-        std::env::set_var("YGG_TEST_GENCONF_DIR", r"C:\ProgramData");
+        let val = std::env::var("ALLUSERSPROFILE")
+            .unwrap_or_else(|_| r"C:\ProgramData".to_string());
         assert_eq!(
-            expand_genconf_path(r"%YGG_TEST_GENCONF_DIR%\Yggdrasil-ng\yggdrasil.toml"),
-            r"C:\ProgramData\Yggdrasil-ng\yggdrasil.toml"
+            expand_genconf_path(r"%ALLUSERSPROFILE%\Yggdrasil-ng\yggdrasil.toml"),
+            format!(r"{}\Yggdrasil-ng\yggdrasil.toml", val)
         );
         assert_eq!(
             expand_genconf_path(r"%YGG_TEST_GENCONF_DOES_NOT_EXIST%\x.toml"),
             r"%YGG_TEST_GENCONF_DOES_NOT_EXIST%\x.toml"
         );
+        // Unknown names and a lone percent stay unchanged.
+        assert_eq!(expand_genconf_path(r"%"), r"%");
+        assert_eq!(expand_genconf_path(r"%%"), r"%%");
     }
 }
