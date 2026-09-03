@@ -46,24 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
-    let mut opts = Options::new();
-    opts.optflagopt("g", "genconf", "Generate a new configuration (optionally save to FILE)", "FILE");
-    opts.optflagopt("", "normalize", "Normalize a config: read from FILE (or stdin if absent), add any missing fields with defaults while preserving user values and comments, and print to stdout", "FILE");
-    opts.optopt("c", "config", "Config file path (default: yggdrasil.toml, then system path)", "FILE");
-    opts.optflag("", "autoconf", "Run without a configuration file (use ephemeral keys)");
-    opts.optflag("a", "address", "Print the IPv6 address for the given config and exit");
-    opts.optflag("s", "subnet", "Print the IPv6 subnet for the given config and exit");
-    opts.optopt("l", "loglevel", "Log level: error, warn, info, debug, trace (default: info)", "LEVEL");
-    opts.optflag("n", "no-replace", "With --genconf FILE, skip if the file already exists");
-    opts.optopt("", "logto", "Log to a file instead of stderr", "FILE");
-    #[cfg(feature = "ctl")]
-    opts.optopt("e", "endpoint", "Admin socket address (default: tcp://localhost:9001)", "URI");
-    #[cfg(feature = "ctl")]
-    opts.optflag("j", "json", "Output control command results as raw JSON");
-    #[cfg(windows)]
-    opts.optflag("", "service", "Run as a Windows service (launched by the Service Control Manager)");
-    opts.optflag("h", "help", "Print this help");
-    opts.optflag("v", "version", "Print version");
+    let opts = make_cli_options();
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -129,13 +112,21 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // --genconf [FILE]: generate config, save to file or print to stdout
     if matches.opt_present("genconf") {
         if let Some(path) = matches.opt_str("genconf") {
-            if matches.opt_present("no-replace") && std::path::Path::new(&path).exists() {
-                eprintln!("Configuration file {} already exists, skipping", path);
+            let path = expand_genconf_path(&path);
+            let path_ref = Path::new(&path);
+            if matches.opt_present("no-replace") && path_ref.exists() {
+                eprintln!("Configuration file {} already exists, skipping", display_abs_path(path_ref));
                 return Ok(());
             }
+            if let Some(parent) = config_parent_dir(path_ref) {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)?;
+                    eprintln!("Created folder {}", display_abs_path(parent));
+                }
+            }
             let text = Config::generate_config_text();
-            std::fs::write(&path, &text)?;
-            eprintln!("Configuration saved to {}", path);
+            std::fs::write(path_ref, &text)?;
+            eprintln!("Configuration saved to {}", display_abs_path(path_ref));
         } else {
             print!("{}", Config::generate_config_text());
         }
@@ -176,13 +167,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Load config
     let config = if autoconf {
         Config::default()
-    } else if !config_path.is_empty() {
-        let file = File::open(&config_path)?;
-        let config = std::io::read_to_string(file)?;
-        toml::from_str::<Config>(&config)?
     } else {
-        tracing::error!("Please specify --genconf, --config, or --autoconf");
-        std::process::exit(1);
+        load_config_file(&config_path)?
     };
 
     // Parse or generate signing key
@@ -273,12 +259,8 @@ async fn run_node(
     // Load config
     let mut config = if autoconf {
         Config::default()
-    } else if !config_path.is_empty() {
-        let file = File::open(&config_path)?;
-        let text = std::io::read_to_string(file)?;
-        toml::from_str::<Config>(&text)?
     } else {
-        return Err("No configuration: specify --config or --autoconf".into());
+        load_config_file(&config_path)?
     };
 
     if let Some((prefix, port)) = resolve_prefix_port() {
@@ -539,6 +521,84 @@ fn init_logging(loglevel: &str, logto: Option<&str>) {
     });
 }
 
+/// Expand `%VAR%` on Windows (e.g. `%ALLUSERSPROFILE%`, `%ProgramData%`).
+/// Unknown names and `%%` are left unchanged. On other OS the path is unchanged.
+fn expand_genconf_path(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        let mut out = String::with_capacity(path.len());
+        let mut rest = path;
+        while let Some(start) = rest.find('%') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            if let Some(end) = after.find('%') {
+                let name = &after[..end];
+                if !name.is_empty() {
+                    if let Ok(val) = std::env::var(name) {
+                        out.push_str(&val);
+                        rest = &after[end + 1..];
+                        continue;
+                    }
+                }
+            }
+            out.push('%');
+            rest = after;
+        }
+        out.push_str(rest);
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string()
+    }
+}
+
+/// Parent directory of a config file path, if one should be considered
+/// for creation. `yggdrasil.toml` and `./yggdrasil.toml` have no folder.
+fn config_parent_dir(path: &Path) -> Option<&Path> {
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() || parent == Path::new(".") {
+        None
+    } else {
+        Some(parent)
+    }
+}
+
+/// Absolute path for messages. Does not call canonicalize() (avoids `\\?\` on Windows).
+fn display_abs_path(path: &Path) -> String {
+    if path.is_absolute() {
+        path.display().to_string()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path).display().to_string()
+    } else {
+        path.display().to_string()
+    }
+}
+
+/// CLI flags for the daemon. Shared by argument parsing and by the
+/// "config file not found" error so both print the same Usage text.
+fn make_cli_options() -> Options {
+    let mut opts = Options::new();
+    opts.optflagopt("g", "genconf", "Generate a new configuration (optionally save to FILE)", "FILE");
+    opts.optflagopt("", "normalize", "Normalize a config: read from FILE (or stdin if absent), add any missing fields with defaults while preserving user values and comments, and print to stdout", "FILE");
+    opts.optopt("c", "config", "Config file path (default: yggdrasil.toml, then system path)", "FILE");
+    opts.optflag("", "autoconf", "Run without a configuration file (use ephemeral keys)");
+    opts.optflag("a", "address", "Print the IPv6 address for the given config and exit");
+    opts.optflag("s", "subnet", "Print the IPv6 subnet for the given config and exit");
+    opts.optopt("l", "loglevel", "Log level: error, warn, info, debug, trace (default: info)", "LEVEL");
+    opts.optflag("n", "no-replace", "With --genconf FILE, skip if the file already exists");
+    opts.optopt("", "logto", "Log to a file instead of stderr", "FILE");
+    #[cfg(feature = "ctl")]
+    opts.optopt("e", "endpoint", "Admin socket address (default: tcp://localhost:9001)", "URI");
+    #[cfg(feature = "ctl")]
+    opts.optflag("j", "json", "Output control command results as raw JSON");
+    #[cfg(windows)]
+    opts.optflag("", "service", "Run as a Windows service (launched by the Service Control Manager)");
+    opts.optflag("h", "help", "Print this help");
+    opts.optflag("v", "version", "Print version");
+    opts
+}
+
 fn usage_string() -> String {
     #[cfg(feature = "ctl")]
     return "Usage: yggdrasil [options] [command [key=value ...]]".to_string();
@@ -718,6 +778,51 @@ fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
     parse_prefix_port(suffix)
 }
 
+/// System default location for `filename` (the second of the two default
+/// paths). Used both to look the file up and to name it in the "not found"
+/// error when neither default exists.
+///
+/// On Windows this returns the `%ALLUSERSPROFILE%` form rather than the
+/// resolved ProgramData directory: that is what the error message should
+/// show. The actual existence check still uses `windows_program_data_dir()`.
+fn system_config_path(filename: &str) -> String {
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        format!("/etc/yggdrasil/{}", filename)
+    }
+    #[cfg(windows)]
+    {
+        format!("%ALLUSERSPROFILE%\\Yggdrasil-ng\\{}", filename)
+    }
+    #[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
+    {
+        filename.to_string()
+    }
+}
+
+/// Open and parse a TOML config file.
+///
+/// `NotFound` is rewritten so the user sees the path that was looked up
+/// (the path they passed with `-c`/`--config`, or the system default when
+/// no path was given). Other I/O and TOML errors are left unchanged.
+fn load_config_file(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                // "Error: Can't find the configuration file {}\n{}",
+                "Error: Can't find the configuration file. Create a configuration file with:\n    yggdrasil --genconf={}\n\n{}",
+                path,
+                make_cli_options().usage(&usage_string())
+            );
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let text = std::io::read_to_string(file)?;
+    Ok(toml::from_str::<Config>(&text)?)
+}
+
 /// Resolve the configuration file path.
 ///
 /// When `--config` / `-c` is not given:
@@ -732,11 +837,15 @@ fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
 ///    - Unix-like (Linux except Android, BSD, macOS, …): `/etc/yggdrasil/<filename>`
 ///    - Windows: `<ProgramData>\Yggdrasil-ng\<filename>`, where ProgramData is
 ///      obtained via SHGetKnownFolderPath(FOLDERID_ProgramData)
-/// 4. If still not found, return the filename so that the subsequent
-///    `File::open` produces the same style of error message as before.
+/// 4. If still not found, return the system path from step 3 (not the
+///    working-directory filename) so the subsequent open() error names
+///    the location the user is expected to create.
 fn resolve_config_path(matches: &getopts::Matches) -> String {
     if let Some(path) = matches.opt_str("config") {
-        return path;
+        if !path.is_empty() {
+            return path;
+        }
+        // Empty --config / -c: same lookup as when the flag is omitted.
     }
 
     // Compute the config filename based on the binary name (if prefix/port recognised)
@@ -765,9 +874,8 @@ fn resolve_config_path(matches: &getopts::Matches) -> String {
         }
     }
 
-    // File not found anywhere — return the computed filename so open() fails
-    // with the same style of error message as before.
-    local
+    // Neither default exists. Name the system path in the error that follows.
+    system_config_path(&local)
 }
 
 /// Return the real ProgramData directory via SHGetKnownFolderPath(FOLDERID_ProgramData).
@@ -888,6 +996,45 @@ mod tests {
     }
 
     #[test]
+    fn test_system_config_path() {
+        #[cfg(all(unix, not(target_os = "android")))]
+        {
+            assert_eq!(
+                system_config_path("yggdrasil.toml"),
+                "/etc/yggdrasil/yggdrasil.toml"
+            );
+            assert_eq!(
+                system_config_path("ygg_0615001.toml"),
+                "/etc/yggdrasil/ygg_0615001.toml"
+            );
+            assert_eq!(
+                system_config_path("yggdrasil_02.9001.toml"),
+                "/etc/yggdrasil/yggdrasil_02.9001.toml"
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                system_config_path("yggdrasil.toml"),
+                "%ALLUSERSPROFILE%\\Yggdrasil-ng\\yggdrasil.toml"
+            );
+            assert_eq!(
+                system_config_path("ygg_0615001.toml"),
+                "%ALLUSERSPROFILE%\\Yggdrasil-ng\\ygg_0615001.toml"
+            );
+            assert_eq!(
+                system_config_path("yggdrasil_02.9001.toml"),
+                "%ALLUSERSPROFILE%\\Yggdrasil-ng\\yggdrasil_02.9001.toml"
+            );
+        }
+        #[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
+        {
+            assert_eq!(system_config_path("yggdrasil.toml"), "yggdrasil.toml");
+            assert_eq!(system_config_path("ygg_0615001.toml"), "ygg_0615001.toml");
+        }
+    }
+
+    #[test]
     fn test_rewrite_default_admin_listen() {
         assert_eq!(
             rewrite_default_admin_listen("tcp://localhost:9001", 15001).as_deref(),
@@ -906,5 +1053,44 @@ mod tests {
         assert_eq!(rewrite_default_admin_listen("tcp://0.0.0.0:9001", 15001), None);
         assert_eq!(rewrite_default_admin_listen("none", 15001), None);
         assert_eq!(rewrite_default_admin_listen("unix:///var/run/ygg.sock", 15001), None);
+    }
+
+    #[test]
+    fn test_config_parent_dir() {
+        assert!(config_parent_dir(Path::new("yggdrasil.toml")).is_none());
+        assert!(config_parent_dir(Path::new("./yggdrasil.toml")).is_none());
+        assert_eq!(
+            config_parent_dir(Path::new("/etc/yggdrasil/yggdrasil.toml"))
+                .map(|p| p.to_str().unwrap()),
+            Some("/etc/yggdrasil")
+        );
+        assert_eq!(
+            config_parent_dir(Path::new("foo/bar.toml")).map(|p| p.to_str().unwrap()),
+            Some("foo")
+        );
+        assert_eq!(
+            config_parent_dir(Path::new("/yggdrasil.toml")).map(|p| p.to_str().unwrap()),
+            Some("/")
+        );
+    }
+
+    #[test]
+    fn test_expand_genconf_path_leaves_plain_paths() {
+        assert_eq!(expand_genconf_path("/etc/yggdrasil/yggdrasil.toml"), "/etc/yggdrasil/yggdrasil.toml");
+        assert_eq!(expand_genconf_path("yggdrasil.toml"), "yggdrasil.toml");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_expand_genconf_path_windows_env() {
+        std::env::set_var("YGG_TEST_GENCONF_DIR", r"C:\ProgramData");
+        assert_eq!(
+            expand_genconf_path(r"%YGG_TEST_GENCONF_DIR%\Yggdrasil-ng\yggdrasil.toml"),
+            r"C:\ProgramData\Yggdrasil-ng\yggdrasil.toml"
+        );
+        assert_eq!(
+            expand_genconf_path(r"%YGG_TEST_GENCONF_DOES_NOT_EXIST%\x.toml"),
+            r"%YGG_TEST_GENCONF_DOES_NOT_EXIST%\x.toml"
+        );
     }
 }
