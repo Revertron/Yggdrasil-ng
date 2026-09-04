@@ -156,7 +156,12 @@ impl TunAdapter {
         let actual_name = device.name().unwrap_or_else(|_| tun_name.to_string());
         let actual_mtu = device.mtu().unwrap_or(mtu);
         tracing::info!("TUN device '{}' created with address {} and MTU {}", actual_name, addr, actual_mtu);
-
+        // Overlay MTU must follow the kernel-clamped interface MTU.
+        // Otherwise inbound packets larger than tun(4) TUNMTU pass the
+        // RWC check, fail tunwrite (EIO on NetBSD) and never produce
+        // an ICMPv6 Packet Too Big for the sender.
+        rwc.set_mtu(actual_mtu as u64);
+        
         // Install CKR routes if configured
         #[cfg(feature = "ckr")]
         if let Some(ckr_cfg) = ckr_config {
