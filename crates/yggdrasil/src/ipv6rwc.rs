@@ -1,5 +1,6 @@
 use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap as HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,7 +44,10 @@ pub struct ReadWriteCloser {
     /// Serializes writers to `lookups` so concurrent updates don't lose changes.
     lookups_write: std::sync::Mutex<()>,
     buffers: Mutex<KeyStoreBuffers>,
-    mtu: u64,
+    /// Overlay payload cap advertised via ICMPv6 PTB.
+    /// Starts as `core.mtu()`, then `set_mtu()` lowers it to the TUN
+    /// interface MTU after the kernel may have clamped `if_mtu`.
+    mtu: AtomicU64,
     #[cfg(feature = "ckr")]
     ckr: Option<CryptoKey>,
     firewall: Option<Arc<Firewall>>,
@@ -95,7 +99,7 @@ impl ReadWriteCloser {
                 addr_buffer: HashMap::default(),
                 subnet_buffer: HashMap::default(),
             }),
-            mtu,
+            mtu: AtomicU64::new(mtu.clamp(1280, 65535)),
             #[cfg(feature = "ckr")]
             ckr,
             firewall,
@@ -147,10 +151,12 @@ impl ReadWriteCloser {
                 continue;
             }
 
-            // MTU enforcement
-            if n as u64 > self.mtu {
+            // MTU enforcement. Use the TUN-clamped overlay MTU, not the
+            // ironwood cap from construction.
+            let overlay_mtu = self.mtu.load(Ordering::Relaxed);
+            if n as u64 > overlay_mtu {
                 if is_ip6 {
-                    let ptb = build_icmpv6_ptb(packet, self.mtu as u32);
+                    let ptb = build_icmpv6_ptb(packet, overlay_mtu as u32);
                     if let Some(ptb) = ptb {
                         let _ = self.core.write_to(&ptb, &from_addr).await;
                     }
@@ -431,7 +437,23 @@ impl ReadWriteCloser {
     }
 
     pub fn mtu(&self) -> u64 {
-        self.mtu
+        self.mtu.load(Ordering::Relaxed)
+    }
+
+    /// Lower the overlay MTU to the TUN interface's actual MTU.
+    ///
+    /// `ReadWriteCloser::new` runs before the TUN exists and stores
+    /// `core.mtu()` (~65535). After `TunAdapter` probes the kernel,
+    /// call this with `device.mtu()`. Incoming packets larger than
+    /// the new value are dropped in `read()` and answered with
+    /// ICMPv6 Packet Too Big so the sender can shrink.
+    ///
+    /// Never raises the cap above what `new()` stored (ironwood
+    /// payload limit). Values below 1280 are raised to the IPv6
+    /// minimum.
+    pub fn set_mtu(&self, mtu: u64) {
+        let mtu = clamp_overlay_mtu(self.mtu.load(Ordering::Relaxed), mtu);
+        self.mtu.store(mtu, Ordering::Relaxed);
     }
 
     // --- CKR helper methods ---
@@ -584,6 +606,11 @@ impl ReadWriteCloser {
     }
 }
 
+/// Resulting overlay MTU: IPv6 floor..65535, and never above `current`.
+fn clamp_overlay_mtu(current: u64, requested: u64) -> u64 {
+    requested.clamp(1280, 65535).min(current)
+}
+
 /// Build an ICMPv6 Packet Too Big message.
 /// Takes the original oversized packet and the MTU to report.
 fn build_icmpv6_ptb(original: &[u8], mtu: u32) -> Option<Vec<u8>> {
@@ -697,5 +724,27 @@ mod tests {
         // Verify src/dst swapped
         assert_eq!(&ptb[8..24], &packet[24..40]); // response src = orig dst
         assert_eq!(&ptb[24..40], &packet[8..24]); // response dst = orig src
+    }
+
+    #[test]
+    fn clamp_overlay_mtu_lowers_to_stock_netbsd_tunmtu() {
+        assert_eq!(clamp_overlay_mtu(65535, 1500), 1500);
+    }
+
+    #[test]
+    fn clamp_overlay_mtu_does_not_raise_above_current() {
+        // Custom kernel already probed to 1500; a later 65535 must not
+        // lift the overlay cap back up.
+        assert_eq!(clamp_overlay_mtu(1500, 65535), 1500);
+    }
+
+    #[test]
+    fn clamp_overlay_mtu_rejects_below_ipv6_minimum() {
+        assert_eq!(clamp_overlay_mtu(65535, 100), 1280);
+    }
+
+    #[test]
+    fn clamp_overlay_mtu_keeps_matching_jumbo() {
+        assert_eq!(clamp_overlay_mtu(65535, 65535), 65535);
     }
 }
