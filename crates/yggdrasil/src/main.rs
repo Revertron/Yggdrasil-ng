@@ -632,12 +632,27 @@ fn print_ctl_commands() {
     println!("    getLookup key=<hex>, forceLookup key=<hex>");
 }
 
+/// Hex offset added to prefix/2 when the name carries a prefix but no port.
+/// `00` → 0x2328 = 9000, `02` → 0x2329 = 9001, `fc` → 0x23A6 = 9126.
+const DERIVED_PORT_OFFSET: u16 = 0x2328;
+
+/// Admin/multicast port derived from a `*00::/7` prefix when the filename
+/// suffix has no explicit port (`ygg_02`, `yggdrasil_fc`).
+fn port_from_prefix(prefix: u8) -> u16 {
+    (prefix as u16 / 2) + DERIVED_PORT_OFFSET
+}
+
 /// Parse a prefix-port value according to the required format.
 /// Used for the suffix after the last '_' in the binary/symlink/hardlink name.
+///
+/// Accepted forms:
+/// - prefix + port: "029001", "02-9001", "02.9001", "02:9001"
+/// - prefix only:   "02", "fc"  (port = prefix/2 + 0x2328)
+///
 /// Returns (prefix_u8, port_u16) on success, None on failure.
 fn parse_prefix_port(s: &str) -> Option<(u8, u16)> {
     // Manual implementation of the given regex (no extra dependency).
-    if s.len() < 6 {
+    if s.len() < 2 {
         return None;
     }
     let bytes = s.as_bytes();
@@ -657,7 +672,8 @@ fn parse_prefix_port(s: &str) -> Option<(u8, u16)> {
     // Optional separator: any char that is not space and not hex digit
     let rest = &s[2..];
     let numeric_start = if rest.is_empty() {
-        return None;
+        // Suffix is only the prefix (`ygg_02`, `yggdrasil_fc`).
+        return Some((prefix, port_from_prefix(prefix)));
     } else if rest.as_bytes()[0].is_ascii_hexdigit() {
         0
     } else if rest.as_bytes()[0].is_ascii() && rest.as_bytes()[0] != b' ' {
@@ -782,8 +798,10 @@ fn config_filename_from_program_name(name: &str) -> String {
 
 /// Extract prefix and port from the binary/symlink/hardlink name.
 /// The last '_' in the name is the marker; everything after it is parsed
-/// with parse_prefix_port (e.g. "029001", "02-9001", "02.9001.exe").
+/// with parse_prefix_port (e.g. "029001", "02-9001", "02.9001", "02").
+/// A trailing Windows ".exe" is stripped first so "ygg_02.exe" is "ygg_02".
 fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
+    let name = strip_exe_suffix(name);
     let idx = name.rfind('_')?;
     let suffix = &name[idx + 1..];
     parse_prefix_port(suffix)
@@ -929,13 +947,24 @@ mod tests {
         assert_eq!(parse_prefix_port("02-9001"), Some((0x02, 9001)));
         assert_eq!(parse_prefix_port("029001"), Some((0x02, 9001)));
         assert_eq!(parse_prefix_port("fc.65535"), Some((0xfc, 65535)));
-        assert_eq!(parse_prefix_port("02"), None);
+        assert_eq!(parse_prefix_port("02"), Some((0x02, 9001)));
+        assert_eq!(parse_prefix_port("fc"), Some((0xfc, 9126)));
         assert_eq!(parse_prefix_port("02:1023"), None); // port too low
         assert_eq!(parse_prefix_port("gg:9001"), None); // invalid prefix
         // Multi-byte separator must not panic; it is not a valid suffix.
         assert_eq!(parse_prefix_port("02€9001"), None);
         assert_eq!(parse_prefix_port("02—9001"), None);
         assert_eq!(parse_prefix_port("02я9001"), None);
+    }
+
+    #[test]
+    fn test_port_from_prefix() {
+        assert_eq!(port_from_prefix(0x00), 9000);
+        assert_eq!(port_from_prefix(0x02), 9001);
+        assert_eq!(port_from_prefix(0xfc), 9126);
+        // prefix/2 + 0x2328, then decimal
+        assert_eq!(port_from_prefix(0x02), (0x02u16 / 2) + 0x2328);
+        assert_eq!(port_from_prefix(0xfc), (0xfcu16 / 2) + 0x2328);
     }
 
     #[test]
@@ -948,11 +977,19 @@ mod tests {
         assert_eq!(prefix_port_from_name("yggdrasil"), None);
         assert_eq!(prefix_port_from_name("yggdrasil_"), None);
         assert_eq!(prefix_port_from_name("yggdrasil_foo"), None);
-        assert_eq!(prefix_port_from_name("yggdrasil_02"), None);
+        assert_eq!(prefix_port_from_name("yggdrasil_02"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("ygg_02"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("ygg_fc"), Some((0xfc, 9126)));
+        assert_eq!(prefix_port_from_name("yggdrasil_00"), Some((0x00, 9000)));
         assert_eq!(prefix_port_from_name("yggdrasil_02-999"), None); // port < 1024
         // last '_' is the marker
         assert_eq!(prefix_port_from_name("my_ygg_02-9001"), Some((0x02, 9001)));
         assert_eq!(prefix_port_from_name("yggdrasil_02€9001"), None);
+        #[cfg(windows)]
+        {
+            assert_eq!(prefix_port_from_name("ygg_02.exe"), Some((0x02, 9001)));
+            assert_eq!(prefix_port_from_name("yggdrasil_fc.EXE"), Some((0xfc, 9126)));
+        }
     }
 
     #[test]
@@ -960,6 +997,14 @@ mod tests {
         assert_eq!(
             config_filename_from_program_name("yggdrasil"),
             "yggdrasil.toml"
+        );
+        assert_eq!(
+            config_filename_from_program_name("ygg_02"),
+            "ygg_02.toml"
+        );
+        assert_eq!(
+            config_filename_from_program_name("yggdrasil_fc"),
+            "yggdrasil_fc.toml"
         );
         assert_eq!(
             config_filename_from_program_name("ygg_029001"),
@@ -975,6 +1020,10 @@ mod tests {
         );
         #[cfg(windows)]
         {
+            assert_eq!(
+                config_filename_from_program_name("ygg_02.exe"),
+                "ygg_02.toml"
+            );
             assert_eq!(
                 config_filename_from_program_name("yggdrasil_02-9001.exe"),
                 "yggdrasil_02-9001.toml"

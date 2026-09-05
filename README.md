@@ -146,9 +146,9 @@ Print your address without starting the daemon:
 ```bash
 yggdrasil --config yggdrasil.toml --address
 ```
-
 A custom `*00::/7` prefix (`00`–`fc`) and port (`1024`–`65535`) can be taken from the name of the binary, symlink or hardlink.
-The last `_` in the filename is the marker; everything after it is parsed by the same rules (e.g. `yggdrasil_029001`, `yggdrasil_02-9001`, `ygg_029001`, `yggdrasil_02.9001.exe`).
+The last `_` in the filename is the marker; everything after it is parsed as prefix and optional port (e.g. `yggdrasil_029001`, `yggdrasil_02-9001`, `ygg_029001`, `yggdrasil_02.9001.exe`).
+If the suffix is only a valid prefix (`yggdrasil_02`, `ygg_02`, `ygg_fc`), the admin/multicast port is derived as `prefix/2 + 0x2328` (`02` → `9001`, `fc` → `9126`, range `9000`–`9126`).
 If the name does not provide a valid value the defaults (`0x02` / `9001`) are kept.
 This also affects control-mode commands (`getPeers`, `getTree`, …) and the TUN interface name, so a renamed binary automatically talks to the matching admin socket and uses a matching interface name.
 
