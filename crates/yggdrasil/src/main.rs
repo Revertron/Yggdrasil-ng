@@ -1,4 +1,5 @@
 use std::fs::{File, OpenOptions};
+use std::path::Path;
 use ed25519_dalek::SigningKey;
 use getopts::Options;
 use time::macros::format_description;
@@ -45,24 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
-    let mut opts = Options::new();
-    opts.optflagopt("g", "genconf", "Generate a new configuration (optionally save to FILE)", "FILE");
-    opts.optflagopt("", "normalize", "Normalize a config: read from FILE (or stdin if absent), add any missing fields with defaults while preserving user values and comments, and print to stdout", "FILE");
-    opts.optopt("c", "config", "Config file path (default: yggdrasil.toml)", "FILE");
-    opts.optflag("", "autoconf", "Run without a configuration file (use ephemeral keys)");
-    opts.optflag("a", "address", "Print the IPv6 address for the given config and exit");
-    opts.optflag("s", "subnet", "Print the IPv6 subnet for the given config and exit");
-    opts.optopt("l", "loglevel", "Log level: error, warn, info, debug, trace (default: info)", "LEVEL");
-    opts.optflag("n", "no-replace", "With --genconf FILE, skip if the file already exists");
-    opts.optopt("", "logto", "Log to a file instead of stderr", "FILE");
-    #[cfg(feature = "ctl")]
-    opts.optopt("e", "endpoint", "Admin socket address (default: tcp://localhost:9001)", "URI");
-    #[cfg(feature = "ctl")]
-    opts.optflag("j", "json", "Output control command results as raw JSON");
-    #[cfg(windows)]
-    opts.optflag("", "service", "Run as a Windows service (launched by the Service Control Manager)");
-    opts.optflag("h", "help", "Print this help");
-    opts.optflag("v", "version", "Print version");
+    let opts = make_cli_options();
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -85,11 +69,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Resolve prefix/port early from binary/symlink/hardlink name suffix
+    // so --address / --subnet and control-mode endpoint see the correct values.
+    // Config mutation and the info message happen later (after logging is ready).
+    if let Some((prefix, port)) = resolve_prefix_port() {
+        yggdrasil::address::set_address_prefix(prefix);
+        yggdrasil::multicast::set_multicast_port(port);
+    }
+
     // If there are free (positional) arguments, treat as a control command
     #[cfg(feature = "ctl")]
     if !matches.free.is_empty() {
         let endpoint = matches.opt_str("endpoint")
-            .unwrap_or_else(|| "tcp://localhost:9001".to_string());
+            .unwrap_or_else(|| format!("tcp://localhost:{}", yggdrasil::multicast::multicast_port()));
         let json_output = matches.opt_present("json");
         let command = matches.free[0].clone();
 
@@ -110,7 +102,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         return service::run_as_service();
     }
 
-    let config_path = matches.opt_str("config").unwrap_or_else(|| "yggdrasil.toml".to_string());
+    let config_path = resolve_config_path(&matches);
     let autoconf = matches.opt_present("autoconf");
     let address = matches.opt_present("address");
     let subnet = matches.opt_present("subnet");
@@ -120,13 +112,31 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // --genconf [FILE]: generate config, save to file or print to stdout
     if matches.opt_present("genconf") {
         if let Some(path) = matches.opt_str("genconf") {
-            if matches.opt_present("no-replace") && std::path::Path::new(&path).exists() {
-                eprintln!("Configuration file {} already exists, skipping", path);
+            let path = expand_genconf_path(&path);
+            let path_ref = Path::new(&path);
+            if matches.opt_present("no-replace") && path_ref.exists() {
+                eprintln!("Configuration file {} already exists, skipping", display_abs_path(path_ref));
                 return Ok(());
             }
+            if let Some(parent) = config_parent_dir(path_ref) {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)?;
+                    eprintln!("Created folder {}", display_abs_path(parent));
+                }
+            }
             let text = Config::generate_config_text();
-            std::fs::write(&path, &text)?;
-            eprintln!("Configuration saved to {}", path);
+            {
+                use std::io::Write;
+                let mut opts = OpenOptions::new();
+                opts.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                opts.open(path_ref)?.write_all(text.as_bytes())?;
+            }
+            eprintln!("Configuration saved to {}", display_abs_path(path_ref));
         } else {
             print!("{}", Config::generate_config_text());
         }
@@ -167,13 +177,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Load config
     let config = if autoconf {
         Config::default()
-    } else if !config_path.is_empty() {
-        let file = File::open(&config_path)?;
-        let config = std::io::read_to_string(file)?;
-        toml::from_str::<Config>(&config)?
     } else {
-        tracing::error!("Please specify --genconf, --config, or --autoconf");
-        std::process::exit(1);
+        load_config_file(&config_path)?
     };
 
     // Parse or generate signing key
@@ -253,7 +258,7 @@ async fn run_node(
         opts.parse(Vec::<String>::new()).unwrap()
     });
 
-    let config_path = matches.opt_str("config").unwrap_or_else(|| "yggdrasil.toml".to_string());
+    let config_path = resolve_config_path(&matches);
     let autoconf = matches.opt_present("autoconf");
     let loglevel = matches.opt_str("loglevel").unwrap_or_else(|| "info".to_string());
     let logto = matches.opt_str("logto");
@@ -262,15 +267,15 @@ async fn run_node(
     init_logging(&loglevel, logto.as_deref());
 
     // Load config
-    let config = if autoconf {
+    let mut config = if autoconf {
         Config::default()
-    } else if !config_path.is_empty() {
-        let file = File::open(&config_path)?;
-        let text = std::io::read_to_string(file)?;
-        toml::from_str::<Config>(&text)?
     } else {
-        return Err("No configuration: specify --config or --autoconf".into());
+        load_config_file(&config_path)?
     };
+
+    if let Some((prefix, port)) = resolve_prefix_port() {
+        apply_prefix_port(prefix, port, &mut config);
+    }
 
     // Parse or generate signing key
     let signing_key = if !config.private_key.is_empty() {
@@ -526,6 +531,84 @@ fn init_logging(loglevel: &str, logto: Option<&str>) {
     });
 }
 
+/// Expand `%VAR%` on Windows (e.g. `%ALLUSERSPROFILE%`, `%ProgramData%`).
+/// Unknown names and `%%` are left unchanged. On other OS the path is unchanged.
+fn expand_genconf_path(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        let mut out = String::with_capacity(path.len());
+        let mut rest = path;
+        while let Some(start) = rest.find('%') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            if let Some(end) = after.find('%') {
+                let name = &after[..end];
+                if !name.is_empty() {
+                    if let Ok(val) = std::env::var(name) {
+                        out.push_str(&val);
+                        rest = &after[end + 1..];
+                        continue;
+                    }
+                }
+            }
+            out.push('%');
+            rest = after;
+        }
+        out.push_str(rest);
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string()
+    }
+}
+
+/// Parent directory of a config file path, if one should be considered
+/// for creation. `yggdrasil.toml` and `./yggdrasil.toml` have no folder.
+fn config_parent_dir(path: &Path) -> Option<&Path> {
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() || parent == Path::new(".") {
+        None
+    } else {
+        Some(parent)
+    }
+}
+
+/// Absolute path for messages. Does not call canonicalize() (avoids `\\?\` on Windows).
+fn display_abs_path(path: &Path) -> String {
+    if path.is_absolute() {
+        path.display().to_string()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path).display().to_string()
+    } else {
+        path.display().to_string()
+    }
+}
+
+/// CLI flags for the daemon. Shared by argument parsing and by the
+/// "config file not found" error so both print the same Usage text.
+fn make_cli_options() -> Options {
+    let mut opts = Options::new();
+    opts.optflagopt("g", "genconf", "Generate a new configuration (optionally save to FILE)", "FILE");
+    opts.optflagopt("", "normalize", "Normalize a config: read from FILE (or stdin if absent), add any missing fields with defaults while preserving user values and comments, and print to stdout", "FILE");
+    opts.optopt("c", "config", "Config file path (default: yggdrasil.toml, then system path)", "FILE");
+    opts.optflag("", "autoconf", "Run without a configuration file (use ephemeral keys)");
+    opts.optflag("a", "address", "Print the IPv6 address for the given config and exit");
+    opts.optflag("s", "subnet", "Print the IPv6 subnet for the given config and exit");
+    opts.optopt("l", "loglevel", "Log level: error, warn, info, debug, trace (default: info)", "LEVEL");
+    opts.optflag("n", "no-replace", "With --genconf FILE, skip if the file already exists");
+    opts.optopt("", "logto", "Log to a file instead of stderr", "FILE");
+    #[cfg(feature = "ctl")]
+    opts.optopt("e", "endpoint", "Admin socket address (default: tcp://localhost:9001)", "URI");
+    #[cfg(feature = "ctl")]
+    opts.optflag("j", "json", "Output control command results as raw JSON");
+    #[cfg(windows)]
+    opts.optflag("", "service", "Run as a Windows service (launched by the Service Control Manager)");
+    opts.optflag("h", "help", "Print this help");
+    opts.optflag("v", "version", "Print version");
+    opts
+}
+
 fn usage_string() -> String {
     #[cfg(feature = "ctl")]
     return "Usage: yggdrasil [options] [command [key=value ...]]".to_string();
@@ -547,4 +630,548 @@ fn print_ctl_commands() {
     println!("    debug_remoteGetPeers key=<hex>, debug_remoteGetTree key=<hex>");
     println!("  Path diagnostics:");
     println!("    getLookup key=<hex>, forceLookup key=<hex>");
+}
+
+/// Hex offset added to prefix/2 when the name carries a prefix but no port.
+/// `00` → 0x2328 = 9000, `02` → 0x2329 = 9001, `fc` → 0x23A6 = 9126.
+const DERIVED_PORT_OFFSET: u16 = 0x2328;
+
+/// Admin/multicast port derived from a `*00::/7` prefix when the filename
+/// suffix has no explicit port (`ygg_02`, `yggdrasil_fc`).
+fn port_from_prefix(prefix: u8) -> u16 {
+    (prefix as u16 / 2) + DERIVED_PORT_OFFSET
+}
+
+/// Parse a prefix-port value according to the required format.
+/// Used for the suffix after the last '_' in the binary/symlink/hardlink name.
+///
+/// Accepted forms:
+/// - prefix + port: "029001", "02-9001", "02.9001", "02:9001"
+/// - prefix only:   "02", "fc"  (port = prefix/2 + 0x2328)
+///
+/// Returns (prefix_u8, port_u16) on success, None on failure.
+fn parse_prefix_port(s: &str) -> Option<(u8, u16)> {
+    // Manual implementation of the given regex (no extra dependency).
+    if s.len() < 2 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    // First two characters must be a valid prefix from the allowed set
+    let p0 = bytes[0] as char;
+    let p1 = bytes[1] as char;
+    let valid_prefix = matches!(
+        (p0, p1),
+        ('0'..='9' | 'a'..='e' | 'A'..='E', '0' | '2' | '4' | '6' | '8' | 'a' | 'c' | 'e' | 'A' | 'C' | 'E')
+            | ('f' | 'F', '0' | '2' | '4' | '6' | '8' | 'a' | 'c' | 'A' | 'C')
+    );
+    if !valid_prefix {
+        return None;
+    }
+    let prefix = u8::from_str_radix(&s[..2], 16).ok()?;
+
+    // Optional separator: any char that is not space and not hex digit
+    let rest = &s[2..];
+    let numeric_start = if rest.is_empty() {
+        // Suffix is only the prefix (`ygg_02`, `yggdrasil_fc`).
+        return Some((prefix, port_from_prefix(prefix)));
+    } else if rest.as_bytes()[0].is_ascii_hexdigit() {
+        0
+    } else if rest.as_bytes()[0].is_ascii() && rest.as_bytes()[0] != b' ' {
+        1
+    } else {
+        return None;
+    };
+    let num_str: String = rest[numeric_start..]
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    if num_str.is_empty() {
+        return None;
+    }
+    let port: u16 = num_str.parse().ok()?;
+    if !(1024..=65535).contains(&port) {
+        return None;
+    }
+    Some((prefix, port))
+}
+
+const DEFAULT_ADMIN_PORT: u16 = 9001;
+
+/// Rewrite a default-style TCP admin URI so its port matches the prefix-port
+/// taken from the binary name. Only loopback hosts with the historic port
+/// 9001 are treated as "still default". The host is preserved.
+///
+/// Recognized: tcp://localhost:9001, tcp://127.0.0.1:9001, tcp://[::1]:9001.
+fn rewrite_default_admin_listen(listen: &str, port: u16) -> Option<String> {
+    let rest = listen.strip_prefix("tcp://")?;
+    let (host, listen_port) = if let Some(inner) = rest.strip_prefix('[') {
+        let (host_inner, after) = inner.split_once(']')?;
+        let p = after.strip_prefix(':')?.parse::<u16>().ok()?;
+        (format!("[{}]", host_inner), p)
+    } else {
+        let (host, pstr) = rest.rsplit_once(':')?;
+        (host.to_string(), pstr.parse::<u16>().ok()?)
+    };
+    if listen_port != DEFAULT_ADMIN_PORT {
+        return None;
+    }
+    match host.as_str() {
+        "localhost" | "127.0.0.1" | "[::1]" => {
+            Some(format!("tcp://{}:{}", host, port))
+        }
+        _ => None,
+    }
+}
+
+fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
+    yggdrasil::address::set_address_prefix(prefix);
+    yggdrasil::multicast::set_multicast_port(port);
+
+    tracing::info!(
+        "Using address prefix 0x{:02x} and port {}",
+        prefix, port
+    );
+
+    // Override admin_listen only when it still looks like the historic
+    // default (loopback + port 9001). Preserve the configured host.
+    if let Some(rewritten) = rewrite_default_admin_listen(&config.admin_listen, port) {
+        config.admin_listen = rewritten;
+    }
+
+    // Override if_name only when it is the default "auto"
+    // (absent/commented in config). macOS is left as "auto".
+    if config.if_name == "auto" {
+        let suffix = format!("{:02x}{}", prefix, port);
+        if cfg!(windows) {
+            config.if_name = format!("Yggdrasil{}", suffix);
+        } else if !cfg!(target_os = "macos") {
+            // Linux / BSD: ygg0-style name with prefix and port, e.g. ygg0615001
+            config.if_name = format!("ygg{}", suffix);
+        }
+        // macOS: keep "auto" — kernel assigns utunN
+    }
+}
+
+/// Return the basename of the program as invoked (argv[0]).
+/// Works for renamed binaries, symlinks and hardlinks.
+fn program_basename() -> String {
+    std::env::args()
+        .next()
+        .map(|a| {
+            Path::new(&a)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&a)
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// Strip a trailing Windows ".exe" (any ASCII case). Any other suffix,
+/// including a dotted prefix-port like "02.9001", is kept so two
+/// networks do not collapse onto one config file.
+#[cfg(windows)]
+fn strip_exe_suffix(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".exe") {
+        // ".exe" is ASCII, so len-4 is always a char boundary here.
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
+}
+
+/// On non-Windows the binary name has no `.exe`; return it unchanged.
+#[cfg(not(windows))]
+fn strip_exe_suffix(name: &str) -> &str {
+    name
+}
+
+/// Config filename derived from argv[0] when `--config` is absent.
+fn config_filename_from_program_name(name: &str) -> String {
+    if prefix_port_from_name(name).is_some() {
+        format!("{}.toml", strip_exe_suffix(name))
+    } else {
+        "yggdrasil.toml".to_string()
+    }
+}
+
+/// Extract prefix and port from the binary/symlink/hardlink name.
+/// The last '_' in the name is the marker; everything after it is parsed
+/// with parse_prefix_port (e.g. "029001", "02-9001", "02.9001", "02").
+/// A trailing Windows ".exe" is stripped first so "ygg_02.exe" is "ygg_02".
+fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
+    let name = strip_exe_suffix(name);
+    let idx = name.rfind('_')?;
+    let suffix = &name[idx + 1..];
+    parse_prefix_port(suffix)
+}
+
+/// System default location for `filename` (the second of the two default
+/// paths). Used both to look the file up and to name it in the "not found"
+/// error when neither default exists.
+///
+/// On Windows this returns the `%ALLUSERSPROFILE%` form rather than the
+/// resolved ProgramData directory: that is what the error message should
+/// show. The actual existence check still uses `windows_program_data_dir()`.
+fn system_config_path(filename: &str) -> String {
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        format!("/etc/yggdrasil/{}", filename)
+    }
+    #[cfg(windows)]
+    {
+        format!("%ALLUSERSPROFILE%\\Yggdrasil-ng\\{}", filename)
+    }
+    #[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
+    {
+        filename.to_string()
+    }
+}
+
+/// Open and parse a TOML config file.
+///
+/// `NotFound` is rewritten so the user sees the path that was looked up
+/// (the path they passed with `-c`/`--config`, or the system default when
+/// no path was given). Other I/O and TOML errors are left unchanged.
+fn load_config_file(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
+    let open_path = expand_genconf_path(path);
+    let file = match File::open(&open_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "Error: Can't find the configuration file. Create a configuration file with:\n    yggdrasil --genconf={}\n\n{}",
+                path,
+                make_cli_options().usage(&usage_string())
+            );
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let text = std::io::read_to_string(file)?;
+    Ok(toml::from_str::<Config>(&text)?)
+}
+
+/// Resolve the configuration file path.
+///
+/// When `--config` / `-c` is not given:
+/// 1. Determine the config filename:
+///    - If the binary/symlink/hardlink name contains a recognised prefix+port
+///      suffix (via `prefix_port_from_name`), use `<name>.toml`, stripping only
+///      a trailing `.exe` (e.g. `ygg_029001.exe` → `ygg_029001.toml`,
+///      `yggdrasil_02.9001` → `yggdrasil_02.9001.toml`).
+///    - Otherwise fall back to the historic default `yggdrasil.toml`.
+/// 2. Try that filename in the current working directory.
+/// 3. If absent, try the OS-specific system directory with the same filename:
+///    - Unix-like (Linux except Android, BSD, macOS, …): `/etc/yggdrasil/<filename>`
+///    - Windows: `<ProgramData>\Yggdrasil-ng\<filename>`, where ProgramData is
+///      obtained via SHGetKnownFolderPath(FOLDERID_ProgramData)
+/// 4. If still not found, return the system path from step 3 (not the
+///    working-directory filename) so the subsequent open() error names
+///    the location the user is expected to create.
+fn resolve_config_path(matches: &getopts::Matches) -> String {
+    if let Some(path) = matches.opt_str("config") {
+        if !path.is_empty() {
+            return path;
+        }
+        // Empty --config / -c: same lookup as when the flag is omitted.
+    }
+
+    // Compute the config filename based on the binary name (if prefix/port recognised)
+    let name = program_basename();
+    let local = config_filename_from_program_name(&name);
+
+    if Path::new(&local).exists() {
+        return local;
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        let system = format!("/etc/yggdrasil/{}", local);
+        if Path::new(&system).exists() {
+            return system;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(program_data) = windows_program_data_dir() {
+            let system = program_data.join("Yggdrasil-ng").join(&local);
+            if system.exists() {
+                return system.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    // Neither default exists. Name the system path in the error that follows.
+    system_config_path(&local)
+}
+
+/// Return the real ProgramData directory via SHGetKnownFolderPath(FOLDERID_ProgramData).
+/// Returns None if the API call fails (no fallback to a hardcoded path).
+#[cfg(windows)]
+fn windows_program_data_dir() -> Option<std::path::PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath};
+
+    unsafe {
+        let pwstr = SHGetKnownFolderPath(
+            &FOLDERID_ProgramData,
+            KNOWN_FOLDER_FLAG(0),
+            None,
+        )
+        .ok()?;
+        // PWSTR is a null-terminated wide string allocated by CoTaskMemAlloc.
+        let wide = pwstr.as_wide();
+        let path = std::path::PathBuf::from(OsString::from_wide(wide));
+        CoTaskMemFree(Some(pwstr.0 as _));
+        Some(path)
+    }
+}
+
+/// Resolve (prefix, port) from the binary/symlink/hardlink name.
+/// Valid suffix after the last '_' is used; otherwise None (keep defaults).
+fn resolve_prefix_port() -> Option<(u8, u16)> {
+    prefix_port_from_name(&program_basename())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_prefix_port_existing_cases() {
+        assert_eq!(parse_prefix_port("02:9001"), Some((0x02, 9001)));
+        assert_eq!(parse_prefix_port("02-9001"), Some((0x02, 9001)));
+        assert_eq!(parse_prefix_port("029001"), Some((0x02, 9001)));
+        assert_eq!(parse_prefix_port("fc.65535"), Some((0xfc, 65535)));
+        assert_eq!(parse_prefix_port("02"), Some((0x02, 9001)));
+        assert_eq!(parse_prefix_port("fc"), Some((0xfc, 9126)));
+        assert_eq!(parse_prefix_port("02:1023"), None); // port too low
+        assert_eq!(parse_prefix_port("gg:9001"), None); // invalid prefix
+        // Multi-byte separator must not panic; it is not a valid suffix.
+        assert_eq!(parse_prefix_port("02€9001"), None);
+        assert_eq!(parse_prefix_port("02—9001"), None);
+        assert_eq!(parse_prefix_port("02я9001"), None);
+    }
+
+    #[test]
+    fn test_port_from_prefix() {
+        assert_eq!(port_from_prefix(0x00), 9000);
+        assert_eq!(port_from_prefix(0x02), 9001);
+        assert_eq!(port_from_prefix(0xfc), 9126);
+        // prefix/2 + 0x2328, then decimal
+        assert_eq!(port_from_prefix(0x02), (0x02u16 / 2) + 0x2328);
+        assert_eq!(port_from_prefix(0xfc), (0xfcu16 / 2) + 0x2328);
+    }
+
+    #[test]
+    fn test_prefix_port_from_name() {
+        assert_eq!(prefix_port_from_name("yggdrasil_029001"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("yggdrasil_02-9001"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("yggdrasil_02.9001"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("yggdrasil_02-9001.exe"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("Yggdrasil_0a.12345"), Some((0x0a, 12345)));
+        assert_eq!(prefix_port_from_name("yggdrasil"), None);
+        assert_eq!(prefix_port_from_name("yggdrasil_"), None);
+        assert_eq!(prefix_port_from_name("yggdrasil_foo"), None);
+        assert_eq!(prefix_port_from_name("yggdrasil_02"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("ygg_02"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("ygg_fc"), Some((0xfc, 9126)));
+        assert_eq!(prefix_port_from_name("yggdrasil_00"), Some((0x00, 9000)));
+        assert_eq!(prefix_port_from_name("yggdrasil_02-999"), None); // port < 1024
+        // last '_' is the marker
+        assert_eq!(prefix_port_from_name("my_ygg_02-9001"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("yggdrasil_02€9001"), None);
+        #[cfg(windows)]
+        {
+            assert_eq!(prefix_port_from_name("ygg_02.exe"), Some((0x02, 9001)));
+            assert_eq!(prefix_port_from_name("yggdrasil_fc.EXE"), Some((0xfc, 9126)));
+        }
+    }
+
+    #[test]
+    fn test_config_filename_from_program_name() {
+        assert_eq!(
+            config_filename_from_program_name("yggdrasil"),
+            "yggdrasil.toml"
+        );
+        assert_eq!(
+            config_filename_from_program_name("ygg_02"),
+            "ygg_02.toml"
+        );
+        assert_eq!(
+            config_filename_from_program_name("yggdrasil_fc"),
+            "yggdrasil_fc.toml"
+        );
+        assert_eq!(
+            config_filename_from_program_name("ygg_029001"),
+            "ygg_029001.toml"
+        );
+        assert_eq!(
+            config_filename_from_program_name("yggdrasil_02.9001"),
+            "yggdrasil_02.9001.toml"
+        );
+        assert_eq!(
+            config_filename_from_program_name("yggdrasil_02.9002"),
+            "yggdrasil_02.9002.toml"
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                config_filename_from_program_name("ygg_02.exe"),
+                "ygg_02.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_02-9001.exe"),
+                "yggdrasil_02-9001.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_02.9001.exe"),
+                "yggdrasil_02.9001.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("YGGDRASIL_02.9001.EXE"),
+                "YGGDRASIL_02.9001.toml"
+            );
+            // Non-ASCII tail: must not panic, and must not strip anything.
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_029001é€"),
+                "yggdrasil_029001é€.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_029001é€.exe"),
+                "yggdrasil_029001é€.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_029001é€.EXE"),
+                "yggdrasil_029001é€.toml"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_02-9001.exe"),
+                "yggdrasil_02-9001.exe.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_02.9001.exe"),
+                "yggdrasil_02.9001.exe.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("YGGDRASIL_02.9001.EXE"),
+                "YGGDRASIL_02.9001.EXE.toml"
+            );
+            assert_eq!(
+                config_filename_from_program_name("yggdrasil_029001é€"),
+                "yggdrasil_029001é€.toml"
+            );
+        }
+
+    }
+
+    #[test]
+    fn test_system_config_path() {
+        #[cfg(all(unix, not(target_os = "android")))]
+        {
+            assert_eq!(
+                system_config_path("yggdrasil.toml"),
+                "/etc/yggdrasil/yggdrasil.toml"
+            );
+            assert_eq!(
+                system_config_path("ygg_0615001.toml"),
+                "/etc/yggdrasil/ygg_0615001.toml"
+            );
+            assert_eq!(
+                system_config_path("yggdrasil_02.9001.toml"),
+                "/etc/yggdrasil/yggdrasil_02.9001.toml"
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                system_config_path("yggdrasil.toml"),
+                "%ALLUSERSPROFILE%\\Yggdrasil-ng\\yggdrasil.toml"
+            );
+            assert_eq!(
+                system_config_path("ygg_0615001.toml"),
+                "%ALLUSERSPROFILE%\\Yggdrasil-ng\\ygg_0615001.toml"
+            );
+            assert_eq!(
+                system_config_path("yggdrasil_02.9001.toml"),
+                "%ALLUSERSPROFILE%\\Yggdrasil-ng\\yggdrasil_02.9001.toml"
+            );
+        }
+        #[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
+        {
+            assert_eq!(system_config_path("yggdrasil.toml"), "yggdrasil.toml");
+            assert_eq!(system_config_path("ygg_0615001.toml"), "ygg_0615001.toml");
+        }
+    }
+
+    #[test]
+    fn test_rewrite_default_admin_listen() {
+        assert_eq!(
+            rewrite_default_admin_listen("tcp://localhost:9001", 15001).as_deref(),
+            Some("tcp://localhost:15001")
+        );
+        assert_eq!(
+            rewrite_default_admin_listen("tcp://127.0.0.1:9001", 15001).as_deref(),
+            Some("tcp://127.0.0.1:15001")
+        );
+        assert_eq!(
+            rewrite_default_admin_listen("tcp://[::1]:9001", 15001).as_deref(),
+            Some("tcp://[::1]:15001")
+        );
+        // Not the historic default port, or not loopback: leave as-is.
+        assert_eq!(rewrite_default_admin_listen("tcp://localhost:15001", 16000), None);
+        assert_eq!(rewrite_default_admin_listen("tcp://0.0.0.0:9001", 15001), None);
+        assert_eq!(rewrite_default_admin_listen("none", 15001), None);
+        assert_eq!(rewrite_default_admin_listen("unix:///var/run/ygg.sock", 15001), None);
+    }
+
+    #[test]
+    fn test_config_parent_dir() {
+        assert!(config_parent_dir(Path::new("yggdrasil.toml")).is_none());
+        assert!(config_parent_dir(Path::new("./yggdrasil.toml")).is_none());
+        assert_eq!(
+            config_parent_dir(Path::new("/etc/yggdrasil/yggdrasil.toml"))
+                .map(|p| p.to_str().unwrap()),
+            Some("/etc/yggdrasil")
+        );
+        assert_eq!(
+            config_parent_dir(Path::new("foo/bar.toml")).map(|p| p.to_str().unwrap()),
+            Some("foo")
+        );
+        assert_eq!(
+            config_parent_dir(Path::new("/yggdrasil.toml")).map(|p| p.to_str().unwrap()),
+            Some("/")
+        );
+    }
+
+    #[test]
+    fn test_expand_genconf_path_leaves_plain_paths() {
+        assert_eq!(expand_genconf_path("/etc/yggdrasil/yggdrasil.toml"), "/etc/yggdrasil/yggdrasil.toml");
+        assert_eq!(expand_genconf_path("yggdrasil.toml"), "yggdrasil.toml");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_expand_genconf_path_windows_env() {
+        let val = std::env::var("ALLUSERSPROFILE")
+            .unwrap_or_else(|_| r"C:\ProgramData".to_string());
+        assert_eq!(
+            expand_genconf_path(r"%ALLUSERSPROFILE%\Yggdrasil-ng\yggdrasil.toml"),
+            format!(r"{}\Yggdrasil-ng\yggdrasil.toml", val)
+        );
+        assert_eq!(
+            expand_genconf_path(r"%YGG_TEST_GENCONF_DOES_NOT_EXIST%\x.toml"),
+            r"%YGG_TEST_GENCONF_DOES_NOT_EXIST%\x.toml"
+        );
+        // Unknown names and a lone percent stay unchanged.
+        assert_eq!(expand_genconf_path(r"%"), r"%");
+        assert_eq!(expand_genconf_path(r"%%"), r"%%");
+    }
 }
