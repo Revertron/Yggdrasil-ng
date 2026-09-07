@@ -109,8 +109,17 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let loglevel = matches.opt_str("loglevel").unwrap_or_else(|| "info".to_string());
     let logto = matches.opt_str("logto");
 
+    if matches.opt_present("base") && !matches.opt_present("genconf") {
+        eprintln!("Error: --base can only be used together with --genconf");
+        std::process::exit(1);
+    }
+
     // --genconf [FILE]: generate config, save to file or print to stdout
     if matches.opt_present("genconf") {
+        if matches.opt_present("base") && matches.opt_str("base").is_none() {
+            eprintln!("Error: --base requires a FILE path");
+            std::process::exit(1);
+        }
         if let Some(path) = matches.opt_str("genconf") {
             let path = expand_genconf_path(&path);
             let path_ref = Path::new(&path);
@@ -124,7 +133,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Created folder {}", display_abs_path(parent));
                 }
             }
-            let text = Config::generate_config_text();
+            let text = generate_config_text_maybe_from_base(matches.opt_str("base").as_deref())?;
             {
                 use std::io::Write;
                 let mut opts = OpenOptions::new();
@@ -138,7 +147,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             eprintln!("Configuration saved to {}", display_abs_path(path_ref));
         } else {
-            print!("{}", Config::generate_config_text());
+            print!("{}", generate_config_text_maybe_from_base(matches.opt_str("base").as_deref())?);
         }
         return Ok(());
     }
@@ -244,6 +253,7 @@ async fn run_node(
     opts.optflag("a", "address", "");
     opts.optflag("s", "subnet", "");
     opts.optflag("n", "no-replace", "");
+    opts.optopt("b", "base", "", "FILE");
     opts.optflag("h", "help", "");
     opts.optflag("v", "version", "");
     #[cfg(feature = "ctl")]
@@ -563,6 +573,29 @@ fn expand_genconf_path(path: &str) -> String {
     }
 }
 
+/// Build genconf text. If `base_path` is set, reuse `private_key` from that
+/// TOML file; otherwise mint a new keypair (existing generate_config_text()).
+fn generate_config_text_maybe_from_base(
+    base_path: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match base_path {
+        None => Ok(Config::generate_config_text()),
+        Some(path) => {
+            let path = expand_genconf_path(path);
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(format!("base configuration file not found: {}", path).into());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let key = Config::private_key_from_toml(&text)
+                .map_err(|e| format!("invalid --base file {}: {}", path, e))?;
+            Ok(Config::generate_config_text_from_private_key(&key))
+        }
+    }
+}
+
 /// Parent directory of a config file path, if one should be considered
 /// for creation. `yggdrasil.toml` and `./yggdrasil.toml` have no folder.
 fn config_parent_dir(path: &Path) -> Option<&Path> {
@@ -597,6 +630,7 @@ fn make_cli_options() -> Options {
     opts.optflag("s", "subnet", "Print the IPv6 subnet for the given config and exit");
     opts.optopt("l", "loglevel", "Log level: error, warn, info, debug, trace (default: info)", "LEVEL");
     opts.optflag("n", "no-replace", "With --genconf FILE, skip if the file already exists");
+    opts.optopt("b", "base", "With --genconf, copy private_key from this existing config file instead of generating a new key", "FILE");
     opts.optopt("", "logto", "Log to a file instead of stderr", "FILE");
     #[cfg(feature = "ctl")]
     opts.optopt("e", "endpoint", "Admin socket address (default: tcp://localhost:9001)", "URI");
@@ -1173,5 +1207,56 @@ mod tests {
         // Unknown names and a lone percent stay unchanged.
         assert_eq!(expand_genconf_path(r"%"), r"%");
         assert_eq!(expand_genconf_path(r"%%"), r"%%");
+    }
+
+    #[test]
+    fn generate_from_base_reuses_key_and_ignores_other_fields() {
+        let base_key = {
+            let generated = yggdrasil::config::Config::generate_config_text();
+            yggdrasil::config::Config::private_key_from_toml(&generated).unwrap()
+        };
+        // Base file has a custom listen/peers; those must NOT be copied.
+        let base_toml = format!(
+            "private_key = \"{base_key}\"\npeers = [\"tcp://198.51.100.7:23456\"]\nlisten = [\"tcp://198.51.100.8:23456\"]\n"
+        );
+        let dir = std::env::temp_dir();
+        let base_path = dir.join(format!(
+            "ygg-base-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&base_path, base_toml).unwrap();
+        let text = generate_config_text_maybe_from_base(Some(base_path.to_str().unwrap())).unwrap();
+        let _ = std::fs::remove_file(&base_path);
+        assert!(text.contains(&format!("private_key = \"{base_key}\"")));
+        assert!(
+            !text.contains("tcp://198.51.100.7:23456"),
+            "peers from the base file must not be copied:\n{text}"
+        );
+        assert!(
+            !text.contains("tcp://198.51.100.8:23456"),
+            "listen from the base file must not be copied:\n{text}"
+        );
+    }
+
+    #[test]
+    fn generate_from_missing_base_is_error() {
+        let err = generate_config_text_maybe_from_base(Some("/no/such/ygg-base-file.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("base configuration file not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn generate_without_base_still_mints_a_key() {
+        let text = generate_config_text_maybe_from_base(None).unwrap();
+        let key = yggdrasil::config::Config::private_key_from_toml(&text).unwrap();
+        assert_eq!(key.len(), 128);
     }
 }

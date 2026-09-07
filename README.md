@@ -110,6 +110,7 @@ yggdrasil [options]
 | `-s, --subnet` | Print the IPv6 subnet for the given config and exit |
 | `-l, --loglevel LEVEL` | Log level: error, warn, info, debug, trace (default: info) |
 | `-n, --no-replace` | With `--genconf FILE`, skip if the file already exists |
+| `-b, --base FILE` | With `--genconf`, copy `private_key` from this existing config |
 | `--logto FILE` | Log to a file instead of stderr (appends) |
 | `--service` | Run as a Windows service (Windows only) |
 | `-h, --help` | Print help message |
@@ -127,6 +128,8 @@ Generate a default configuration file:
 yggdrasil --genconf > yggdrasil.toml
 # Or save directly to a file:
 yggdrasil --genconf=yggdrasil.toml
+# Reuse private_key from an existing config (new file still uses the current template):
+yggdrasil --genconf=yggdrasil.toml --base=yggdrasil.toml.old
 ```
 
 Edit the configuration to add peers, then start the daemon:
