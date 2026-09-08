@@ -17,18 +17,17 @@ This project aims to provide a lightweight, self-arranging, and secure mesh netw
 **✅ Fully Implemented:**
 - Core routing protocol (spanning tree, path discovery, bloom filters)
 - End-to-end encryption with forward secrecy (session key ratcheting)
-- TCP and TLS transports with automatic reconnection and exponential backoff
-- TUN/TAP interface for IPv6 traffic
+- TCP, TLS, WebSocket and QUIC transports with automatic reconnection and exponential backoff
+- TUN interface for IPv6 traffic
 - Admin socket API (getSelf, getPeers, getTree, getPaths, getSessions, addPeer, removePeer, etc.)
 - Session cleanup and timeout handling
 - Optimized Ed25519→Curve25519 key conversion
 - Single binary for daemon and control commands (no separate `yggdrasilctl`)
 - Windows service support (runs as `yggdrasil-ng` service via SCM)
-- UniFFI bindings for Android
+- Multicast peer discovery on local networks
 - Crypto-Key Routing (CKR) — tunnel arbitrary IPv4/IPv6 subnets through the mesh (enabled by default via the `ckr` feature)
 
 **⏳ Planned Features:**
-- Multicast peer discovery on local networks
 - Performance optimizations and protocol improvements
 
 ## Building from Source
@@ -104,7 +103,7 @@ yggdrasil [options]
 | Option | Description |
 |--------|-------------|
 | `-g, --genconf [FILE]` | Generate a new configuration (save to FILE or print to stdout) |
-| `-c, --config FILE` | Config file path (default: `yggdrasil.toml`) |
+| `-c, --config FILE` | Config file path. (default: `./yggdrasil.toml`, then `yggdrasil.toml` in OS system directory see [Default configuration file paths](#default-configuration-file-paths) |
 | `--autoconf` | Run without a configuration file (use ephemeral keys) |
 | `-a, --address` | Print the IPv6 address for the given config and exit |
 | `-s, --subnet` | Print the IPv6 subnet for the given config and exit |
@@ -149,11 +148,35 @@ Print your address without starting the daemon:
 ```bash
 yggdrasil --config yggdrasil.toml --address
 ```
-A custom `*00::/7` prefix (`00`–`fc`) and port (`1024`–`65535`) can be taken from the name of the binary, symlink or hardlink.
-The last `_` in the filename is the marker; everything after it is parsed as prefix and optional port (e.g. `yggdrasil_029001`, `yggdrasil_02-9001`, `ygg_029001`, `yggdrasil_02.9001.exe`).
-If the suffix is only a valid prefix (`yggdrasil_02`, `ygg_02`, `ygg_fc`), the admin/multicast port is derived as `prefix/2 + 0x2328` (`02` → `9001`, `fc` → `9126`, range `9000`–`9126`).
-If the name does not provide a valid value the defaults (`0x02` / `9001`) are kept.
-This also affects control-mode commands (`getPeers`, `getTree`, …) and the TUN interface name, so a renamed binary automatically talks to the matching admin socket and uses a matching interface name.
+A non-standard `*00::/7` prefix and admin/multicast port can be selected by renaming the binary or by creating a symlink/hardlink (`ygg_fc`, `yggdrasil_02-9001`, …). That also picks the default config filename, the admin socket and the TUN name, so several overlays can run on one host. Why you would do this, how the name is parsed, and a `ygg_fc` / `fc00::/7` quick start are in **[docs/PREFIX.md](docs/PREFIX.md)**.
+
+### Default configuration file paths
+
+When `-c` / `--config` is omitted, the config filename is:
+
+- `<stem>.toml` if the binary/symlink/hardlink name contains a recognised prefix/port suffix (`.exe` is stripped first), e.g. `ygg_fc` / `ygg_fc.exe` → `ygg_fc.toml`;
+- `yggdrasil.toml` otherwise.
+
+That filename is then searched in this order:
+
+1. the current working directory;
+2. the OS system directory, same filename:
+   - Unix-like (Linux except Android, BSD, macOS): `/etc/yggdrasil/<filename>`
+   - Windows: `%ALLUSERSPROFILE%\Yggdrasil-ng\<filename>` (resolved via `SHGetKnownFolderPath(FOLDERID_ProgramData)`, usually `C:\ProgramData\Yggdrasil-ng\`).
+
+If the file exists in either place, the daemon and control commands can be started **without** `-c`.
+
+```bash
+# Linux — system default for the public mesh
+sudo yggdrasil --genconf=/etc/yggdrasil/yggdrasil.toml
+sudo yggdrasil
+```
+
+```cmd
+:: Windows — system default for the public mesh
+yggdrasil.exe --genconf="%ALLUSERSPROFILE%\Yggdrasil-ng\yggdrasil.toml"
+yggdrasil.exe
+```
 
 ### Control Commands
 
@@ -218,6 +241,8 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
+| `group_password` | string | Closed-network password; empty = open mesh. See [Group password (closed networks)](#group-password-closed-networks) |
+| `[[multicast_interfaces]]` | array of tables | LAN multicast discovery (`filter`, `beacon`, `listen`, `port`, `priority`, `password`) |
 | `[tunnel_routing]` | table | CKR tunnel routing config (`ckr` feature, enabled by default) — see [docs/CKR.md](docs/CKR.md) |
 
 **Example minimal configuration:**
@@ -235,7 +260,7 @@ peers = [
 # Listen for incoming connections
 listen = ["tcp://[::]:1234"]
 
-# Admin socket for yggdrasilctl
+# Admin socket for yggdrasilctl 
 admin_listen = "tcp://localhost:9001"
 
 # TUN interface settings
@@ -298,13 +323,25 @@ peers = [
     "tcp://peer.example.com:12345?password=mysecret",
 ]
 ```
+### Group password (closed networks)
+
+`group_password` is a mesh-wide secret. When it is non-empty, this node only finishes encrypted sessions with peers that use the **exact same** string. Empty (the default) is an open network.
+
+It is independent of the per-URI `?password=` on `peers` / `listen` and of `password` on `[[multicast_interfaces]]`. Those only authenticate a **direct link**. `group_password` is folded into the session handshake, so a node that somehow obtained a link still cannot complete a session unless it shares the group secret.
+
+```toml
+# Same non-empty value on every member of a private overlay.
+# Leave commented or empty for the public mesh.
+group_password = "change-me"
+```
+Use group_password together with ?password= on every personal overlay. A different *00::/7 prefix alone does not keep strangers out — see [Protecting an isolated network](docs/PREFIX.md#protecting-an-isolated-network)
 
 ### Differences from Go Version
 
 **Command line:**
 - `-c/--config` instead of `-useconffile`
 - `--genconf [FILE]` instead of `-genconf` (can save directly to file)
-- Config file defaults to `yggdrasil.toml` (not required to specify)
+- Config file defaults to `yggdrasil.toml` in the current directory or in the OS system directory (`/etc/yggdrasil/` on Unix-like systems, `%ALLUSERSPROFILE%\Yggdrasil-ng\` on Windows) — `-c` is not required when that file exists
 - New `YGGDRASIL_PRIVATE_KEY` environment variable support
 
 **Config file:**
@@ -362,10 +399,36 @@ The service is registered under the name `yggdrasil-ng` (display name "Yggdrasil
 Open an elevated (Administrator) command prompt:
 
 ```cmd
-sc create yggdrasil-ng binPath= "C:\path\to\yggdrasil.exe --service -c C:\path\to\yggdrasil.toml" start= auto DisplayName= "Yggdrasil NG"
+sc create yggdrasil-ng binPath= "%ProgramFiles%\Yggdrasil-ng\yggdrasil.exe --service -c %ALLUSERSPROFILE%\Yggdrasil-ng\yggdrasil.toml" start= auto DisplayName= "Yggdrasil NG"
+sc description yggdrasil-ng "Yggdrasil Network router process"
+```
+Creating the service without `-c` is also valid when `yggdrasil.toml` already exists in the current directory or in `%ALLUSERSPROFILE%\Yggdrasil-ng\`:
+
+```cmd
+sc create yggdrasil-ng binPath= "%ProgramFiles%\Yggdrasil-ng\yggdrasil.exe --service" start= auto DisplayName= "Yggdrasil NG"
+sc description yggdrasil-ng "Yggdrasil Network router process"
 ```
 
 > **Note:** The spaces after `binPath=`, `start=`, and `DisplayName=` are required by `sc`.
+
+Example of creating a service for PowerShell users, both with and without specifying the configuration file path:
+
+```powershell
+New-Service -Name "yggdrasil-ng" `
+ -BinaryPathName "%ProgramFiles%\Yggdrasil-ng\yggdrasil.exe --service -c %ALLUSERSPROFILE%\Yggdrasil-ng\yggdrasil.toml" `
+  -StartupType Automatic `
+  -DisplayName "Yggdrasil NG"
+  -Description "Yggdrasil Network router process"
+```
+
+```powershell
+New-Service -Name "yggdrasil-ng" `
+  -BinaryPathName "%ProgramFiles%\Yggdrasil-ng\yggdrasil.exe --service" `
+  -StartupType Automatic `
+  -DisplayName "Yggdrasil NG"
+  -Description "Yggdrasil Network router process"
+```
+A second service on another prefix (for example `YggFC` + `ygg_fc.exe`) is described in [docs/PREFIX.md](docs/PREFIX.md#windows-service-yggfc).
 
 ### Start / Stop
 
