@@ -556,13 +556,26 @@ fn expand_genconf_path(path: &str) -> String {
     }
 }
 
+/// Rewrite the historic default admin_listen URI inside generated
+/// config text so the commented template line uses the port taken
+/// from the binary/symlink/hardlink name.
+///
+/// The template ships with `tcp://localhost:9001` (commented).
+/// Only that exact default URI is replaced; a custom URI would
+/// not appear in freshly generated text.
+fn rewrite_admin_listen_in_genconf_text(text: &str, port: u16) -> String {
+    let from = format!("tcp://localhost:{}", DEFAULT_ADMIN_PORT);
+    let to = format!("tcp://localhost:{}", port);
+    text.replace(&from, &to)
+}
+
 /// Build genconf text. If `base_path` is set, reuse `private_key` from that
 /// TOML file; otherwise mint a new keypair (existing generate_config_text()).
 fn generate_config_text_maybe_from_base(
     base_path: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    match base_path {
-        None => Ok(Config::generate_config_text()),
+    let text = match base_path {
+        None => Config::generate_config_text(),
         Some(path) => {
             let path = expand_genconf_path(path);
             let text = match std::fs::read_to_string(&path) {
@@ -574,9 +587,13 @@ fn generate_config_text_maybe_from_base(
             };
             let key = Config::private_key_from_toml(&text)
                 .map_err(|e| format!("invalid --base file {}: {}", path, e))?;
-            Ok(Config::generate_config_text_from_private_key(&key))
+            Config::generate_config_text_from_private_key(&key)
         }
-    }
+    };
+    let port = resolve_prefix_port()
+        .map(|(_, port)| port)
+        .unwrap_or(DEFAULT_ADMIN_PORT);
+    Ok(rewrite_admin_listen_in_genconf_text(&text, port))
 }
 
 /// Parent directory of a config file path, if one should be considered
@@ -1243,5 +1260,58 @@ mod tests {
         let text = generate_config_text_maybe_from_base(None).unwrap();
         let key = yggdrasil::config::Config::private_key_from_toml(&text).unwrap();
         assert_eq!(key.len(), 128);
+    }
+
+    #[test]
+    fn rewrite_admin_listen_in_genconf_text_keeps_historic_port() {
+        let input = "# admin_listen = \"tcp://localhost:9001\"\n";
+        let out = rewrite_admin_listen_in_genconf_text(input, DEFAULT_ADMIN_PORT);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn rewrite_admin_listen_in_genconf_text_uses_explicit_port() {
+        let input = "# admin_listen = \"tcp://localhost:9001\"\n";
+        let out = rewrite_admin_listen_in_genconf_text(input, 15001);
+        assert_eq!(out, "# admin_listen = \"tcp://localhost:15001\"\n");
+        assert!(!out.contains("tcp://localhost:9001"));
+    }
+
+    #[test]
+    fn rewrite_admin_listen_in_genconf_text_uses_derived_prefix_only_port() {
+        // Same formula as ygg_fc / ygg_06: suffix is only the prefix.
+        let input = "# admin_listen = \"tcp://localhost:9001\"\n";
+        let fc = rewrite_admin_listen_in_genconf_text(input, port_from_prefix(0xfc));
+        assert_eq!(port_from_prefix(0xfc), 9126);
+        assert_eq!(fc, "# admin_listen = \"tcp://localhost:9126\"\n");
+
+        let p06 = rewrite_admin_listen_in_genconf_text(input, port_from_prefix(0x06));
+        assert_eq!(port_from_prefix(0x06), 9003);
+        assert_eq!(p06, "# admin_listen = \"tcp://localhost:9003\"\n");
+
+        let p02 = rewrite_admin_listen_in_genconf_text(input, port_from_prefix(0x02));
+        assert_eq!(port_from_prefix(0x02), DEFAULT_ADMIN_PORT);
+        assert_eq!(p02, input);
+    }
+
+    #[test]
+    fn generate_config_text_maybe_from_base_contains_commented_admin_listen() {
+        let text = generate_config_text_maybe_from_base(None).unwrap();
+        // Cargo test binary has no prefix/port suffix, so the historic
+        // commented default must still be present.
+        assert!(
+            text.contains("# admin_listen = \"tcp://localhost:9001\""),
+            "expected commented default admin_listen in generated text:\n{text}"
+        );
+        // And the helper must rewrite that exact line on a derived port.
+        let rewritten = rewrite_admin_listen_in_genconf_text(&text, 9126);
+        assert!(
+            rewritten.contains("# admin_listen = \"tcp://localhost:9126\""),
+            "expected rewritten commented admin_listen:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("tcp://localhost:9001"),
+            "historic default URI must not remain after rewrite:\n{rewritten}"
+        );
     }
 }
