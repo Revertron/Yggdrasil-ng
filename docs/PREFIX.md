@@ -10,6 +10,16 @@ quick start for prefix `fc00::/7` using `ygg_fc` / `ygg_fc.exe`.
 The public mesh uses prefix `0200::/7` and admin/multicast port `9001`. Those
 remain the defaults when the filename does not contain a recognised suffix.
 
+The parser accepts **127** theoretically possible `/7` prefixes: the first
+byte of the IPv6 address is an even value from `00` through `fc`
+(`00`, `02`, …, `fa`, `fc`). That set exists so operators can pick an
+overlay that does not collide with something already on the host. It does
+**not** mean 127 overlays can actually run at once — much of that space is
+already used by other networks (public Yggdrasil, Mycelium, ULA LANs,
+global unicast, IANA special-purpose ranges). Read
+[Possible prefix collisions](#possible-prefix-collisions) before choosing
+anything other than the public-mesh default.
+
 ---
 
 ## Why run with a non-standard prefix
@@ -60,6 +70,10 @@ who runs a binary with the same suffix can generate an address in that
 closed-network `group_password` — see [Protecting an isolated
 network](#protecting-an-isolated-network) at the end of this page.
 
+Pick the `/7` with [Possible prefix collisions](#possible-prefix-collisions)
+in mind. The public mesh already owns `200::/7`; other values can overlap
+ULA LANs, Mycelium, IANA special-purpose space, or global unicast.
+
 ---
 
 ## Prefix and port from the binary name
@@ -81,6 +95,11 @@ The two hex digits of the prefix must be a valid `*00::/7` value:
 when present, must be in `1024`–`65535`. The separator between prefix and
 port may be any single ASCII character that is not a space and not a hex
 digit (`-`, `.`, `:`, and so on).
+
+All 127 of those values parse. That is a flexibility limit, not a promise
+that every value is safe on a given host. `00` overlaps IANA special-purpose
+space; `02` is the public Yggdrasil Network; `fc` is RFC 4193 ULA space.
+See [Possible prefix collisions](#possible-prefix-collisions).
 
 Examples of names that parse:
 
@@ -164,7 +183,10 @@ sudo cp /usr/local/bin/yggdrasil /usr/local/bin/ygg_fc
 
 ```cmd
 :: Windows — extra name next to the installed binary
+:: Bare mklink creates a symbolic link and needs elevation or Developer Mode.
 mklink "C:\Program Files\Yggdrasil-ng\ygg_fc.exe" "C:\Program Files\Yggdrasil-ng\yggdrasil.exe"
+:: Hard link (same volume as the target):
+mklink /H "C:\Program Files\Yggdrasil-ng\ygg_fc.exe" "C:\Program Files\Yggdrasil-ng\yggdrasil.exe"
 :: or a second copy
 copy "C:\Program Files\Yggdrasil-ng\yggdrasil.exe" "C:\Program Files\Yggdrasil-ng\ygg_fc.exe"
 ```
@@ -181,6 +203,11 @@ Reuse of `private_key` is optional. It gives the personal node the same
 identity bits under a different prefix (the IPv6 address changes because
 the prefix changes). Generate a fresh key instead if you want a separate
 identity: drop `--base` / `-b`.
+
+`fc00::/7` is RFC 4193 unique-local address space. Use it only if the
+host (and the LAN it sits on) does not already route ULA. If a ULA LAN
+is already present, pick a free prefix from
+[Possible prefix collisions](#possible-prefix-collisions) instead.
 
 ### Linux
 
@@ -229,6 +256,9 @@ From an elevated command prompt:
 
 ```cmd
 :: One extra name for the same binary (pick one)
+:: Symbolic link (needs elevation or Developer Mode):
+mklink "C:\Program Files\Yggdrasil-ng\ygg_fc.exe" "C:\Program Files\Yggdrasil-ng\yggdrasil.exe"
+:: Hard link (same volume as the target):
 mklink "C:\Program Files\Yggdrasil-ng\ygg_fc.exe" "C:\Program Files\Yggdrasil-ng\yggdrasil.exe"
 :: copy "C:\Program Files\Yggdrasil-ng\yggdrasil.exe" "C:\Program Files\Yggdrasil-ng\ygg_fc.exe"
 
@@ -339,3 +369,67 @@ Use both of the following on every personal node:
 Do not reuse the public-mesh `listen` port advertisement or the public
 peer list on a personal node. Keep the two overlays on separate binaries
 (or separate names) and separate config files.
+
+---
+
+## Possible prefix collisions
+
+The filename parser accepts 127 theoretically possible `/7` prefixes
+(first byte `00`, `02`, …, `fc`). That is the **flexibility** of the
+mechanism: you can pick a `/7` that is still empty on *your* hosts.
+
+It is **not** a claim that 127 Yggdrasil-ng overlays can run at the same
+time on one machine, or that every value is unused on the Internet.
+Part of that address space is almost certainly already occupied — by the
+public Yggdrasil Network, by another overlay, by a LAN ULA, by IANA
+special-purpose assignments, or by global unicast IPv6. Two networks
+that share a `/7` will fight over routes and addresses on any host that
+runs both.
+
+`200::/7` (written `0200::/7` in some docs) is the public Yggdrasil
+Network. Use a different prefix for a private overlay. The list below
+is a practical map of the 127 values, not a routing-table dump.
+
+- ⚠️ Prefix `0::/7` (`0000::/7`, suffix `00`). Collisions with IANA
+  special-purpose space inside `::/7`: `64:ff9b::/96` (NAT64 well-known
+  prefix, RFC 6052), `64:ff9b:1::/48` (RFC 8215), `100::/64` (discard-only,
+  RFC 6666), `100:0:0:1::/64`, plus `::/128` (unspecified), `::1/128`
+  (loopback), and `::ffff:0:0/96` (IPv4-mapped). A host with a NAT64
+  gateway, or anything that depends on those ranges, can misbehave in
+  ways that are hard to diagnose. For experienced or desperate operators
+  only.
+
+- ❌ Prefix `200::/7` (`0200::/7`, suffix `02`). Occupied by the public
+  Yggdrasil Network. Do not use it for a private overlay if you want
+  isolation from that mesh.
+
+- ⚠️ Prefix `400::/7` (suffix `04`). May be occupied by the Mycelium
+  Network (overlay addresses in `400::/7`).
+
+- ✅ Range `600::/7`–`1e00::/7` (suffixes `06`–`1e`). Usually free. Safe
+  to use on a typical host.
+
+- ❌ Range `2000::/7`–`2e00::/7` (suffixes `20`–`2e`). Modern IPv6
+  Internet (`2000::/3` global unicast). Do not use even if the ISP does
+  not yet offer IPv6.
+
+- ⚠️ Range `3000::/7`–`3e00::/7` (suffixes `30`–`3e`). Also inside
+  `2000::/3`. Global unicast is expected to grow here, but not before
+  about 2030. Theoretically usable until then.
+
+- ✅ Range `4000::/7`–`5c00::/7` (suffixes `40`–`5c`). Usually free. Safe
+  to use on a typical host.
+
+- ❌ Prefix `5e00::/7` (suffix `5e`). Conflicts with `5f00::/16`. Usable
+  only when the host has no IPv6 Internet connectivity and IPv4 is
+  preferred over IPv6.
+
+- ✅ Range `6000::/7`–`fa00::/7` (suffixes `60`–`fa`). Usually free. Safe
+  to use on a typical host.
+
+- ✅ Prefix `fc00::/7` (suffix `fc`). RFC 4193 unique-local address space,
+  the usual choice for internal IPv6 networks. Recommended for a personal
+  overlay **if** the host and its LAN do not already use ULA. If a ULA
+  LAN is already present, this is the value in the set most likely to
+  collide with something already on the network — pick another free
+  prefix instead.

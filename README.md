@@ -103,7 +103,7 @@ yggdrasil [options]
 | Option | Description |
 |--------|-------------|
 | `-g, --genconf [FILE]` | Generate a new configuration (save to FILE or print to stdout) |
-| `-c, --config FILE` | Config file path. (default: `./yggdrasil.toml`, then `yggdrasil.toml` in OS system directory see [Default configuration file paths](#default-configuration-file-paths) |
+| `-c, --config FILE` | Config file path (default: `./<stem>.toml` when the binary name contains a recognised prefix/port suffix, e.g. `ygg_fc` → `./ygg_fc.toml`, otherwise `./yggdrasil.toml`; then the same filename in the OS system directory — see [Default configuration file paths](#default-configuration-file-paths)). |
 | `--autoconf` | Run without a configuration file (use ephemeral keys) |
 | `-a, --address` | Print the IPv6 address for the given config and exit |
 | `-s, --subnet` | Print the IPv6 subnet for the given config and exit |
@@ -417,7 +417,7 @@ Example of creating a service for PowerShell users, both with and without specif
 New-Service -Name "yggdrasil-ng" `
  -BinaryPathName "%ProgramFiles%\Yggdrasil-ng\yggdrasil.exe --service -c %ALLUSERSPROFILE%\Yggdrasil-ng\yggdrasil.toml" `
   -StartupType Automatic `
-  -DisplayName "Yggdrasil NG"
+  -DisplayName "Yggdrasil NG" `
   -Description "Yggdrasil Network router process"
 ```
 
@@ -425,7 +425,7 @@ New-Service -Name "yggdrasil-ng" `
 New-Service -Name "yggdrasil-ng" `
   -BinaryPathName "%ProgramFiles%\Yggdrasil-ng\yggdrasil.exe --service" `
   -StartupType Automatic `
-  -DisplayName "Yggdrasil NG"
+  -DisplayName "Yggdrasil NG" `
   -Description "Yggdrasil Network router process"
 ```
 A second service on another prefix (for example `YggFC` + `ygg_fc.exe`) is described in [docs/PREFIX.md](docs/PREFIX.md#windows-service-yggfc).
