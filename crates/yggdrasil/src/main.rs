@@ -116,7 +116,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --genconf [FILE]: generate config, save to file or print to stdout
     if matches.opt_present("genconf") {
-        if matches.opt_present("base") && matches.opt_str("base").is_none() {
+        if matches.opt_present("base")
+            && matches.opt_str("base").unwrap_or_default().is_empty()
+        {
             eprintln!("Error: --base requires a FILE path");
             std::process::exit(1);
         }
@@ -243,30 +245,11 @@ async fn run_node(
     // When called from service mode, logging + config aren't set up yet.
     // Re-read CLI args to get config path / autoconf / loglevel.
     let args: Vec<String> = std::env::args().collect();
-    let mut opts = Options::new();
-    opts.optopt("c", "config", "", "FILE");
-    opts.optflag("", "autoconf", "");
-    opts.optopt("l", "loglevel", "", "LEVEL");
-    opts.optopt("", "logto", "", "FILE");
-    // Accept (and ignore) the rest so parsing doesn't fail
-    opts.optflagopt("g", "genconf", "", "FILE");
-    opts.optflag("a", "address", "");
-    opts.optflag("s", "subnet", "");
-    opts.optflag("n", "no-replace", "");
-    opts.optopt("b", "base", "", "FILE");
-    opts.optflag("h", "help", "");
-    opts.optflag("v", "version", "");
-    #[cfg(feature = "ctl")]
-    opts.optopt("e", "endpoint", "", "URI");
-    #[cfg(feature = "ctl")]
-    opts.optflag("j", "json", "");
-    #[cfg(windows)]
-    opts.optflag("", "service", "");
-
-    let matches = opts.parse(&args[1..]).unwrap_or_else(|_| {
-        // Fallback: empty matches
-        opts.parse(Vec::<String>::new()).unwrap()
-    });
+    let opts = make_cli_options();
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(_) => opts.parse(Vec::<String>::new()).unwrap(),
+    };
 
     let config_path = resolve_config_path(&matches);
     let autoconf = matches.opt_present("autoconf");
@@ -874,11 +857,13 @@ fn load_config_file(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
-                "Error: Can't find the configuration file. Create a configuration file with:\n    yggdrasil --genconf={}\n\n{}",
+                "Error: Can't find the configuration file. Create a configuration file with:\n    {} --genconf={}\n\n{}",
+                program_basename(),
                 path,
                 make_cli_options().usage(&usage_string())
             );
-            std::process::exit(1);
+            // Short Err for SCM Stopped / main() Termination (Debug escapes newlines).
+            return Err(format!("configuration file not found: {}", path).into());
         }
         Err(e) => return Err(e.into()),
     };
