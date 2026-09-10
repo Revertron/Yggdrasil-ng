@@ -239,10 +239,10 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `if_name` | string | TUN interface name: "auto" (default) or "none" to disable |
 | `if_mtu` | integer | TUN MTU (default: 65535) |
 | `if_dns` | array | DNS servers for the TUN interface (Windows only), e.g. `["308:84:68:55::", "308:62:45:62::"]` |
+| `group_password` | string | Closed-network password; empty = open mesh. See [Group password (closed networks)](#group-password-closed-networks) |
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
-| `group_password` | string | Closed-network password; empty = open mesh. See [Group password (closed networks)](#group-password-closed-networks) |
 | `[[multicast_interfaces]]` | array of tables | LAN multicast discovery (`filter`, `beacon`, `listen`, `port`, `priority`, `password`) |
 | `[tunnel_routing]` | table | CKR tunnel routing config (`ckr` feature, enabled by default) — see [docs/CKR.md](docs/CKR.md) |
 
@@ -403,6 +403,7 @@ Open an elevated (Administrator) command prompt:
 sc create yggdrasil-ng binPath= "%ProgramFiles%\Yggdrasil-ng\yggdrasil.exe --service -c %ALLUSERSPROFILE%\Yggdrasil-ng\yggdrasil.toml" start= auto DisplayName= "Yggdrasil NG"
 sc description yggdrasil-ng "Yggdrasil Network router process"
 ```
+
 Creating the service without `-c` is also valid when `yggdrasil.toml` already exists in the current directory or in `%ALLUSERSPROFILE%\Yggdrasil-ng\`:
 
 ```cmd
