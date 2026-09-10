@@ -238,6 +238,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `admin_listen` | string | Admin socket address, e.g. `"tcp://localhost:9001"` |
 | `if_name` | string | TUN interface name: "auto" (default) or "none" to disable |
 | `if_mtu` | integer | TUN MTU (default: 65535) |
+| `if_dns` | array | DNS servers for the TUN interface (Windows only), e.g. `["308:84:68:55::", "308:62:45:62::"]` |
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
