@@ -721,8 +721,8 @@ impl Router {
         self.update(&ann)
     }
 
-    /// Parent selection: choose the best root and parent.
-    fn fix(&mut self) -> Vec<RouterAction> {
+    /// Parent selection: returns the best root and the parent leading to it.
+    fn select_parent(&self) -> (PublicKey, PublicKey) {
         let self_key = self.crypto.public_key;
         let mut best_root = self_key;
         let mut best_parent = self_key;
@@ -732,8 +732,9 @@ impl Router {
 
         // Check current parent
         if self.peers.contains_key(&self_info_parent) {
-            let (root, dists) = self.get_root_and_dists(&self_key);
-            if root < best_root {
+            let (root, dists, valid) = self.get_root_and_dists(&self_key);
+            // Only retain the current path when it reaches a confirmed root.
+            if valid && root < best_root {
                 let mut cost = u64::MAX;
                 if let Some(peers) = self.peers.get(&self_info_parent) {
                     for (_, entry) in peers {
@@ -756,14 +757,19 @@ impl Router {
             if !self.infos.contains_key(&pk) {
                 continue;
             }
-            let (p_root, p_dists) = self.get_root_and_dists(&pk);
+            let (p_root, p_dists, valid) = self.get_root_and_dists(&pk);
+            if !valid {
+                // Incomplete or looping ancestry doesn't identify a root.
+                continue;
+            }
             if p_dists.contains_key(&self_key) {
                 continue; // would loop
             }
             let mut cost = u64::MAX;
             if let Some(peers) = self.peers.get(&pk) {
                 for (_, entry) in peers {
-                    let dist_to_root = p_dists.get(&p_root).copied().unwrap_or(u64::MAX);
+                    // +1 for the hop to the peer, otherwise a root peer always costs 0.
+                    let dist_to_root = p_dists.get(&p_root).map_or(u64::MAX, |d| d + 1);
                     let c = dist_to_root.saturating_mul(self.get_cost(entry.id));
                     if c < cost {
                         cost = c;
@@ -785,6 +791,15 @@ impl Router {
                 best_cost = cost;
             }
         }
+
+        (best_root, best_parent)
+    }
+
+    /// Parent selection: choose the best root and parent.
+    fn fix(&mut self) -> Vec<RouterAction> {
+        let self_key = self.crypto.public_key;
+        let self_info_parent = self.infos.get(&self_key).map(|i| i.parent).unwrap_or(self_key);
+        let (best_root, best_parent) = self.select_parent();
 
         let mut actions = Vec::new();
 
@@ -925,28 +940,28 @@ impl Router {
     // Tree traversal
     // -----------------------------------------------------------------------
 
-    /// Get root and distances from a starting node.
-    pub fn get_root_and_dists(&self, dest: &PublicKey) -> (PublicKey, HashMap<PublicKey, u64>) {
+    /// Get root and each known ancestor's distance from `dest`. The result is
+    /// only valid (third element) if the ancestry terminates at a node that
+    /// identifies itself as root; loops and missing ancestors make it invalid.
+    pub fn get_root_and_dists(&self, dest: &PublicKey) -> (PublicKey, HashMap<PublicKey, u64>, bool) {
         let mut dists = HashMap::default();
         let mut next = *dest;
-        let mut root = [0u8; 32];
         let mut dist = 0u64;
 
         loop {
             if dists.contains_key(&next) {
-                break;
+                return ([0u8; 32], dists, false);
             }
-            if let Some(info) = self.infos.get(&next) {
-                root = next;
-                dists.insert(next, dist);
-                dist += 1;
-                next = info.parent;
-            } else {
-                break;
+            let Some(info) = self.infos.get(&next) else {
+                return ([0u8; 32], dists, false);
+            };
+            dists.insert(next, dist);
+            if info.parent == next {
+                return (next, dists, true);
             }
+            dist += 1;
+            next = info.parent;
         }
-
-        (root, dists)
     }
 
     /// Get root and path (coordinates) from root to destination.
@@ -1667,6 +1682,118 @@ mod tests {
         let (root, path) = router.get_root_and_path(&self_key);
         assert_eq!(root, self_key);
         assert!(path.is_empty()); // root has empty path
+    }
+
+    /// Generate `n` signing keys sorted by public key (ascending), so tests
+    /// can control which node wins the "lowest key is root" comparison.
+    fn sorted_keys(n: usize) -> Vec<SigningKey> {
+        let mut keys: Vec<SigningKey> = (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        keys.sort_by_key(|k| k.verifying_key().to_bytes());
+        keys
+    }
+
+    fn pub_key(k: &SigningKey) -> PublicKey {
+        k.verifying_key().to_bytes()
+    }
+
+    /// Insert a tree info without signatures; select_parent never checks them.
+    fn set_info(router: &mut Router, key: PublicKey, parent: PublicKey) {
+        router.infos.insert(
+            key,
+            RouterInfo { parent, seq: 1, nonce: 0, port: 0, psig: [0u8; 64], sig: [0u8; 64] },
+        );
+    }
+
+    /// Make `key` a directly connected peer with the given link latency and a
+    /// pending response, i.e. a parent candidate for select_parent.
+    fn set_candidate(router: &mut Router, key: PublicKey, id: PeerId, lag_ms: u64) {
+        let entry = PeerEntry { id, key, port: id as PeerPort, prio: 0, order: id };
+        router.peers.entry(key).or_default().insert(id, entry);
+        router.lags.insert(id, Duration::from_millis(lag_ms));
+        router
+            .responses
+            .insert(key, SigResState { seq: 1, nonce: 0, port: 0, psig: [0u8; 64] });
+    }
+
+    #[test]
+    fn root_and_dists_valid_chain() {
+        let router = &mut make_router();
+        let keys = sorted_keys(2);
+        let (root, child) = (pub_key(&keys[0]), pub_key(&keys[1]));
+        set_info(router, root, root);
+        set_info(router, child, root);
+
+        let (r, dists, valid) = router.get_root_and_dists(&child);
+        assert!(valid);
+        assert_eq!(r, root);
+        assert_eq!(dists[&child], 0);
+        assert_eq!(dists[&root], 1);
+    }
+
+    #[test]
+    fn root_and_dists_rejects_missing_ancestor_and_loop() {
+        let router = &mut make_router();
+        let keys = sorted_keys(3);
+        let (a, b, missing) = (pub_key(&keys[0]), pub_key(&keys[1]), pub_key(&keys[2]));
+
+        set_info(router, a, missing);
+        assert!(!router.get_root_and_dists(&a).2, "missing ancestor must be invalid");
+
+        set_info(router, a, b);
+        set_info(router, b, a);
+        assert!(!router.get_root_and_dists(&a).2, "loop must be invalid");
+    }
+
+    #[test]
+    fn select_parent_skips_incomplete_ancestry() {
+        // `bogus` has the lowest key but its parent is unknown, so it must not
+        // be mistaken for a root; the valid tree rooted at `root` wins.
+        let keys = sorted_keys(5);
+        let (bogus, root, mid, unknown) =
+            (pub_key(&keys[0]), pub_key(&keys[1]), pub_key(&keys[2]), pub_key(&keys[3]));
+        let mut router = Router::new(Crypto::new(keys[4].clone()), &crate::config::Config::default());
+
+        set_info(&mut router, bogus, unknown);
+        set_candidate(&mut router, bogus, 1, 10);
+        set_info(&mut router, root, root);
+        set_info(&mut router, mid, root);
+        set_candidate(&mut router, mid, 2, 10);
+
+        assert_eq!(router.select_parent(), (root, mid));
+    }
+
+    #[test]
+    fn select_parent_drops_current_parent_with_incomplete_ancestry() {
+        let keys = sorted_keys(3);
+        let (parent, unknown) = (pub_key(&keys[0]), pub_key(&keys[1]));
+        let mut router = Router::new(Crypto::new(keys[2].clone()), &crate::config::Config::default());
+        let self_key = router.crypto.public_key;
+
+        set_info(&mut router, self_key, parent);
+        set_info(&mut router, parent, unknown);
+        router.peers.entry(parent).or_default().insert(
+            1,
+            PeerEntry { id: 1, key: parent, port: 1, prio: 0, order: 1 },
+        );
+
+        assert_eq!(router.select_parent(), (self_key, self_key));
+    }
+
+    #[test]
+    fn select_parent_counts_hop_to_root_peer() {
+        // Slow direct link to the root (100ms, 1 hop) vs. fast link to the
+        // root's child (1ms, 2 hops): the child is cheaper. Without the local
+        // hop the root peer's cost was 0 and it always won.
+        let keys = sorted_keys(3);
+        let (root, child) = (pub_key(&keys[0]), pub_key(&keys[1]));
+        let mut router = Router::new(Crypto::new(keys[2].clone()), &crate::config::Config::default());
+
+        set_info(&mut router, root, root);
+        set_candidate(&mut router, root, 1, 100);
+        set_info(&mut router, child, root);
+        set_candidate(&mut router, child, 2, 1);
+
+        assert_eq!(router.select_parent(), (root, child));
     }
 
     #[test]
