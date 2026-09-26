@@ -75,6 +75,14 @@ if_mtu = 65535
 # these public keys will be allowed to connect. Leave empty to allow all peers.
 # allowed_public_keys = []
 
+# Maximum number of simultaneous *inbound* links from a single remote public key.
+# Several links to one peer over different transports (tcp + tls + ws + quic) are
+# supported and all stay up; this only bounds how many inbound sockets one remote
+# key can pin on us, since the remote side decides how many to open.
+# 0 = unlimited. Outbound links are not capped here — they are governed by the
+# `peers` list above.
+# max_inbound_links_per_peer = 4
+
 # Multicast peer discovery — automatically finds and connects to nearby nodes
 # on the local network without manual configuration.
 #

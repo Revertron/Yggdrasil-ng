@@ -447,6 +447,7 @@ async fn handle_router_msg(
                     let cost = router.get_cost(entry.id);
                     result.push(PeerInfo {
                         key: *key,
+                        id: entry.id,
                         port: entry.port,
                         priority: entry.prio,
                         latency_ms,
@@ -675,108 +676,7 @@ impl crate::types::PacketConn for PacketConnImpl {
     }
 
     async fn handle_conn(&self, key: Addr, conn: Box<dyn AsyncConn>, prio: u8) -> Result<()> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(Error::Closed);
-        }
-
-        let peer_key = key.0;
-
-        // Don't connect to ourselves
-        if peer_key == self.pub_key {
-            return Err(Error::BadKey);
-        }
-
-        // Split connection into read and write halves
-        let (read_half, write_half) = tokio::io::split(conn);
-
-        // Create writer channel and cancellation token for this peer
-        let (writer_tx, writer_rx) = mpsc::channel(PEER_WRITER_CHANNEL_SIZE);
-        let peer_cancel = CancellationToken::new();
-        let _cancel_on_drop = peer_cancel.clone().drop_guard();
-
-        // Allocate the peer in the peers manager
-        let handle = {
-            let mut peers = self.peers.lock().await;
-            peers.allocate_peer(
-                peer_key,
-                prio,
-                writer_tx.clone(),
-                peer_cancel.clone(),
-                self.config.peer_max_message_size,
-            )
-        };
-
-        let peer_id = handle.id;
-        let entry = handle.to_entry();
-        let port = handle.port;
-        let traffic_queue = handle.traffic_queue.clone();
-        let traffic_notify = handle.traffic_notify.clone();
-
-        // Register with router actor and wait for completion.
-        // This ensures the peer is in the router before the reader starts.
-        let (done_tx, done_rx) = oneshot::channel();
-        self.router_handle
-            .send_wait(RouterMsg::AddPeer {
-                entry,
-                done: Some(done_tx),
-            })
-            .await;
-        // Wait for the actor to process AddPeer and dispatch initial actions
-        let _ = done_rx.await;
-
-        // Send a keepalive as initial message
-        let keepalive_frame = wire::encode_frame(wire::PacketType::KeepAlive, &[]);
-        let _ = writer_tx
-            .send(PeerMessage::SendFrame(keepalive_frame))
-            .await;
-
-        // Shared deadline: writer arms it on non-keepalive sends;
-        // reader clears it on any receive.
-        let read_deadline: ReadDeadline = Arc::new(std::sync::Mutex::new(None));
-
-        // Diagnostic only: lets the disconnect summary say whether we were
-        // still writing when the link ended.
-        let last_write: LastWrite = Arc::new(std::sync::Mutex::new(None));
-
-        // Spawn writer task
-        let writer_cancel = peer_cancel.clone();
-        let _writer_handle = tokio::spawn(peer_writer(
-            peer_id,
-            peer_key,
-            port,
-            writer_rx,
-            write_half,
-            traffic_queue,
-            traffic_notify,
-            self.router_handle.clone(),
-            self.peers.clone(),
-            self.config.peer_keepalive_delay,
-            self.config.peer_timeout,
-            read_deadline.clone(),
-            last_write.clone(),
-            writer_cancel,
-        ));
-
-        // Run reader task (blocks until peer disconnects)
-        let result = peer_reader(
-            peer_id,
-            peer_key,
-            self.pub_key,
-            read_half,
-            self.router_handle.clone(),
-            self.peers.clone(),
-            writer_tx.clone(),
-            peer_cancel.clone(),
-            self.config.peer_max_message_size,
-            self.config.peer_timeout,
-            self.config.peer_probe_count,
-            self.config.peer_keepalive_delay,
-            read_deadline,
-            last_write,
-        )
-        .await;
-
-        result
+        self.handle_conn_with_id(key, conn, prio, None).await
     }
 
     fn is_closed(&self) -> bool {
@@ -849,6 +749,125 @@ impl crate::types::PacketConn for PacketConnImpl {
     }
 }
 
+impl PacketConnImpl {
+    /// Same as [`PacketConn::handle_conn`], but reports the per-link peer id
+    /// through `id_tx` as soon as it is allocated. Several links may share one
+    /// public key; the id is what tells their `get_peers()` entries apart.
+    pub async fn handle_conn_with_id(
+        &self,
+        key: Addr,
+        conn: Box<dyn AsyncConn>,
+        prio: u8,
+        id_tx: Option<oneshot::Sender<u64>>,
+    ) -> Result<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Error::Closed);
+        }
+
+        let peer_key = key.0;
+
+        // Don't connect to ourselves
+        if peer_key == self.pub_key {
+            return Err(Error::BadKey);
+        }
+
+        // Split connection into read and write halves
+        let (read_half, write_half) = tokio::io::split(conn);
+
+        // Create writer channel and cancellation token for this peer
+        let (writer_tx, writer_rx) = mpsc::channel(PEER_WRITER_CHANNEL_SIZE);
+        let peer_cancel = CancellationToken::new();
+        let _cancel_on_drop = peer_cancel.clone().drop_guard();
+
+        // Allocate the peer in the peers manager
+        let handle = {
+            let mut peers = self.peers.lock().await;
+            peers.allocate_peer(
+                peer_key,
+                prio,
+                writer_tx.clone(),
+                peer_cancel.clone(),
+                self.config.peer_max_message_size,
+            )
+        };
+
+        let peer_id = handle.id;
+        if let Some(tx) = id_tx {
+            let _ = tx.send(peer_id);
+        }
+        let entry = handle.to_entry();
+        let port = handle.port;
+        let traffic_queue = handle.traffic_queue.clone();
+        let traffic_notify = handle.traffic_notify.clone();
+
+        // Register with router actor and wait for completion.
+        // This ensures the peer is in the router before the reader starts.
+        let (done_tx, done_rx) = oneshot::channel();
+        self.router_handle
+            .send_wait(RouterMsg::AddPeer {
+                entry,
+                done: Some(done_tx),
+            })
+            .await;
+        // Wait for the actor to process AddPeer and dispatch initial actions
+        let _ = done_rx.await;
+
+        // Send a keepalive as initial message
+        let keepalive_frame = wire::encode_frame(wire::PacketType::KeepAlive, &[]);
+        let _ = writer_tx
+            .send(PeerMessage::SendFrame(keepalive_frame))
+            .await;
+
+        // Shared deadline: writer arms it on non-keepalive sends;
+        // reader clears it on any receive.
+        let read_deadline: ReadDeadline = Arc::new(std::sync::Mutex::new(None));
+
+        // Diagnostic only: lets the disconnect summary say whether we were
+        // still writing when the link ended.
+        let last_write: LastWrite = Arc::new(std::sync::Mutex::new(None));
+
+        // Spawn writer task
+        let writer_cancel = peer_cancel.clone();
+        let _writer_handle = tokio::spawn(peer_writer(
+            peer_id,
+            peer_key,
+            port,
+            writer_rx,
+            write_half,
+            traffic_queue,
+            traffic_notify,
+            self.router_handle.clone(),
+            self.peers.clone(),
+            self.config.peer_keepalive_delay,
+            self.config.peer_timeout,
+            read_deadline.clone(),
+            last_write.clone(),
+            writer_cancel,
+        ));
+
+        // Run reader task (blocks until peer disconnects)
+        let result = peer_reader(
+            peer_id,
+            peer_key,
+            self.pub_key,
+            read_half,
+            self.router_handle.clone(),
+            self.peers.clone(),
+            writer_tx.clone(),
+            peer_cancel.clone(),
+            self.config.peer_max_message_size,
+            self.config.peer_timeout,
+            self.config.peer_probe_count,
+            self.config.peer_keepalive_delay,
+            read_deadline,
+            last_write,
+        )
+        .await;
+
+        result
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public types returned by query methods
 // ---------------------------------------------------------------------------
@@ -882,6 +901,9 @@ pub struct DebugSnapshot {
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
     pub key: [u8; 32],
+    /// Per-link id. Unique across links, including several links to the same
+    /// `key` — which share one `port`.
+    pub id: u64,
     pub port: u64,
     pub priority: u8,
     pub latency_ms: f64,

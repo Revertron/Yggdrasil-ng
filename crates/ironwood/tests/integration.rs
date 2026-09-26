@@ -456,3 +456,89 @@ async fn silent_peer_is_probed_before_disconnect() {
         "single-probe peer survived {no_retry:?}, expected a prompt drop"
     );
 }
+
+/// Two links to the same neighbour must both stay up, share one peer port (so
+/// the tree still sees a single logical neighbour) and be told apart by their
+/// per-link id. Losing one link must not cost us the neighbour.
+#[tokio::test]
+async fn two_links_to_one_peer() {
+    let node_a = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+    let node_b = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
+
+    let addr_a = node_a.local_addr();
+    let addr_b = node_b.local_addr();
+
+    // Two independent duplex streams between the same pair of nodes.
+    let mut a_tasks = Vec::new();
+    for _ in 0..2 {
+        let (sa, sb) = tokio::io::duplex(1 << 16);
+        let (a2, b2) = (node_a.clone(), node_b.clone());
+        a_tasks.push(tokio::spawn(async move {
+            let _ = a2.handle_conn(addr_b, Box::new(sa), 0).await;
+        }));
+        tokio::spawn(async move {
+            let _ = b2.handle_conn(addr_a, Box::new(sb), 0).await;
+        });
+    }
+
+    /// Wait until `node` reports exactly `want` peers, or give up.
+    async fn wait_for_peers(node: &Arc<PacketConnImpl>, want: usize) -> Vec<ironwood::PeerInfo> {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let peers = node.get_peers().await;
+                if peers.len() == want {
+                    return peers;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("never settled at {want} peers"))
+    }
+
+    for node in [&node_a, &node_b] {
+        let peers = wait_for_peers(node, 2).await;
+        assert_eq!(peers[0].key, peers[1].key, "both links go to the same node");
+        assert_ne!(peers[0].id, peers[1].id, "links need distinct ids");
+        assert_eq!(
+            peers[0].port, peers[1].port,
+            "extra links must reuse the peer port, so the tree sees one neighbour"
+        );
+    }
+
+    // Kill one link: A drops its half, B sees the EOF.
+    a_tasks.remove(0).abort();
+    let survivors = wait_for_peers(&node_b, 1).await;
+    assert_eq!(survivors[0].key, addr_a.0, "the neighbour must survive");
+
+    // Traffic still flows over the remaining link.
+    let node_b2 = node_b.clone();
+    let reader = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            match node_b2.read_from(&mut buf).await {
+                Ok((n, from)) if n > 0 && from == addr_a => return buf[..n].to_vec(),
+                Ok(_) => continue,
+                Err(_) => return Vec::new(),
+            }
+        }
+    });
+    let node_a2 = node_a.clone();
+    let sender = tokio::spawn(async move {
+        loop {
+            let _ = node_a2.write_to(b"survivor", &addr_b).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    let got = timeout(Duration::from_secs(30), reader).await;
+    sender.abort();
+    assert_eq!(
+        got.expect("timeout: nothing arrived over the surviving link")
+            .expect("reader panicked"),
+        b"survivor"
+    );
+
+    node_a.close().await.unwrap();
+    node_b.close().await.unwrap();
+}
