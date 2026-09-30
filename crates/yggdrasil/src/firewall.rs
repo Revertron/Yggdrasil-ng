@@ -149,11 +149,14 @@ impl Firewall {
 
     fn gc(&self) {
         let now = Instant::now();
-        let mut t = self.table.lock().unwrap();
-        t.retain(|key, entry| {
-            let max = entry.timeout(key.proto);
-            now.duration_since(entry.last_seen) < max
-        });
+        // A poisoned lock skips this sweep rather than mutating a table that may be
+        // half-updated; the next sweep picks it up.
+        if let Ok(mut t) = lock!(self.table) {
+            t.retain(|key, entry| {
+                let max = entry.timeout(key.proto);
+                now.duration_since(entry.last_seen) < max
+            });
+        }
     }
 
     /// Record an outbound flow. Outbound is never blocked.
@@ -174,7 +177,12 @@ impl Firewall {
             peer_port: p.dst_port,
         };
         let now = Instant::now();
-        let mut t = self.table.lock().unwrap();
+        // Nothing can be recorded for this flow, so the return packet will find no
+        // matching flow and be denied. That is the fail-closed direction, so it is
+        // left to the caller's normal path rather than special-cased here.
+        let Ok(mut t) = lock!(self.table) else {
+            return;
+        };
         let entry = t.entry(key).or_insert(FlowEntry {
             last_seen: now,
             tcp_state: if p.proto == PROTO_TCP {
@@ -232,7 +240,10 @@ impl Firewall {
             peer_port: p.src_port,
         };
         {
-            let mut t = self.table.lock().unwrap();
+            let Ok(mut t) = lock!(self.table) else {
+                // Cannot confirm the flow; deny rather than allow on state we cannot read.
+                return false;
+            };
             if let Some(entry) = t.get_mut(&key) {
                 entry.last_seen = Instant::now();
                 if p.proto == PROTO_TCP {
@@ -249,7 +260,11 @@ impl Firewall {
                     && (p.tcp_flags & TCP_FLAG_ACK) == 0;
                 if is_syn && self.open_tcp.contains(&p.dst_port) {
                     let now = Instant::now();
-                    let mut t = self.table.lock().unwrap();
+                    // Denied rather than allowed: the flow cannot be recorded, so the
+                    // return packet would not match it either.
+                    let Ok(mut t) = lock!(self.table) else {
+                        return false;
+                    };
                     t.insert(
                         key,
                         FlowEntry {
@@ -263,7 +278,9 @@ impl Firewall {
             PROTO_UDP => {
                 if self.open_udp.contains(&p.dst_port) {
                     let now = Instant::now();
-                    let mut t = self.table.lock().unwrap();
+                    let Ok(mut t) = lock!(self.table) else {
+                        return false;
+                    };
                     t.insert(
                         key,
                         FlowEntry {

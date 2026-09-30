@@ -582,20 +582,31 @@ impl DeliveryQueue {
 
         // Slow path: queue the packet. Overload is handled by CoDel at dequeue
         // (`pop_codel`); `push` only enforces the hard byte caps.
-        let mut queue = self.queue.lock().unwrap();
+        let Ok(mut queue) = lock!(self.queue) else {
+            // Cannot reach the queue, so the packet is dropped rather than assumed
+            // to have been queued.
+            return None;
+        };
         queue.push(packet);
         None
     }
 
     /// Get the current number of bytes queued (snapshot).
+    ///
+    /// A poisoned lock reports an empty queue rather than failing the stats call.
     pub fn queue_size(&self) -> u64 {
-        self.queue.lock().unwrap().size()
+        lock!(self.queue).map(|q| q.size()).unwrap_or(0)
     }
 
     /// Called by read_from() before waiting on channel. Returns Some(packet)
     /// if one is already queued, or None if the reader should wait (recv_ready incremented).
     pub fn try_pop_or_wait(&self) -> Option<TrafficPacket> {
-        let mut queue = self.queue.lock().unwrap();
+        // On poison the queue cannot be read, so fall back to the same path as
+        // "nothing queued": arm the wakeup and let the reader wait.
+        let Ok(mut queue) = lock!(self.queue) else {
+            self.recv_ready.fetch_add(1, Ordering::AcqRel);
+            return None;
+        };
 
         if let Some(packet) = queue.pop_codel(std::time::Instant::now()) {
             // Packet was queued, return it immediately

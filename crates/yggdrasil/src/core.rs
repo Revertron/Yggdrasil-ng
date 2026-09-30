@@ -55,7 +55,11 @@ impl Core {
     /// Create a new Core from a signing key and configuration.
     /// Returns the Core and a PathNotifySlot that should be filled with
     /// the ReadWriteCloser after creation (call `set_path_notify`).
-    pub fn new(signing_key: SigningKey, config: Config) -> Arc<Self> {
+    ///
+    /// Fails when the self-signed certificate or the TLS configs built from it
+    /// cannot be made — a bad key or an unsupported rustls build, reported to the
+    /// operator at startup rather than taken as a panic halfway through boot.
+    pub fn new(signing_key: SigningKey, config: Config) -> Result<Arc<Self>, String> {
         let public_key = signing_key.verifying_key().to_bytes();
         let address = addr_for_key(&public_key);
         let subnet = subnet_for_key(&public_key);
@@ -76,7 +80,7 @@ impl Core {
             .with_group_password(config.group_password.clone().into_bytes())
             .with_path_notify(move |key: [u8; 32]| {
                 let rwc = {
-                    let guard = slot_clone.lock().unwrap();
+                    let guard = lock_recover!(slot_clone);
                     guard.clone()
                 };
                 if let Some(rwc) = rwc {
@@ -91,16 +95,15 @@ impl Core {
         let active_links = ActiveLinks::new();
 
         // Generate self-signed TLS certificate
-        let tls_material = tls::generate_self_signed_cert(&signing_key)
-            .expect("failed to generate TLS certificate");
+        let tls_material = tls::generate_self_signed_cert(&signing_key)?;
         let tls_server_config = tls::create_server_config(
             tls_material.cert_chain(),
-            tls_material.private_key().expect("invalid private key"),
-        ).expect("failed to create TLS server config");
+            tls_material.private_key()?,
+        )?;
         let tls_client_config = tls::create_client_config(
             tls_material.cert_chain(),
-            tls_material.private_key().expect("invalid private key"),
-        ).expect("failed to create TLS client config");
+            tls_material.private_key()?,
+        )?;
         let cert_expiry = tls_material.expiry;
 
         let tls_server_config = Arc::new(RwLock::new(tls_server_config));
@@ -166,14 +169,13 @@ impl Core {
             core_clone.tls_renewal_task().await;
         });
 
-        core
+        Ok(core)
     }
 
     /// Wire up the path_notify callback to deliver to the given ReadWriteCloser.
     /// Must be called after both Core and RWC are created.
     pub fn set_path_notify(&self, rwc: Arc<ReadWriteCloser>) {
-        let mut slot = self.path_notify_slot.lock().unwrap();
-        *slot = Some(rwc);
+        *lock_recover!(self.path_notify_slot) = Some(rwc);
     }
 
     /// Read a traffic packet from ironwood into `buf`, returning the range of
@@ -487,15 +489,14 @@ impl Core {
     /// Record the name and MTU of the TUN interface. Called once the adapter
     /// exists, since the OS may hand out different values than were requested.
     pub fn set_tun_info(&self, name: &str, mtu: u64) {
-        let mut slot = self.tun_info.lock().unwrap();
-        *slot = Some((name.to_string(), mtu));
+        *lock_recover!(self.tun_info) = Some((name.to_string(), mtu));
     }
 
     /// Get TUN adapter status: (enabled, name, mtu). Without a TUN — disabled
     /// via `if_name = "none"`, or built without the `tun` feature — the name
     /// is empty, the MTU is 0 and `enabled` is false.
     pub fn get_tun_status(&self) -> (bool, String, u64) {
-        match self.tun_info.lock().unwrap().clone() {
+        match lock_recover!(self.tun_info).clone() {
             Some((name, mtu)) => (true, name, mtu),
             None => (false, String::new(), 0),
         }
@@ -590,14 +591,16 @@ impl Core {
                 // Generate new certificate
                 match tls::generate_self_signed_cert(&self.signing_key) {
                     Ok(material) => {
-                        let server_result = tls::create_server_config(
-                            material.cert_chain(),
-                            material.private_key().unwrap(),
-                        );
-                        let client_result = tls::create_client_config(
-                            material.cert_chain(),
-                            material.private_key().unwrap(),
-                        );
+                        // private_key() is fallible too; it was the one call here that
+                        // panicked while its siblings logged. Fold it into the same path.
+                        let server_result = material
+                            .private_key()
+                            .map_err(|e| format!("failed to create private key: {e}"))
+                            .and_then(|k| tls::create_server_config(material.cert_chain(), k));
+                        let client_result = material
+                            .private_key()
+                            .map_err(|e| format!("failed to create private key: {e}"))
+                            .and_then(|k| tls::create_client_config(material.cert_chain(), k));
                         match (server_result, client_result) {
                             (Ok(server_config), Ok(client_config)) => {
                                 // Update configs

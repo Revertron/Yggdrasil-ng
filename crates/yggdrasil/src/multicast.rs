@@ -89,6 +89,8 @@ fn compute_auth_hash(public_key: &[u8; 32], password: &[u8]) -> Vec<u8> {
         // Keyed BLAKE2b-512 (password as MAC key)
         use blake2::digest::Mac;
         use blake2::Blake2bMac512;
+        // Key length is capped at 64 bytes by Config::validate, so this only fires if a
+        // caller bypasses it. Go's blake2b.New512 rejects a longer key the same way.
         let mut mac = Blake2bMac512::new_from_slice(password)
             .expect("BLAKE2b accepts any key length up to 64 bytes");
         mac.update(public_key);

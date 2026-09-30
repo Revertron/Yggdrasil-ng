@@ -2,6 +2,9 @@ pub mod types;
 pub mod config;
 pub mod core;
 
+#[macro_use]
+pub(crate) mod poison;
+
 pub(crate) mod crypto;
 pub(crate) mod wire;
 pub(crate) mod traffic;

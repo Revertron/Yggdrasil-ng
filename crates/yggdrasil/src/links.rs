@@ -1314,6 +1314,22 @@ async fn wrap_incoming(
     }
 }
 
+/// Turn a URL host into a TLS server name, as a DNS name or as an IP address.
+///
+/// The IP branch is not redundant with the DNS one: `url` hands back an IPv6 host
+/// with its brackets still attached (`[2001:db8::1]`), and that is neither a legal
+/// DNS name nor a parseable address, so it reaches here and needs stripping before
+/// the address parse. Without it every IPv6 peer with TLS took the failure path.
+fn server_name_from_host(host: &str) -> Option<rustls::pki_types::ServerName<'static>> {
+    if let Ok(name) = rustls::pki_types::ServerName::try_from(host.to_string()) {
+        return Some(name);
+    }
+    let bare = host.strip_prefix('[')?.strip_suffix(']')?;
+    rustls::pki_types::IpAddr::try_from(bare)
+        .ok()
+        .map(rustls::pki_types::ServerName::IpAddress)
+}
+
 /// Dial a TCP-based peer (tcp/tls/ws/wss): TCP connect, then an optional TLS
 /// handshake (tls/wss) and an optional WebSocket handshake (ws/wss), producing
 /// a ready `Stream`.
@@ -1340,15 +1356,11 @@ async fn dial_stream(
         .map_err(|e| format!("peer_addr: {}", e))?;
 
     if let Some(connector) = tls_connector {
-        // Use SNI from options (explicit ?sni= or hostname fallback), else raw host
+        // Use SNI from options (explicit ?sni= or hostname fallback), else raw host.
         let sni_host = sni.map(str::to_string).unwrap_or_else(|| host.to_string());
-        let server_name = rustls::pki_types::ServerName::try_from(sni_host)
-            .unwrap_or_else(|_| {
-                // Fallback to using IP address as server name if hostname parsing fails
-                rustls::pki_types::ServerName::IpAddress(
-                    rustls::pki_types::IpAddr::try_from(host).expect("invalid hostname"),
-                )
-            });
+        let server_name = server_name_from_host(&sni_host).ok_or_else(|| {
+            format!("peer host {sni_host:?} is neither a valid DNS name nor an IP address")
+        })?;
         let tls_stream = connector
             .connect(server_name, stream)
             .await
@@ -1534,6 +1546,29 @@ mod tests {
         let url = Url::parse("tls://192.168.1.1:12345").unwrap();
         let opts = parse_link_options(&url).unwrap();
         assert_eq!(opts.tls_sni, None);
+    }
+
+    /// A bracketed IPv6 host is what `url` actually hands back, and it is neither a
+    /// legal DNS name nor a parseable address, so it used to reach the IP fallback
+    /// and panic there.
+    #[test]
+    fn test_server_name_from_host() {
+        use rustls::pki_types::ServerName;
+
+        assert!(matches!(
+            server_name_from_host("peer.example.com"),
+            Some(ServerName::DnsName(_))
+        ));
+        assert!(matches!(
+            server_name_from_host("192.168.1.1"),
+            Some(ServerName::IpAddress(_))
+        ));
+        assert!(matches!(
+            server_name_from_host("[2001:db8::1]"),
+            Some(ServerName::IpAddress(_))
+        ));
+        // Neither form: reported, not panicked.
+        assert_eq!(server_name_from_host("not a host"), None);
     }
 
     #[test]

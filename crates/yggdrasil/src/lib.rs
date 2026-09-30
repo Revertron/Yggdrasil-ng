@@ -1,3 +1,6 @@
+#[macro_use]
+pub(crate) mod poison;
+
 pub mod address;
 pub mod admin;
 pub mod config;

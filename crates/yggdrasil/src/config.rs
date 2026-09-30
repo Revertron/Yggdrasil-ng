@@ -327,6 +327,26 @@ fn merge_missing(into: &mut toml_edit::Table, from: &toml_edit::Table) {
 }
 
 impl Config {
+    /// Reject settings the node cannot act on, before any of them is used deep in a
+    /// hot path. Returns the first problem found.
+    pub fn validate(&self) -> Result<(), String> {
+        // BLAKE2b keyed mode takes a key of at most 64 bytes. A longer password is
+        // valid TOML but unusable, so it is rejected here rather than at the first
+        // beacon. (`group_password` is exempt: ironwood hashes it down rather than
+        // using it as the MAC key directly.)
+        const MAX_KEY: usize = 64;
+        for iface in &self.multicast_interfaces {
+            if iface.password.len() > MAX_KEY {
+                return Err(format!(
+                    "multicast password for {:?} must be at most {MAX_KEY} bytes for \
+                     BLAKE2b keyed mode (got {})",
+                    iface.filter,
+                    iface.password.len()
+                ));
+            }
+        }
+        Ok(())
+    }
 
     /// Parse the private key from hex.
     pub fn signing_key(&self) -> Result<SigningKey, String> {
@@ -518,5 +538,20 @@ mod normalize_tests {
             out.contains("private_key = \"\""),
             "normalize must not mint a key:\n{out}"
         );
+    }
+
+    /// A multicast password over 64 bytes is valid TOML but unusable: BLAKE2b keyed
+    /// mode caps the key there. It used to surface as a panic on the first beacon.
+    #[test]
+    fn validate_rejects_over_long_multicast_password() {
+        let mut config = Config::default();
+        assert!(config.validate().is_ok(), "default config must validate");
+
+        config.multicast_interfaces[0].password = "y".repeat(64);
+        assert!(config.validate().is_ok(), "64 bytes is the limit, not over it");
+
+        config.multicast_interfaces[0].password = "y".repeat(65);
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("64"), "message should name the limit: {err}");
     }
 }

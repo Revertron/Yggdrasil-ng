@@ -170,7 +170,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     } else if !config_path.is_empty() {
         let file = File::open(&config_path)?;
         let config = std::io::read_to_string(file)?;
-        toml::from_str::<Config>(&config)?
+        let config = toml::from_str::<Config>(&config)?;
+        config.validate()?;
+        config
     } else {
         tracing::error!("Please specify --genconf, --config, or --autoconf");
         std::process::exit(1);
@@ -248,10 +250,16 @@ async fn run_node(
     #[cfg(windows)]
     opts.optflag("", "service", "");
 
-    let matches = opts.parse(&args[1..]).unwrap_or_else(|_| {
-        // Fallback: empty matches
-        opts.parse(Vec::<String>::new()).unwrap()
-    });
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(e) => {
+            // Args were already parsed in main(); this re-parse exists so service mode
+            // can reach the same settings. Report the failure instead of swallowing it,
+            // then fall back to defaults.
+            tracing::warn!("could not re-parse CLI args ({}); using defaults", e);
+            opts.parse(Vec::<String>::new())?
+        }
+    };
 
     let config_path = matches.opt_str("config").unwrap_or_else(|| "yggdrasil.toml".to_string());
     let autoconf = matches.opt_present("autoconf");
@@ -267,7 +275,9 @@ async fn run_node(
     } else if !config_path.is_empty() {
         let file = File::open(&config_path)?;
         let text = std::io::read_to_string(file)?;
-        toml::from_str::<Config>(&text)?
+        let config = toml::from_str::<Config>(&text)?;
+        config.validate()?;
+        config
     } else {
         return Err("No configuration: specify --config or --autoconf".into());
     };
@@ -291,7 +301,7 @@ async fn run_node(
     };
 
     // Create core
-    let core = Core::new(signing_key, config.clone());
+    let core = Core::new(signing_key, config.clone())?;
     tracing::info!("Your IPv6 address is {}", core.address());
     tracing::info!("Your IPv6 subnet is {}", core.subnet());
     tracing::info!("Your public key is {}", hex::encode(core.public_key()));
@@ -335,7 +345,7 @@ async fn run_node(
         #[cfg(feature = "ckr")]
         Some(&config.tunnel_routing),
         firewall,
-    );
+    )?;
 
     // Wire up path_notify: when ironwood discovers a new path, update the key store
     core.set_path_notify(rwc.clone());

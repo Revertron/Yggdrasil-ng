@@ -71,21 +71,23 @@ impl ReadWriteCloser {
         mtu: u64,
         #[cfg(feature = "ckr")] ckr_config: Option<&TunnelRoutingConfig>,
         firewall: Option<Arc<Firewall>>,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, String> {
         let address = *core.address();
         let subnet = *core.subnet();
 
+        // A bad CKR entry is a configuration error the operator can fix, so it is
+        // reported the same way the firewall config above reports its own — not taken
+        // as a panic in the middle of startup.
         #[cfg(feature = "ckr")]
-        let ckr = ckr_config
-            .filter(|c| c.enable)
-            .map(|c| {
-                CryptoKey::new(c, core.public_key()).unwrap_or_else(|e| {
-                    tracing::error!("Failed to configure CKR: {}", e);
-                    panic!("CKR configuration error: {}", e);
-                })
-            });
+        let ckr = match ckr_config.filter(|c| c.enable) {
+            Some(c) => Some(CryptoKey::new(c, core.public_key()).map_err(|e| {
+                tracing::error!("Failed to configure CKR: {}", e);
+                format!("CKR configuration error: {e}")
+            })?),
+            None => None,
+        };
 
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             core,
             address,
             subnet,
@@ -103,7 +105,7 @@ impl ReadWriteCloser {
             #[cfg(feature = "ckr")]
             ckr,
             firewall,
-        })
+        }))
     }
 
     /// Read a packet from the network (Core) destined for the TUN.
@@ -362,8 +364,9 @@ impl ReadWriteCloser {
         let now = Instant::now();
 
         // Update lookup maps via clone-and-swap (writer mutex serializes concurrent updaters).
-        {
-            let _w = self.lookups_write.lock().unwrap();
+        // On poison the map may be half-updated, so this update is skipped rather than
+        // stacked on top of it; the next packet that learns this key retries it.
+        if let Ok(_w) = lock!(self.lookups_write) {
             let mut new = (**self.lookups.load()).clone();
             let info = KeyInfo {
                 address,
@@ -401,9 +404,9 @@ impl ReadWriteCloser {
 
     /// Clean up expired entries from the key store.
     pub async fn cleanup(&self) {
-        // Remove expired key infos
-        {
-            let _w = self.lookups_write.lock().unwrap();
+        // Remove expired key infos. On poison the sweep is skipped rather than run
+        // against a map that may be half-updated; the next sweep picks it up.
+        if let Ok(_w) = lock!(self.lookups_write) {
             let cur = self.lookups.load();
             let expired_keys: Vec<[u8; 32]> = cur
                 .key_to_info
