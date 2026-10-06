@@ -162,7 +162,7 @@ That filename is then searched in this order:
 1. the current working directory;
 2. the OS system directory, same filename:
    - Unix-like (Linux except Android, BSD, macOS): `/etc/yggdrasil/<filename>`
-   - Windows: `%ALLUSERSPROFILE%\Yggdrasil-ng\<filename>` (resolved via `SHGetKnownFolderPath(FOLDERID_ProgramData)`, usually `C:\ProgramData\Yggdrasil-ng\`).
+   - Windows: `%ALLUSERSPROFILE%\Yggdrasil-ng\<filename>` (resolved from the `ProgramData` environment variable, then `ALLUSERSPROFILE`, then `C:\ProgramData`; usually `C:\ProgramData\Yggdrasil-ng\`).
 
 If the file exists in either place, the daemon and control commands can be started **without** `-c`.
 

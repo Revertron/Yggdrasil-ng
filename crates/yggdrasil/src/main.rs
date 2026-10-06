@@ -901,7 +901,10 @@ fn load_config_file(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
 /// 3. If absent, try the OS-specific system directory with the same filename:
 ///    - Unix-like (Linux except Android, BSD, macOS, …): `/etc/yggdrasil/<filename>`
 ///    - Windows: `<ProgramData>\Yggdrasil-ng\<filename>`, where ProgramData is
-///      obtained via SHGetKnownFolderPath(FOLDERID_ProgramData)
+///      the `ProgramData` environment variable, then `ALLUSERSPROFILE`, then
+///      `C:\ProgramData`. `SHGetKnownFolderPath` is not used: the `windows`
+///      crate links it as a raw-dylib import of shell32.dll, which does not
+///      link on the `*-win7-windows-gnu` targets.
 /// 4. If still not found, return the system path from step 3 (not the
 ///    working-directory filename) so the subsequent open() error names
 ///    the location the user is expected to create.
@@ -943,28 +946,23 @@ fn resolve_config_path(matches: &getopts::Matches) -> String {
     system_config_path(&local)
 }
 
-/// Return the real ProgramData directory via SHGetKnownFolderPath(FOLDERID_ProgramData).
-/// Returns None if the API call fails (no fallback to a hardcoded path).
+/// Return the ProgramData directory without linking shell32 or ole32.
+///
+/// `SHGetKnownFolderPath` / `CoTaskMemFree` are not called. The `windows` crate
+/// imports them as raw-dylibs (`shell32.dll`, `ole32.dll`), and that import
+/// does not link for `x86_64-win7-windows-gnu` / `i686-win7-windows-gnu`
+/// (`cargo zigbuild`). On Windows 7 the same folder is already published as
+/// `ProgramData` (Vista+) and `ALLUSERSPROFILE`.
 #[cfg(windows)]
 fn windows_program_data_dir() -> Option<std::path::PathBuf> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath};
-
-    unsafe {
-        let pwstr = SHGetKnownFolderPath(
-            &FOLDERID_ProgramData,
-            KNOWN_FOLDER_FLAG(0),
-            None,
-        )
-        .ok()?;
-        // PWSTR is a null-terminated wide string allocated by CoTaskMemAlloc.
-        let wide = pwstr.as_wide();
-        let path = std::path::PathBuf::from(OsString::from_wide(wide));
-        CoTaskMemFree(Some(pwstr.0 as _));
-        Some(path)
+    for key in ["ProgramData", "ALLUSERSPROFILE"] {
+        if let Some(dir) = std::env::var_os(key) {
+            if !dir.is_empty() {
+                return Some(std::path::PathBuf::from(dir));
+            }
+        }
     }
+    Some(std::path::PathBuf::from(r"C:\ProgramData"))
 }
 
 /// Resolve (prefix, port) from the binary/symlink/hardlink name.
@@ -1211,6 +1209,26 @@ mod tests {
         assert_eq!(expand_genconf_path(r"%%"), r"%%");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_program_data_dir_uses_env_not_shell32() {
+        let dir = windows_program_data_dir().expect("program data dir");
+        assert!(!dir.as_os_str().is_empty());
+        if let Some(from_env) = std::env::var_os("ProgramData") {
+            if !from_env.is_empty() {
+                assert_eq!(dir, std::path::PathBuf::from(from_env));
+                return;
+            }
+        }
+        if let Some(from_env) = std::env::var_os("ALLUSERSPROFILE") {
+            if !from_env.is_empty() {
+                assert_eq!(dir, std::path::PathBuf::from(from_env));
+                return;
+            }
+        }
+        assert_eq!(dir, std::path::PathBuf::from(r"C:\ProgramData"));
+    }
+    
     #[test]
     fn generate_from_base_reuses_key_and_ignores_other_fields() {
         let base_key = {
