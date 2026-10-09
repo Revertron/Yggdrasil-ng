@@ -18,8 +18,9 @@ use crate::pathfinder::Pathfinder;
 use crate::wire::{self, PeerPort};
 
 /// Unknown latency sentinel (high but won't overflow in multiplication).
-/// Go uses `time.Duration(^uint32(0))` ≈ 4.3s. We use a round 5s.
-const UNKNOWN_LATENCY: Duration = Duration::from_secs(5);
+/// Same value as Go's `time.Duration(^uint32(0))` ≈ 4.29s, so the cost of a
+/// not-yet-measured link (4294) matches Go during parent selection.
+const UNKNOWN_LATENCY: Duration = Duration::from_nanos(u32::MAX as u64);
 
 // ---------------------------------------------------------------------------
 // Router-level types
@@ -236,8 +237,9 @@ pub(crate) struct Router {
 
     // Latency tracking
     pub lags: HashMap<PeerId, Duration>,
-    /// When we last sent a SigReq to each peer (for accurate RTT measurement).
-    pub sig_req_times: HashMap<PeerId, Instant>,
+    /// Most recent raw SigReq→SigRes RTT per peer, reported as peer latency
+    /// (Go's `srrt - srst`). `lags` is the smoothed, penalized value behind cost.
+    pub rtts: HashMap<PeerId, Duration>,
 
     // Signature protocol
     pub requests: HashMap<PublicKey, SigReqState>,
@@ -276,7 +278,7 @@ impl Router {
             ancs: HashMap::default(),
             cache: HashMap::default(),
             lags: HashMap::default(),
-            sig_req_times: HashMap::default(),
+            rtts: HashMap::default(),
             requests: HashMap::default(),
             responses: HashMap::default(),
             responded: HashSet::default(),
@@ -447,7 +449,6 @@ impl Router {
         }
         let req = self.requests[&key].clone();
         self.responded.remove(&peer_id);
-        self.sig_req_times.insert(peer_id, Instant::now());
         actions.push(RouterAction::SendSigReq {
             peer_id,
             req: wire::SigReq {
@@ -472,7 +473,7 @@ impl Router {
         let mut actions = Vec::new();
         self.lags.remove(&peer_id);
         self.responded.remove(&peer_id);
-        self.sig_req_times.remove(&peer_id);
+        self.rtts.remove(&peer_id);
 
         if let Some(peers) = self.peers.get_mut(&key) {
             peers.remove(&peer_id);
@@ -543,18 +544,17 @@ impl Router {
     }
 
     /// Handle a signature response from a peer.
-    pub fn handle_response(&mut self, peer_id: PeerId, key: &PublicKey, res: &wire::SigRes) {
+    /// `rtt` is measured by the peer tasks from SigReq flush to SigRes arrival.
+    pub fn handle_response(&mut self, peer_id: PeerId, key: &PublicKey, res: &wire::SigRes, rtt: Duration) {
         let req_match = self
             .requests
             .get(key)
             .map_or(false, |r| r.seq == res.seq && r.nonce == res.nonce);
 
-        // Compute accurate RTT from stored SigReq send time (matches Go's p.srst/p.srrt).
-        let rtt = self
-            .sig_req_times
-            .get(&peer_id)
-            .map(|t| t.elapsed())
-            .unwrap_or(Duration::ZERO);
+        // Go refreshes srrt on every verified SigRes, matching or not.
+        if !rtt.is_zero() {
+            self.rtts.insert(peer_id, rtt);
+        }
 
         if !self.responses.contains_key(key) && req_match {
             tracing::debug!("SigRes accepted from {:?}, rtt={:?}", hex::encode(&key[..4]), rtt);
@@ -852,13 +852,11 @@ impl Router {
             .map(|(k, ps)| (*k, ps.keys().copied().collect()))
             .collect();
 
-        let now = Instant::now();
         for (pk, peer_ids) in peer_keys {
             let req = self.new_req();
             self.requests.insert(pk, req.clone());
             for peer_id in peer_ids {
                 self.responded.remove(&peer_id);
-                self.sig_req_times.insert(peer_id, now);
                 actions.push(RouterAction::SendSigReq {
                     peer_id,
                     req: wire::SigReq {
