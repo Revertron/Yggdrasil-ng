@@ -1,6 +1,6 @@
 [package]
 name = "ironwood"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Routing library: ed25519-addressed PacketConn over spanning tree"
 license = "MPL-2.0"
@@ -8,7 +8,7 @@ license = "MPL-2.0"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-curve25519-dalek = "4"
+curve25519-dalek = "5.0.0"
 crypto_box = "0.9"
 murmur3 = "0.5"
 rand = "0.8"

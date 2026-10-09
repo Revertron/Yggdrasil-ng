@@ -144,6 +144,13 @@ pub(crate) struct SigResState {
     pub psig: Sig,
 }
 
+/// Cached root and path (coords) for a node.
+#[derive(Clone, Debug)]
+pub(crate) struct RouterPath {
+    pub root: PublicKey,
+    pub path: Vec<PeerPort>,
+}
+
 // ---------------------------------------------------------------------------
 // Outbound actions: things the router wants the networking layer to do
 // ---------------------------------------------------------------------------
@@ -232,8 +239,8 @@ pub(crate) struct Router {
     pub info_times: HashMap<PublicKey, Instant>,
     /// Ancestry info per peer.
     pub ancs: HashMap<PublicKey, Vec<PublicKey>>,
-    /// Cached path (coords) for each peer.
-    pub cache: HashMap<PublicKey, Vec<PeerPort>>,
+    /// Cached root and path (coords) for each node.
+    pub cache: HashMap<PublicKey, RouterPath>,
 
     // Latency tracking
     pub lags: HashMap<PeerId, Duration>,
@@ -531,6 +538,16 @@ impl Router {
                 psig,
             },
         }
+    }
+
+    /// Verify a signature response from `parent` for `node`. Port 0 is only valid
+    /// for a root's self-announce, matching `RouterAnnounce::check`.
+    pub(crate) fn check_sig_res(res: &wire::SigRes, node: &PublicKey, parent: &PublicKey) -> bool {
+        if res.port == 0 && node != parent {
+            return false;
+        }
+        let bs = Self::sig_res_bytes_for_sig(node, parent, res.seq, res.nonce, res.port);
+        Crypto::verify(parent, &bs, &res.psig)
     }
 
     fn sig_res_bytes_for_sig(node: &PublicKey, parent: &PublicKey, seq: u64, nonce: u64, port: PeerPort) -> Vec<u8> {
@@ -990,19 +1007,34 @@ impl Router {
         (root, ports)
     }
 
+    /// Get cached root and coordinates for a key. Computes and caches if not present.
+    fn cached_root_and_path(&mut self, key: &PublicKey) -> &RouterPath {
+        if !self.cache.contains_key(key) {
+            let (root, path) = self.get_root_and_path(key);
+            self.cache.insert(*key, RouterPath { root, path });
+        }
+        &self.cache[key]
+    }
+
     /// Get cached coordinates for a key. Computes and caches if not present.
     fn cached_coords(&mut self, key: &PublicKey) -> Vec<PeerPort> {
-        if let Some(cached) = self.cache.get(key) {
-            return cached.clone();
-        }
-        let (_, path) = self.get_root_and_path(key);
-        self.cache.insert(*key, path.clone());
-        path
+        self.cached_root_and_path(key).path.clone()
     }
 
     /// Get distance between a path and a key in tree-space.
     fn get_dist(&mut self, dest_path: &[PeerPort], key: &PublicKey) -> u64 {
-        let key_path = self.cached_coords(key);
+        let self_key = self.crypto.public_key;
+        let self_root = self.cached_root_and_path(&self_key).root;
+        let root = self.cached_root_and_path(key).root;
+        if self.infos.get(&root).map_or(true, |info| info.parent != root) {
+            // A failed ancestry walk is not the empty path of a real root.
+            return u64::MAX;
+        }
+        if root != self_root {
+            // Coordinates from different roots are not comparable.
+            return u64::MAX;
+        }
+        let key_path = &self.cache[key].path;
 
         let end = dest_path.len().min(key_path.len());
         let mut dist = (key_path.len() + dest_path.len()) as u64;
@@ -1802,6 +1834,96 @@ mod tests {
 
         let dist = router.get_dist(&[], &self_key);
         assert_eq!(dist, 0); // same node, same (empty) path
+    }
+
+    #[test]
+    fn get_dist_same_root_child() {
+        let mut router = make_router();
+        router.become_root();
+        let self_key = router.crypto.public_key;
+        let child = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        set_info(&mut router, child, self_key);
+        router.infos.get_mut(&child).unwrap().port = 3;
+
+        assert_eq!(router.get_dist(&[3], &child), 0);
+        assert_eq!(router.get_dist(&[], &child), 1);
+    }
+
+    #[test]
+    fn get_dist_ignores_dead_end_ancestry() {
+        let mut router = make_router();
+        router.become_root();
+        let orphan = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        let missing = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        set_info(&mut router, orphan, missing);
+
+        // The failed walk yields an empty path; it must not look like distance 0.
+        assert_eq!(router.get_dist(&[], &orphan), u64::MAX);
+        // Unknown node: no info at all.
+        assert_eq!(router.get_dist(&[], &missing), u64::MAX);
+    }
+
+    #[test]
+    fn get_dist_ignores_looping_ancestry() {
+        let mut router = make_router();
+        router.become_root();
+        let a = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        let b = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        set_info(&mut router, a, b);
+        set_info(&mut router, b, a);
+
+        assert_eq!(router.get_dist(&[], &a), u64::MAX);
+    }
+
+    #[test]
+    fn get_dist_ignores_different_root() {
+        let mut router = make_router();
+        router.become_root();
+        let other_root = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        let other_child = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        set_info(&mut router, other_root, other_root);
+        set_info(&mut router, other_child, other_root);
+
+        assert_eq!(router.get_dist(&[], &other_root), u64::MAX);
+        assert_eq!(router.get_dist(&[], &other_child), u64::MAX);
+    }
+
+    fn signed_sig_res(parent: &Crypto, node: &PublicKey, port: PeerPort) -> wire::SigRes {
+        let bs = Router::sig_res_bytes_for_sig(node, &parent.public_key, 1, 42, port);
+        wire::SigRes { seq: 1, nonce: 42, port, psig: parent.sign(&bs) }
+    }
+
+    #[test]
+    fn sig_res_check_accepts_valid() {
+        let parent = Crypto::new(SigningKey::generate(&mut OsRng));
+        let node = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        let res = signed_sig_res(&parent, &node, 5);
+        assert!(Router::check_sig_res(&res, &node, &parent.public_key));
+    }
+
+    #[test]
+    fn sig_res_check_rejects_bad_signature() {
+        let parent = Crypto::new(SigningKey::generate(&mut OsRng));
+        let node = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        let mut res = signed_sig_res(&parent, &node, 5);
+        res.nonce += 1;
+        assert!(!Router::check_sig_res(&res, &node, &parent.public_key));
+    }
+
+    #[test]
+    fn sig_res_check_rejects_port_zero_for_non_root() {
+        let parent = Crypto::new(SigningKey::generate(&mut OsRng));
+        let node = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        // Validly signed, but port 0 is reserved for a root's self-announce.
+        let res = signed_sig_res(&parent, &node, 0);
+        assert!(!Router::check_sig_res(&res, &node, &parent.public_key));
+    }
+
+    #[test]
+    fn sig_res_check_accepts_port_zero_for_self() {
+        let root = Crypto::new(SigningKey::generate(&mut OsRng));
+        let res = signed_sig_res(&root, &root.public_key, 0);
+        assert!(Router::check_sig_res(&res, &root.public_key, &root.public_key));
     }
 
     #[test]

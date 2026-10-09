@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bloom::BloomFilter;
 use crate::core::{RouterHandle, RouterMsg};
-use crate::crypto::{Crypto, PublicKey};
-use crate::router::{PeerId, PeerEntry, RouterAction, RouterAnnounce};
+use crate::crypto::PublicKey;
+use crate::router::{PeerId, PeerEntry, Router, RouterAction, RouterAnnounce};
 use crate::traffic::{PacketQueue, TrafficPacket};
 use crate::types::Error;
 use crate::wire::{self, PeerPort};
@@ -559,17 +559,8 @@ pub(crate) async fn peer_reader(
                         break;
                     },
                 };
-                // Verify the signature before sending to the actor
-                let bs = {
-                    let mut out = Vec::new();
-                    out.extend_from_slice(&our_key);
-                    out.extend_from_slice(&peer_key);
-                    wire::encode_uvarint(&mut out, res.seq);
-                    wire::encode_uvarint(&mut out, res.nonce);
-                    wire::encode_uvarint(&mut out, res.port);
-                    out
-                };
-                if !Crypto::verify(&peer_key, &bs, &res.psig) {
+                // Verify the response before sending to the actor
+                if !Router::check_sig_res(&res, &our_key, &peer_key) {
                     disconnect_reason = Some(Error::BadMessage);
                     break;
                 }

@@ -834,3 +834,4 @@ fn join_multicast_on_interface(
 use std::os::unix::io::FromRawFd;
 #[cfg(windows)]
 use std::os::windows::io::FromRawSocket;
+use blake2::digest::KeyInit;
