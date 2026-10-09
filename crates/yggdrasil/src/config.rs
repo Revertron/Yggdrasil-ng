@@ -271,6 +271,26 @@ impl Config {
         CONFIG_TEMPLATE.replace("{{PRIVATE_KEY}}", &key_hex)
     }
 
+    /// Generate a commented config file using an already-known hex private key
+    /// instead of minting a new keypair.
+    pub fn generate_config_text_from_private_key(key_hex: &str) -> String {
+        CONFIG_TEMPLATE.replace("{{PRIVATE_KEY}}", key_hex)
+    }
+
+    /// Read `private_key` from an existing TOML config string.
+    ///
+    /// Other fields are ignored. The key must be present, non-empty and a
+    /// valid 64-byte Ed25519 keypair hex (same rules as `signing_key()`).
+    pub fn private_key_from_toml(user_toml: &str) -> Result<String, String> {
+        let cfg: Config = toml::from_str(user_toml)
+            .map_err(|e| format!("invalid base config TOML: {}", e))?;
+        if cfg.private_key.is_empty() {
+            return Err("base config has empty private_key".to_string());
+        }
+        let _ = cfg.signing_key()?;
+        Ok(cfg.private_key)
+    }
+
     /// Read a TOML config string, add any fields missing from the user's input
     /// (with their template comments), and return the merged document.
     /// Preserves user values, formatting, comments, and unknown keys.
@@ -518,5 +538,64 @@ mod normalize_tests {
             out.contains("private_key = \"\""),
             "normalize must not mint a key:\n{out}"
         );
+    }
+
+    #[test]
+    fn generate_from_private_key_inserts_exact_hex() {
+        let generated = Config::generate_config_text();
+        let key = Config::private_key_from_toml(&generated).unwrap();
+        assert_eq!(key.len(), 128, "ed25519 keypair hex must be 128 chars");
+
+        let reused = Config::generate_config_text_from_private_key(&key);
+        assert!(
+            reused.contains(&format!("private_key = \"{key}\"")),
+            "generated text must contain the supplied private_key:\n{reused}"
+        );
+        let parsed: Config = toml::from_str(&reused).unwrap();
+        assert_eq!(parsed.private_key, key);
+        // Template scaffolding must still be present (not a copy of the base file).
+        assert!(reused.contains("peers = []"));
+        assert!(reused.contains("[firewall]"));
+    }
+
+    #[test]
+    fn private_key_from_toml_reads_only_the_key() {
+        let toml_text = "private_key = \"aabb\"\npeers = [\"tcp://127.0.0.1:1\"]\n";
+        // "aabb" is not a valid 64-byte key — must fail via signing_key().
+        let err = Config::private_key_from_toml(toml_text).unwrap_err();
+        assert!(
+            err.contains("64 bytes") || err.contains("invalid private key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn private_key_from_toml_rejects_empty_key() {
+        let err = Config::private_key_from_toml("private_key = \"\"\n").unwrap_err();
+        assert_eq!(err, "base config has empty private_key");
+    }
+
+    #[test]
+    fn private_key_from_toml_rejects_missing_key() {
+        // Field defaults to empty via serde(default).
+        let err = Config::private_key_from_toml("peers = []\n").unwrap_err();
+        assert_eq!(err, "base config has empty private_key");
+    }
+
+    #[test]
+    fn private_key_from_toml_rejects_invalid_toml() {
+        let err = Config::private_key_from_toml("this is = = not toml\n").unwrap_err();
+        assert!(
+            err.starts_with("invalid base config TOML:"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn private_key_from_toml_accepts_valid_generated_key() {
+        let generated = Config::generate_config_text();
+        let key = Config::private_key_from_toml(&generated).unwrap();
+        assert_eq!(key.len(), 128);
+        assert!(generated.contains(&key));
     }
 }
