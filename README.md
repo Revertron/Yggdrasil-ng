@@ -111,6 +111,7 @@ yggdrasil [options]
 | `-n, --no-replace` | With `--genconf FILE`, skip if the file already exists |
 | `-b, --base FILE` | With `--genconf`, copy `private_key` from this existing config |
 | `--logto FILE` | Log to a file instead of stderr (appends) |
+| `-p, --peer URI` | Peer URI to connect to on startup (repeatable; merged into config peers, duplicates skipped) |
 | `--service` | Run as a Windows service (Windows only) |
 | `-h, --help` | Print help message |
 | `-v, --version` | Print version |

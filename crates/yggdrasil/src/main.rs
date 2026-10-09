@@ -288,8 +288,16 @@ async fn run_node(
         SigningKey::generate(&mut rand::rngs::OsRng)
     };
 
-    // Create core
-    let core = Core::new(signing_key, config.clone());
+    // Merge CLI-provided peers (-p/--peer) into a clone of config so the node connects
+    // to them on startup (deduped against configured entries).
+    let mut cfg = config.clone();
+    for uri in matches.opt_strs("p") {
+        if !cfg.peers.contains(&uri) {
+            cfg.peers.push(uri);
+        }
+    }
+
+    let core = Core::new(signing_key, cfg);
     tracing::info!("Your IPv6 address is {}", core.address());
     tracing::info!("Your IPv6 subnet is {}", core.subnet());
     tracing::info!("Your public key is {}", hex::encode(core.public_key()));
@@ -632,6 +640,7 @@ fn make_cli_options() -> Options {
     opts.optflag("n", "no-replace", "With --genconf FILE, skip if the file already exists");
     opts.optopt("b", "base", "With --genconf, copy private_key from this existing config file instead of generating a new key", "FILE");
     opts.optopt("", "logto", "Log to a file instead of stderr", "FILE");
+    opts.optmulti("p", "peer", "Peer URI to connect to on startup (repeatable)", "URI");
     #[cfg(feature = "ctl")]
     opts.optopt("e", "endpoint", "Admin socket address (default: tcp://localhost:9001)", "URI");
     #[cfg(feature = "ctl")]
