@@ -55,6 +55,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     opts.optopt("l", "loglevel", "Log level: error, warn, info, debug, trace (default: info)", "LEVEL");
     opts.optflag("n", "no-replace", "With --genconf FILE, skip if the file already exists");
     opts.optopt("", "logto", "Log to a file instead of stderr", "FILE");
+    opts.optmulti("p", "peer", "Peer URI to connect to on startup (repeatable)", "URI");
     #[cfg(feature = "ctl")]
     opts.optopt("e", "endpoint", "Admin socket address (default: tcp://localhost:9001)", "URI");
     #[cfg(feature = "ctl")]
@@ -234,6 +235,8 @@ async fn run_node(
     opts.optflag("", "autoconf", "");
     opts.optopt("l", "loglevel", "", "LEVEL");
     opts.optopt("", "logto", "", "FILE");
+    // Accept (and collect) -p/--peer so startup peers can be merged into config.peers.
+    opts.optmulti("p", "peer", "", "URI");
     // Accept (and ignore) the rest so parsing doesn't fail
     opts.optflagopt("g", "genconf", "", "FILE");
     opts.optflag("a", "address", "");
@@ -290,8 +293,17 @@ async fn run_node(
         SigningKey::generate(&mut rand::rngs::OsRng)
     };
 
-    // Create core
-    let core = Core::new(signing_key, config.clone());
+
+    // Merge CLI-provided peers (-p/--peer) into a clone of config so the node connects
+    // to them on startup (deduped against configured entries).
+    let mut cfg = config.clone();
+    for uri in matches.opt_strs("p") {
+        if !cfg.peers.contains(&uri) {
+            cfg.peers.push(uri);
+        }
+    }
+
+    let core = Core::new(signing_key, cfg);
     tracing::info!("Your IPv6 address is {}", core.address());
     tracing::info!("Your IPv6 subnet is {}", core.subnet());
     tracing::info!("Your public key is {}", hex::encode(core.public_key()));
