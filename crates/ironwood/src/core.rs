@@ -22,7 +22,7 @@ use crate::bloom::BloomFilter;
 use crate::config::Config;
 use crate::crypto::{Crypto, PublicKey};
 use crate::peers::{
-    dispatch_actions, peer_reader, peer_writer, LastWrite, PeerMessage, Peers, ReadDeadline,
+    dispatch_actions, peer_reader, peer_writer, LastWrite, PeerMessage, Peers, ReadDeadline, SigReqSent,
 };
 use crate::router::{PeerEntry, PeerId, Router, RouterAction, RouterAnnounce};
 use crate::traffic::{DeliveryQueue, TrafficPacket};
@@ -65,6 +65,8 @@ pub(crate) enum RouterMsg {
         peer_id: PeerId,
         key: PublicKey,
         res: wire::SigRes,
+        /// SigRes arrival minus SigReq flush, measured on the link itself.
+        rtt: Duration,
     },
     HandleAnnounce {
         peer_id: PeerId,
@@ -384,8 +386,8 @@ async fn handle_router_msg(
                 }
             }
         }
-        RouterMsg::HandleResponse { peer_id, key, res } => {
-            router.handle_response(peer_id, &key, &res);
+        RouterMsg::HandleResponse { peer_id, key, res, rtt } => {
+            router.handle_response(peer_id, &key, &res, rtt);
         }
         RouterMsg::HandleAnnounce { peer_id, peer_key, ann } => {
             let actions = router.handle_announce(peer_id, &peer_key, &ann);
@@ -440,7 +442,7 @@ async fn handle_router_msg(
             for (key, entries) in &router.peers {
                 for (_id, entry) in entries {
                     let latency_ms = router
-                        .lags
+                        .rtts
                         .get(&entry.id)
                         .map(|d| d.as_secs_f64() * 1000.0)
                         .unwrap_or(0.0);
@@ -526,7 +528,7 @@ async fn handle_router_msg(
                 .map(|(key, entries)| {
                     let latency = entries
                         .keys()
-                        .find_map(|id| router.lags.get(id))
+                        .find_map(|id| router.rtts.get(id))
                         .map(|d| d.as_secs_f64() * 1000.0)
                         .unwrap_or(0.0);
                     (*key, latency)
@@ -738,6 +740,9 @@ impl crate::types::PacketConn for PacketConnImpl {
         // still writing when the link ended.
         let last_write: LastWrite = Arc::new(std::sync::Mutex::new(None));
 
+        // Writer stamps SigReq flushes; reader measures RTT from it.
+        let sig_req_sent: SigReqSent = Arc::new(std::sync::Mutex::new(None));
+
         // Spawn writer task
         let writer_cancel = peer_cancel.clone();
         let _writer_handle = tokio::spawn(peer_writer(
@@ -754,6 +759,7 @@ impl crate::types::PacketConn for PacketConnImpl {
             self.config.peer_timeout,
             read_deadline.clone(),
             last_write.clone(),
+            sig_req_sent.clone(),
             writer_cancel,
         ));
 
@@ -773,6 +779,7 @@ impl crate::types::PacketConn for PacketConnImpl {
             self.config.peer_keepalive_delay,
             read_deadline,
             last_write,
+            sig_req_sent,
         )
         .await;
 
