@@ -207,6 +207,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `admin_listen` | string | Admin socket address, e.g. `"tcp://localhost:9001"` |
 | `if_name` | string | TUN interface name: "auto" (default) or "none" to disable |
 | `if_mtu` | integer | TUN MTU (default: 65535) |
+| `if_gso` | bool | TUN segmentation offload, Linux only (default: false) — see [docs/GSO.md](docs/GSO.md) |
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
@@ -420,6 +421,24 @@ Yggdrasil-ng is designed to be **wire-compatible** with the original Go implemen
 - Thorough tests are to be made, but some tests with iperf3 show significant improvements over the Go's version.
 - Also, the memory footprint is a lot smaller.
 - And binaries are smaller too :)
+
+### TUN segmentation offload (GSO)
+
+`if_gso = true` (Linux only, off by default) lets the kernel hand over segmented
+buffers in one read/write instead of one syscall per packet.
+
+**It pays off when many small packets arrive back to back — the predicate is
+packet density, not MTU.** Measured over 1 GbE at `if_mtu = 1500`, single stream,
+10 reps per arm on idle hosts: **+18% throughput, −32% sender CPU per gigabit,
+−23% receiver CPU per gigabit**, 20× coalescing, and 6× tighter run-to-run
+variance. It costs about 0.6 ms of loaded latency.
+
+It is inert for bulk transfer at the default MTU — TCP already emits ~64 KB
+segments there, so there is nothing to coalesce — and inert for sparse traffic.
+Enable it for interop with 1500-byte-MTU meshes and for CKR/VPN forwarding.
+
+See **[docs/GSO.md](docs/GSO.md)** for when to enable it, what it costs, and how
+to verify the kernel granted it.
 
 ---
 

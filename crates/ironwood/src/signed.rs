@@ -171,6 +171,27 @@ impl crate::types::PacketConn for SignedPacketConn {
         Ok((n, Addr(msg.source)))
     }
 
+    fn try_read_from(&self, buf: &mut [u8]) -> Result<Option<(usize, Addr)>> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Error::Closed);
+        }
+
+        let msg = match self.recv_rx.try_lock() {
+            Ok(mut rx) => match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(None),
+                Err(mpsc::error::TryRecvError::Disconnected) => return Err(Error::Closed),
+            },
+            // Another reader holds the receiver; treat it as "nothing for us
+            // right now" rather than blocking on the lock.
+            Err(_) => return Ok(None),
+        };
+
+        let n = buf.len().min(msg.data.len());
+        buf[..n].copy_from_slice(&msg.data[..n]);
+        Ok(Some((n, Addr(msg.source))))
+    }
+
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
