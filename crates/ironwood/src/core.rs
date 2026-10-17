@@ -449,6 +449,7 @@ async fn handle_router_msg(
                     let cost = router.get_cost(entry.id);
                     result.push(PeerInfo {
                         key: *key,
+                        id: entry.id,
                         port: entry.port,
                         priority: entry.prio,
                         latency_ms,
@@ -677,6 +678,90 @@ impl crate::types::PacketConn for PacketConnImpl {
     }
 
     async fn handle_conn(&self, key: Addr, conn: Box<dyn AsyncConn>, prio: u8) -> Result<()> {
+        self.handle_conn_with_id(key, conn, prio, None).await
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+
+    fn private_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+
+    fn mtu(&self) -> u64 {
+        let traffic = wire::Traffic {
+            path: vec![],
+            from: vec![],
+            source: [0; 32],
+            dest: [0; 32],
+            watermark: u64::MAX,
+            payload: vec![],
+        };
+        let overhead = traffic.size() + 1;
+        self.config.peer_max_message_size.saturating_sub(overhead as u64)
+    }
+
+    async fn send_lookup(&self, target: Addr) {
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        self.router_handle.send(RouterMsg::SendLookup {
+            our_key: self.pub_key,
+            dest: target.0,
+        });
+    }
+
+    async fn close(&self) -> Result<()> {
+        if self
+            .closed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(Error::Closed);
+        }
+
+        // Cancel all background tasks (including router actor)
+        self.cancel.cancel();
+
+        // Close all peer connections
+        let handles: Vec<(PublicKey, Vec<u64>)> = {
+            let peers = self.peers.lock().await;
+            peers
+                .handles
+                .iter()
+                .map(|(k, m)| (*k, m.keys().copied().collect()))
+                .collect()
+        };
+
+        for (_key, peer_ids) in &handles {
+            let peers = self.peers.lock().await;
+            for &id in peer_ids {
+                if let Some(handle) = peers.get_handle(id) {
+                    handle.cancel.cancel();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn local_addr(&self) -> Addr {
+        Addr(self.pub_key)
+    }
+}
+
+impl PacketConnImpl {
+    /// Same as [`PacketConn::handle_conn`], but reports the per-link peer id
+    /// through `id_tx` as soon as it is allocated. Several links may share one
+    /// public key; the id is what tells their `get_peers()` entries apart.
+    pub async fn handle_conn_with_id(
+        &self,
+        key: Addr,
+        conn: Box<dyn AsyncConn>,
+        prio: u8,
+        id_tx: Option<oneshot::Sender<u64>>,
+    ) -> Result<()> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
@@ -709,6 +794,9 @@ impl crate::types::PacketConn for PacketConnImpl {
         };
 
         let peer_id = handle.id;
+        if let Some(tx) = id_tx {
+            let _ = tx.send(peer_id);
+        }
         let entry = handle.to_entry();
         let port = handle.port;
         let traffic_queue = handle.traffic_queue.clone();
@@ -785,75 +873,6 @@ impl crate::types::PacketConn for PacketConnImpl {
 
         result
     }
-
-    fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Relaxed)
-    }
-
-    fn private_key(&self) -> &SigningKey {
-        &self.signing_key
-    }
-
-    fn mtu(&self) -> u64 {
-        let traffic = wire::Traffic {
-            path: vec![],
-            from: vec![],
-            source: [0; 32],
-            dest: [0; 32],
-            watermark: u64::MAX,
-            payload: vec![],
-        };
-        let overhead = traffic.size() + 1;
-        self.config.peer_max_message_size.saturating_sub(overhead as u64)
-    }
-
-    async fn send_lookup(&self, target: Addr) {
-        if self.closed.load(Ordering::Relaxed) {
-            return;
-        }
-        self.router_handle.send(RouterMsg::SendLookup {
-            our_key: self.pub_key,
-            dest: target.0,
-        });
-    }
-
-    async fn close(&self) -> Result<()> {
-        if self
-            .closed
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-            .is_err()
-        {
-            return Err(Error::Closed);
-        }
-
-        // Cancel all background tasks (including router actor)
-        self.cancel.cancel();
-
-        // Close all peer connections
-        let handles: Vec<(PublicKey, Vec<u64>)> = {
-            let peers = self.peers.lock().await;
-            peers
-                .handles
-                .iter()
-                .map(|(k, m)| (*k, m.keys().copied().collect()))
-                .collect()
-        };
-
-        for (_key, peer_ids) in &handles {
-            let peers = self.peers.lock().await;
-            for &id in peer_ids {
-                if let Some(handle) = peers.get_handle(id) {
-                    handle.cancel.cancel();
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn local_addr(&self) -> Addr {
-        Addr(self.pub_key)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -889,6 +908,9 @@ pub struct DebugSnapshot {
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
     pub key: [u8; 32],
+    /// Per-link id. Unique across links, including several links to the same
+    /// `key` — which share one `port`.
+    pub id: u64,
     pub port: u64,
     pub priority: u8,
     pub latency_ms: f64,
