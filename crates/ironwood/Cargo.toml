@@ -1,6 +1,6 @@
 [package]
 name = "ironwood"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Routing library: ed25519-addressed PacketConn over spanning tree"
 license = "MPL-2.0"
