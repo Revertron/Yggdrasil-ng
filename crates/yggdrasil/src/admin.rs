@@ -466,7 +466,14 @@ async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_js
                 .arguments
                 .get("key")
                 .and_then(|v| v.as_str())
-                .ok_or("missing 'key' argument")?;
+                .unwrap_or("");
+            // No key or our own key: answer locally (matches yggdrasil-go).
+            let self_key = hex::encode(core.public_key());
+            if key_str.is_empty() || key_str.eq_ignore_ascii_case(&self_key) {
+                let own: serde_json::Value = serde_json::from_str(&core.config.node_info_json())
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                return Ok(serde_json::json!({ self_key: own }));
+            }
             let key_bytes = hex::decode(key_str)
                 .map_err(|_| "invalid hex key")?;
             if key_bytes.len() != 32 {
