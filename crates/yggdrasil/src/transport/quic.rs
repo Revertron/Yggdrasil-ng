@@ -123,7 +123,16 @@ fn make_endpoint(
     .map_err(|e| format!("QUIC endpoint: {}", e))
 }
 
-/// Match yggdrasil-go: MaxIdleTimeout = 1 minute, KeepAlivePeriod = 20 seconds.
+/// How long an incoming connection may take to complete its handshake
+/// (quic-go's default HandshakeIdleTimeout, which yggdrasil-go relies on).
+const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long an incoming connection may take to open its stream before it is
+/// closed (matches yggdrasil-go's waitForStream).
+const QUIC_STREAM_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Match yggdrasil-go: MaxIdleTimeout = 1 minute, KeepAlivePeriod = 20 seconds,
+/// a single incoming bidirectional stream and no unidirectional streams.
 fn quic_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
@@ -131,6 +140,8 @@ fn quic_transport_config() -> quinn::TransportConfig {
     ));
     transport.keep_alive_interval(Some(Duration::from_secs(20)));
     transport.stream_receive_window(quinn::VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW));
+    transport.max_concurrent_bidi_streams(1u32.into());
+    transport.max_concurrent_uni_streams(0u32.into());
     transport
 }
 
@@ -358,39 +369,53 @@ pub(crate) async fn quic_listen(
 
                     let tx = tx.clone();
                     tokio::spawn(async move {
-                        let connection = match incoming.await {
-                            Ok(conn) => conn,
-                            Err(e) => {
-                                tracing::debug!("QUIC accept failed: {}", e);
+                        let remote_addr = incoming.remote_address();
+                        let connection = match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
+                            Ok(Ok(conn)) => conn,
+                            Ok(Err(e)) => {
+                                tracing::debug!("QUIC accept from {} failed: {}", remote_addr, e);
                                 return;
                             }
-                        };
-                        let remote_addr = connection.remote_address();
-
-                        // Accept a single bidirectional stream (matching yggdrasil-go: AcceptStream).
-                        let (send, recv) = match connection.accept_bi().await {
-                            Ok(streams) => streams,
-                            Err(e) => {
-                                tracing::debug!("QUIC accept stream failed: {}", e);
-                                connection.close(1u32.into(), format!("stream error: {}", e).as_bytes());
+                            Err(_) => {
+                                // Dropping the Connecting future abandons the handshake.
+                                tracing::debug!("QUIC handshake from {} timed out", remote_addr);
                                 return;
                             }
                         };
 
-                        let peer_cert = peer_cert_of(&connection);
-                        // Server side: the endpoint is owned by the QuicListener,
-                        // so the per-connection stream doesn't carry one.
-                        let _ = tx
-                            .send(QuicStream {
-                                send,
-                                recv,
-                                remote_addr,
-                                peer_cert,
-                                _connection: connection,
-                                _endpoint: None,
-                                _permit: Some(permit),
-                            })
-                            .await;
+                        // Accept a single bidirectional stream and hand it to the
+                        // listener, all within the deadline (matching yggdrasil-go:
+                        // waitForStream). A peer that never opens a stream would
+                        // otherwise hold its limiter permit until the idle timeout.
+                        let handoff = async {
+                            let (send, recv) = match connection.accept_bi().await {
+                                Ok(streams) => streams,
+                                Err(e) => {
+                                    tracing::debug!("QUIC accept stream from {} failed: {}", remote_addr, e);
+                                    connection.close(1u32.into(), format!("stream error: {}", e).as_bytes());
+                                    return;
+                                }
+                            };
+
+                            let peer_cert = peer_cert_of(&connection);
+                            // Server side: the endpoint is owned by the QuicListener,
+                            // so the per-connection stream doesn't carry one.
+                            let _ = tx
+                                .send(QuicStream {
+                                    send,
+                                    recv,
+                                    remote_addr,
+                                    peer_cert,
+                                    _connection: connection.clone(),
+                                    _endpoint: None,
+                                    _permit: Some(permit),
+                                })
+                                .await;
+                        };
+                        if tokio::time::timeout(QUIC_STREAM_ACCEPT_TIMEOUT, handoff).await.is_err() {
+                            tracing::debug!("QUIC connection from {} opened no stream in time", remote_addr);
+                            connection.close(1u32.into(), b"stream not created");
+                        }
                     });
                 }
             }
@@ -566,6 +591,34 @@ mod tests {
         let url = Url::parse(&format!("quic://{}", listener.local_addr())).unwrap();
         let result = quic_connect(&url, None, client_config).await;
         assert!(result.is_err(), "connection must be refused when limiter is exhausted");
+
+        listener.close();
+    }
+
+    /// A peer that completes the handshake but never opens a stream must be
+    /// disconnected after QUIC_STREAM_ACCEPT_TIMEOUT, releasing its permit.
+    #[tokio::test]
+    async fn test_quic_no_stream_is_closed() {
+        let (server_config, client_config) = test_configs();
+        let limiter = Arc::new(Semaphore::new(4));
+        let listener =
+            quic_listen("127.0.0.1:0".parse().unwrap(), server_config, limiter.clone())
+                .await
+                .expect("listen");
+
+        let url = Url::parse(&format!("quic://{}", listener.local_addr())).unwrap();
+        // open_bi is local until data is sent, so the server never sees a stream.
+        let client = quic_connect(&url, None, client_config).await.expect("connect");
+        assert_eq!(limiter.available_permits(), 3, "permit held while waiting");
+
+        let closed = tokio::time::timeout(
+            QUIC_STREAM_ACCEPT_TIMEOUT + Duration::from_secs(3),
+            client._connection.closed(),
+        )
+        .await;
+        assert!(closed.is_ok(), "server must close a connection without a stream");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(limiter.available_permits(), 4, "permit released");
 
         listener.close();
     }
