@@ -171,10 +171,7 @@ impl SessionInit {
         // When a group password is set, the password hash is prepended to the
         // verified bytes (preimage); the signature only checks out if the sender
         // used the same secret. Empty preimage verifies the bytes unchanged.
-        // Low-order keys would allow forged session inits (Go: edCheck).
-        if !crate::types::is_public_key_valid(from_ed_pub) {
-            return Err(Error::BadMessage);
-        }
+        // Crypto::verify also rejects low-order keys (Go: edCheck).
         let verified = if preimage.is_empty() {
             Crypto::verify(from_ed_pub, &sig_bytes, &sig)
         } else {
