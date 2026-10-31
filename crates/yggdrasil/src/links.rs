@@ -916,6 +916,7 @@ impl Links {
                 let dial_result: Result<Stream, String> = if use_quic {
                     quic::quic_connect(
                         &url,
+                        options.tls_sni.as_deref(),
                         quic_client_config.clone().expect("quic client config"),
                     )
                     .await

@@ -163,11 +163,16 @@ fn peer_cert_of(connection: &quinn::Connection) -> Option<CertificateDer<'static
 }
 
 /// Dial a QUIC peer, opening a single bidirectional stream.
+///
+/// `sni` overrides the TLS server name (from `?sni=` or the URI hostname);
+/// without it the bare URL host is used.
 pub(crate) async fn quic_connect(
     url: &Url,
+    sni: Option<&str>,
     client_config: Arc<rustls::ClientConfig>,
 ) -> Result<QuicStream, String> {
     let host = bare_host(url)?;
+    let server_name = sni.unwrap_or(&host).to_string();
     let port = url
         .port_or_known_default()
         .ok_or_else(|| "missing port".to_string())?;
@@ -223,7 +228,7 @@ pub(crate) async fn quic_connect(
         };
         endpoint.set_default_client_config(client_config);
 
-        let connecting = match endpoint.connect(remote_addr, &host) {
+        let connecting = match endpoint.connect(remote_addr, &server_name) {
             Ok(c) => c,
             Err(e) => {
                 last_err = format!("QUIC connect: {}", e);
@@ -520,7 +525,7 @@ mod tests {
         // complete until the client writes. Connect AND write in one arm.
         let (client_stream, server_stream) = tokio::join!(
             async {
-                let mut c = quic_connect(&url, client_config).await?;
+                let mut c = quic_connect(&url, None, client_config).await?;
                 c.write_all(b"hello quic")
                     .await
                     .map_err(|e| e.to_string())?;
@@ -559,7 +564,7 @@ mod tests {
             .expect("listen");
 
         let url = Url::parse(&format!("quic://{}", listener.local_addr())).unwrap();
-        let result = quic_connect(&url, client_config).await;
+        let result = quic_connect(&url, None, client_config).await;
         assert!(result.is_err(), "connection must be refused when limiter is exhausted");
 
         listener.close();
