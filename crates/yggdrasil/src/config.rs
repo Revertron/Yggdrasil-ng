@@ -342,8 +342,12 @@ impl Config {
             ));
         }
         let key_bytes: [u8; 64] = bytes.try_into().unwrap();
-        SigningKey::from_keypair_bytes(&key_bytes)
-            .map_err(|e| format!("invalid ed25519 key: {}", e))
+        let key = SigningKey::from_keypair_bytes(&key_bytes)
+            .map_err(|e| format!("invalid ed25519 key: {}", e))?;
+        if !ironwood::is_public_key_valid(&key.verifying_key().to_bytes()) {
+            return Err("invalid ed25519 key: public key is a low-order point".to_string());
+        }
+        Ok(key)
     }
 
     /// Get the set of allowed public keys (parsed from hex).
