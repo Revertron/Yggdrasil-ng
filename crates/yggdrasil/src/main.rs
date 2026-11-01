@@ -204,8 +204,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY hex: {}", e))?;
         let key_bytes: [u8; 64] = bytes.try_into()
             .map_err(|v: Vec<u8>| format!("YGGDRASIL_PRIVATE_KEY should be 64 bytes, got {}", v.len()))?;
-        SigningKey::from_keypair_bytes(&key_bytes)
-            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?
+        let key = SigningKey::from_keypair_bytes(&key_bytes)
+            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?;
+        if !ironwood::is_public_key_valid(&key.verifying_key().to_bytes()) {
+            return Err("invalid YGGDRASIL_PRIVATE_KEY: public key is a low-order point".into());
+        }
+        key
     } else {
         tracing::warn!("No private key configured, generating ephemeral key");
         SigningKey::generate(&mut rand::rngs::OsRng)
@@ -281,8 +285,12 @@ async fn run_node(
             .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY hex: {}", e))?;
         let key_bytes: [u8; 64] = bytes.try_into()
             .map_err(|v: Vec<u8>| format!("YGGDRASIL_PRIVATE_KEY should be 64 bytes, got {}", v.len()))?;
-        SigningKey::from_keypair_bytes(&key_bytes)
-            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?
+        let key = SigningKey::from_keypair_bytes(&key_bytes)
+            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?;
+        if !ironwood::is_public_key_valid(&key.verifying_key().to_bytes()) {
+            return Err("invalid YGGDRASIL_PRIVATE_KEY: public key is a low-order point".into());
+        }
+        key
     } else {
         tracing::warn!("No private key configured, generating ephemeral key");
         SigningKey::generate(&mut rand::rngs::OsRng)

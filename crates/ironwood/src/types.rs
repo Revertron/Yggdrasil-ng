@@ -12,6 +12,20 @@ impl Addr {
     }
 }
 
+/// Check that an ed25519 public key is a canonically encoded curve point
+/// that is neither the identity nor of low order.
+///
+/// Signatures for low-order keys can be forged without knowing a private key,
+/// so such keys must not be accepted as peer or session identities.
+/// Matches Go's `types.IsPublicKeyValid` (ironwood PR #56).
+pub fn is_public_key_valid(key: &[u8; 32]) -> bool {
+    use curve25519_dalek::edwards::CompressedEdwardsY;
+    match CompressedEdwardsY(*key).decompress() {
+        Some(point) => point.compress().as_bytes() == key && !point.is_small_order(),
+        None => false,
+    }
+}
+
 impl fmt::Display for Addr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for byte in &self.0 {
@@ -112,4 +126,40 @@ pub trait PacketConn: Send + Sync {
 
     /// Get the local address (our public key).
     fn local_addr(&self) -> Addr;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn low_order_and_non_canonical_keys_rejected() {
+        // Same vectors as Go's types/crypto_test.go.
+        let keys = [
+            "0200000000000000000000000000000000000000000000000000000000000000",
+            "0100000000000000000000000000000000000000000000000000000000000080",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+            // Additional low-order points: identity, all-zero (order 4), order 2.
+            "0100000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        ];
+        for key in keys {
+            let mut pk = [0u8; 32];
+            pk.copy_from_slice(&hex::decode(key).unwrap());
+            assert!(!is_public_key_valid(&pk), "key {} should not be valid", key);
+        }
+    }
+
+    #[test]
+    fn generated_keys_accepted() {
+        for _ in 0..32 {
+            let key = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+            assert!(is_public_key_valid(&key));
+        }
+    }
 }

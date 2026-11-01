@@ -688,6 +688,11 @@ impl crate::types::PacketConn for PacketConnImpl {
             return Err(Error::BadKey);
         }
 
+        // Reject low-order / non-canonical keys (signatures for them are forgeable)
+        if !crate::types::is_public_key_valid(&peer_key) {
+            return Err(Error::BadKey);
+        }
+
         // Split connection into read and write halves
         let (read_half, write_half) = tokio::io::split(conn);
 

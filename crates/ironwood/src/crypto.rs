@@ -31,7 +31,16 @@ impl Crypto {
     }
 
     /// Verify a signature from the given public key.
+    ///
+    /// Low-order and non-canonical keys are rejected outright: signatures for
+    /// them can be forged without a private key, which would e.g. let anyone
+    /// relay a tree announcement claiming the all-zero (lowest, so root) key.
+    /// Go only checks direct peers and session inits; checking every signature
+    /// here also covers relayed announcements, without changing the wire format.
     pub fn verify(key: &PublicKey, message: &[u8], sig: &Sig) -> bool {
+        if !crate::types::is_public_key_valid(key) {
+            return false;
+        }
         let Ok(verifying_key) = VerifyingKey::from_bytes(key) else {
             return false;
         };
@@ -79,5 +88,22 @@ mod tests {
         let crypto2 = Crypto::new(key2);
         let sig = crypto1.sign(b"test");
         assert!(!Crypto::verify(&crypto2.public_key, b"test", &sig));
+    }
+
+    /// Identity-point key with R = identity and s = 0 satisfies the
+    /// (cofactorless) verification equation for *any* message.
+    #[test]
+    fn forged_signature_for_low_order_key_rejected() {
+        let mut key = [0u8; 32];
+        key[0] = 1; // compressed identity point
+        let mut sig = [0u8; 64];
+        sig[0] = 1; // R = identity, s = 0
+        let message = b"anything at all";
+
+        // Plain ed25519 verification accepts the forgery...
+        let vk = VerifyingKey::from_bytes(&key).expect("identity decodes");
+        assert!(vk.verify(message, &Signature::from_bytes(&sig)).is_ok());
+        // ...Crypto::verify must not.
+        assert!(!Crypto::verify(&key, message, &sig));
     }
 }

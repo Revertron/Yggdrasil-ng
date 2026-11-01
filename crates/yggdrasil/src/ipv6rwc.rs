@@ -1,6 +1,6 @@
 use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap as HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,7 +47,7 @@ pub struct ReadWriteCloser {
     /// Overlay payload cap advertised via ICMPv6 PTB.
     /// Starts as `core.mtu()`, then `set_mtu()` lowers it to the TUN
     /// interface MTU after the kernel may have clamped `if_mtu`.
-    mtu: AtomicU64,
+    mtu: AtomicU32,
     #[cfg(feature = "ckr")]
     ckr: Option<CryptoKey>,
     firewall: Option<Arc<Firewall>>,
@@ -99,7 +99,7 @@ impl ReadWriteCloser {
                 addr_buffer: HashMap::default(),
                 subnet_buffer: HashMap::default(),
             }),
-            mtu: AtomicU64::new(mtu.clamp(1280, 65535)),
+            mtu: AtomicU32::new(mtu.clamp(1280, 65535) as u32),
             #[cfg(feature = "ckr")]
             ckr,
             firewall,
@@ -153,7 +153,7 @@ impl ReadWriteCloser {
 
             // MTU enforcement. Use the TUN-clamped overlay MTU, not the
             // ironwood cap from construction.
-            let overlay_mtu = self.mtu.load(Ordering::Relaxed);
+            let overlay_mtu = self.mtu.load(Ordering::Relaxed) as u64;
             if n as u64 > overlay_mtu {
                 if is_ip6 {
                     let ptb = build_icmpv6_ptb(packet, overlay_mtu as u32);
@@ -437,7 +437,7 @@ impl ReadWriteCloser {
     }
 
     pub fn mtu(&self) -> u64 {
-        self.mtu.load(Ordering::Relaxed)
+        self.mtu.load(Ordering::Relaxed) as u64
     }
 
     /// Lower the overlay MTU to the TUN interface's actual MTU.
@@ -452,8 +452,8 @@ impl ReadWriteCloser {
     /// payload limit). Values below 1280 are raised to the IPv6
     /// minimum.
     pub fn set_mtu(&self, mtu: u64) {
-        let mtu = clamp_overlay_mtu(self.mtu.load(Ordering::Relaxed), mtu);
-        self.mtu.store(mtu, Ordering::Relaxed);
+        let mtu = clamp_overlay_mtu(self.mtu.load(Ordering::Relaxed) as u64, mtu);
+        self.mtu.store(mtu as u32, Ordering::Relaxed);
     }
 
     // --- CKR helper methods ---

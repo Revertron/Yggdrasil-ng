@@ -158,6 +158,9 @@ const DEFAULT_BACKOFF_LIMIT: Duration = Duration::from_secs(4096);
 const MINIMUM_BACKOFF_LIMIT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Outbound TLS handshake and WebSocket upgrade, each (matches yggdrasil-go's
+/// TLSHandshakeTimeout / ResponseHeaderTimeout).
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Maximum shift for exponential backoff (dial wait = 1 << shift seconds),
 // further clamped by options.max_backoff.
@@ -781,7 +784,15 @@ impl Links {
                                     // Permit is held for the duration of this task
 
                                     // Perform TLS and/or WebSocket handshakes as needed
-                                    let wrapped_stream = match wrap_incoming(stream, acceptor, use_ws, remote).await {
+                                    // Bounded like the rest of the handshake so a client that
+                                    // stalls mid-TLS/WebSocket can't hold its permit forever.
+                                    let wrapped_stream = match tokio::time::timeout(
+                                        HANDSHAKE_TIMEOUT,
+                                        wrap_incoming(stream, acceptor, use_ws, remote),
+                                    )
+                                    .await
+                                    .unwrap_or_else(|_| Err("TLS/WebSocket handshake timed out".to_string()))
+                                    {
                                         Ok(s) => s,
                                         Err(e) => {
                                             tracing::debug!("{} from {}", e, remote);
@@ -916,6 +927,7 @@ impl Links {
                 let dial_result: Result<Stream, String> = if use_quic {
                     quic::quic_connect(
                         &url,
+                        options.tls_sni.as_deref(),
                         quic_client_config.clone().expect("quic client config"),
                     )
                     .await
@@ -1349,9 +1361,9 @@ async fn dial_stream(
                     rustls::pki_types::IpAddr::try_from(host).expect("invalid hostname"),
                 )
             });
-        let tls_stream = connector
-            .connect(server_name, stream)
+        let tls_stream = tokio::time::timeout(UPGRADE_TIMEOUT, connector.connect(server_name, stream))
             .await
+            .map_err(|_| "TLS handshake timed out".to_string())?
             .map_err(|e| format!("TLS handshake failed: {}", e))?;
         #[cfg(feature = "ws")]
         if use_ws {
@@ -1361,17 +1373,24 @@ async fn dial_stream(
                 .1
                 .peer_certificates()
                 .and_then(|certs| certs.first().cloned());
-            let ws =
-                ws::ws_client_handshake(Box::new(tls_stream), host, port, path, remote_addr, peer_cert)
-                    .await?;
+            let ws = tokio::time::timeout(
+                UPGRADE_TIMEOUT,
+                ws::ws_client_handshake(Box::new(tls_stream), host, port, path, remote_addr, peer_cert),
+            )
+            .await
+            .map_err(|_| "WebSocket handshake timed out".to_string())??;
             return Ok(Stream::Ws(ws));
         }
         Ok(Stream::TlsClient(tls_stream))
     } else {
         #[cfg(feature = "ws")]
         if use_ws {
-            let ws = ws::ws_client_handshake(Box::new(stream), host, port, path, remote_addr, None)
-                .await?;
+            let ws = tokio::time::timeout(
+                UPGRADE_TIMEOUT,
+                ws::ws_client_handshake(Box::new(stream), host, port, path, remote_addr, None),
+            )
+            .await
+            .map_err(|_| "WebSocket handshake timed out".to_string())??;
             return Ok(Stream::Ws(ws));
         }
         Ok(Stream::Tcp(stream))

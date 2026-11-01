@@ -189,6 +189,10 @@ impl Metadata {
         let hash = blake2b_hash(&meta.public_key, password);
         let signature =
             Signature::from_bytes(sig_bytes.try_into().map_err(|_| VersionError::BadSignature)?);
+        // Signatures for low-order keys are forgeable; reject them up front.
+        if !ironwood::is_public_key_valid(&meta.public_key) {
+            return Err(VersionError::InvalidKey);
+        }
         let verifying_key = VerifyingKey::from_bytes(&meta.public_key)
             .map_err(|_| VersionError::InvalidKey)?;
         verifying_key
