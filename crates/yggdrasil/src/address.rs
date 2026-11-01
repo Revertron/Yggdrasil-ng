@@ -1,4 +1,6 @@
 use std::fmt;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::AtomicBool;
 
 /// Yggdrasil IPv6 address (16 bytes, prefix 0x02).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -8,13 +10,35 @@ pub struct Address(pub [u8; 16]);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Subnet(pub [u8; 8]);
 
-const ADDRESS_PREFIX: u8 = 0x02;
-const SUBNET_PREFIX: u8 = 0x03;
+static ADDRESS_PREFIX: AtomicU8 = AtomicU8::new(0x02);
+static SUBNET_PREFIX: AtomicU8 = AtomicU8::new(0x03);
+/// Set to true when a custom prefix/port was successfully applied
+/// (via binary/symlink/hardlink name suffix).
+static PREFIX_PORT_SET: AtomicBool = AtomicBool::new(false);
+
+/// Set the address prefix used by addr_for_key / is_valid_* (and subnet = prefix + 1).
+/// Must be called once at startup before any address generation.
+pub fn set_address_prefix(prefix: u8) {
+    ADDRESS_PREFIX.store(prefix, Ordering::Relaxed);
+    SUBNET_PREFIX.store(prefix.wrapping_add(1), Ordering::Relaxed);
+    PREFIX_PORT_SET.store(true, Ordering::Relaxed);
+}
+
+/// Current address prefix (default 0x02).
+pub fn address_prefix() -> u8 {
+    ADDRESS_PREFIX.load(Ordering::Relaxed)
+}
+
+/// Returns true if a custom prefix/port was successfully applied at startup
+/// (via binary/symlink/hardlink name suffix).
+pub fn prefix_port_set() -> bool {
+    PREFIX_PORT_SET.load(Ordering::Relaxed)
+}
 
 impl Address {
     /// Check if this is a valid Yggdrasil address (starts with 0x02).
     pub fn is_valid(&self) -> bool {
-        self.0[0] == ADDRESS_PREFIX
+        self.0[0] == ADDRESS_PREFIX.load(Ordering::Relaxed)
     }
 
     /// Reconstruct a partial ed25519 public key from this address.
@@ -54,7 +78,7 @@ impl Address {
 impl Subnet {
     /// Check if this is a valid Yggdrasil subnet (starts with 0x03).
     pub fn is_valid(&self) -> bool {
-        self.0[0] == SUBNET_PREFIX
+        self.0[0] == SUBNET_PREFIX.load(Ordering::Relaxed)
     }
 
     /// Reconstruct a partial ed25519 public key from this subnet.
@@ -121,7 +145,7 @@ pub fn addr_for_key(public_key: &[u8; 32]) -> Address {
     }
 
     let mut addr = [0u8; 16];
-    addr[0] = ADDRESS_PREFIX;
+    addr[0] = ADDRESS_PREFIX.load(Ordering::Relaxed);
     // ones can exceed 255 for degenerate keys; clamp to u8 range
     addr[1] = ones.min(255) as u8;
     let copy_len = temp.len().min(14);
@@ -141,12 +165,12 @@ pub fn subnet_for_key(public_key: &[u8; 32]) -> Subnet {
 
 /// Check if an IPv6 address (16 bytes) is a valid Yggdrasil address.
 pub fn is_valid_address(addr: &[u8; 16]) -> bool {
-    addr[0] == ADDRESS_PREFIX
+    addr[0] == ADDRESS_PREFIX.load(Ordering::Relaxed)
 }
 
 /// Check if an IPv6 /64 prefix (first 8 bytes) is a valid Yggdrasil subnet.
 pub fn is_valid_subnet(prefix: &[u8; 8]) -> bool {
-    prefix[0] == SUBNET_PREFIX
+    prefix[0] == SUBNET_PREFIX.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
