@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ygg"
+version = "0.1.0"
+description = "Embedded Yggdrasil node for Python: TCP/UDP over the Yggdrasil network as ordinary sockets, no TUN needed"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MPL-2.0" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+]
+
+[tool.maturin]
+module-name = "ygg._native"
+python-source = "python"
+features = ["pyo3/extension-module"]

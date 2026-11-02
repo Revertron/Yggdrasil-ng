@@ -161,6 +161,15 @@ impl EmbeddedNode {
         Ok(self.runtime.block_on(yggdrasil::admin::handle_json(&core, request_json)))
     }
 
+    /// Address of `host`; for a public key this also registers the key so the
+    /// first packet does not wait for a lookup.
+    pub fn resolve(&self, host: &Host) -> Result<Ipv6Addr> {
+        if self.is_stopped() {
+            return Err(Error::new(ERR_CLOSED, "node is stopped"));
+        }
+        Ok(self.runtime.block_on(self.stack.resolve(host)))
+    }
+
     /// Echo request; returns the round-trip time. `None` uses 5 s.
     pub fn ping(&self, host: &Host, timeout: Option<Duration>) -> Result<Duration> {
         let timeout = timeout.unwrap_or(DEFAULT_PING_TIMEOUT);
@@ -395,9 +404,11 @@ impl EmbeddedNode {
 
     // ---- shutdown
 
-    /// Stop the node. Sockets it handed out see EOF; the application still
-    /// closes its own sockets (listener and UDP handles included).
-    pub fn stop(self) {
+    /// Shut the node down without consuming it: services stop, pending and
+    /// future accepts fail, connections see EOF and later calls return
+    /// `ERR_CLOSED`. Idempotent; safe to call while other threads are blocked
+    /// in this node. The runtime threads exit when the node is dropped.
+    pub fn shutdown(&self) {
         for (_, task) in lock(&self.services).drain() {
             task.abort();
         }
@@ -412,12 +423,24 @@ impl EmbeddedNode {
             task.abort();
         }
         let node = lock(&self.node).take();
-        self.runtime.block_on(async {
-            self.stack.close();
-            if let Some(node) = node {
+        if let Some(node) = node {
+            self.runtime.block_on(async {
+                self.stack.close();
                 node.close().await;
-            }
-        });
+            });
+        }
+    }
+
+    /// Whether [`shutdown`](Self::shutdown) or [`stop`](Self::stop) has run.
+    pub fn is_stopped(&self) -> bool {
+        lock(&self.node).is_none()
+    }
+
+    /// Stop the node and its runtime. Sockets it handed out see EOF; the
+    /// application still closes its own sockets (listener and UDP handles
+    /// included).
+    pub fn stop(self) {
+        self.shutdown();
         let Self { runtime, stack, .. } = self;
         drop(stack);
         runtime.shutdown_timeout(Duration::from_secs(2));

@@ -21,3 +21,24 @@ jobs:
       # Keep the slim build (no ws/quic — e.g. OpenWrt) compiling.
       - name: Check slim build
         run: cargo check -p yggdrasil --no-default-features --features ctl,tun,systemd,ckr
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and test the Python package
+        working-directory: crates/yggdrasil-py
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install maturin pytest
+          maturin develop
+          pytest -q tests

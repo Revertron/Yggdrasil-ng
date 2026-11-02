@@ -11,7 +11,9 @@ an ordinary Yggdrasil node and talk to it with their kernel stacks.
 | Crate | Purpose |
 |---|---|
 | `yggdrasil` | The node. `node::NodeBuilder` starts it; `.embedded()` disables TUN and the admin socket. |
+| `yggdrasil-embed` | Shared core of the bindings below: `EmbeddedNode`, a synchronous Rust API that returns connections as OS sockets. |
 | `yggdrasil-ffi` | C ABI (`libygg.so` / `ygg.dll` / `libygg.dylib`, plus static `libygg.a`), header `crates/yggdrasil-ffi/include/ygg.h`. |
+| `yggdrasil-py` | Python package `ygg` (PyO3, abi3 wheel for CPython ≥ 3.9). |
 | `yggdrasil-stack` | `YggStack`: TCP streams/listeners, UDP sockets and ICMPv6 ping over an embedded node. Feature `proxy` (default): SOCKS5 server and port forwarding. Feature `cli`: the `yggdrasil-proxy` tool. |
 
 ## Rust example
@@ -198,19 +200,45 @@ Conventions (details in the header):
   `ygg_*` functions from inside the callback.
 - On Windows, initialise Winsock (`WSAStartup`) before using the sockets.
 
-Examples:
+Example: `crates/yggdrasil-ffi/examples/c/ygg_echo.c`, a `poll()`-based echo
+server. A minimal ctypes binding is in
+`crates/yggdrasil-ffi/examples/python/ygg.py`; prefer the native package
+below.
 
-- `crates/yggdrasil-ffi/examples/c/ygg_echo.c`: `poll()`-based echo server.
-- `crates/yggdrasil-ffi/examples/python/ygg.py`: ctypes binding returning
-  `socket.socket` objects, with an asyncio client demo:
+## Python package (`ygg`)
+
+```bash
+cd crates/yggdrasil-py
+pip install maturin
+maturin build --release      # abi3 wheel in target/wheels/, CPython >= 3.9
+maturin develop --release    # or install into the active virtualenv
+```
 
 ```python
-from ygg import Node
-with Node('peers = ["tls://peer.example.org:443"]') as node:
-    sock = node.connect("<hex key>.pk.ygg", 7000)      # a normal socket.socket
-    reader, writer = await asyncio.open_connection(sock=sock)
+import ygg
+
+with ygg.Node(peers=["tls://peer.example.org:443"]) as node:
+    s = node.connect("<hex key>.pk.ygg", 80)       # a normal socket.socket
+    with node.listen(8080) as listener:            # fileno() works with selectors
+        conn, peer = listener.accept()
+    with node.udp_bind() as u:                     # (data, (host, port)) API
+        u.sendto(b"hi", ("200:1234::1", 5353))
+    node.ping("200:1234::1"); node.admin("getPeers")
+
+# asyncio
+reader, writer = await node.open_connection("200:1234::1", 80)
+server = await node.start_server(handle, 8080)
 ```
+
+Blocking calls release the GIL; `node.close()` wakes threads blocked in
+`accept`. Errors map to built-in exceptions (`ConnectionRefusedError`,
+`TimeoutError`, `BlockingIOError`, `ConnectionError`, `ValueError`,
+`OSError` with `errno`). `ygg.log_to_python()` routes logs into `logging`.
+See `crates/yggdrasil-py/README.md`.
+
+The crate is its own Cargo workspace (built by maturin), so the main
+workspace builds without Python.
 
 ## Roadmap
 
-- Native Python package (PyO3) and Kotlin/Android bindings on top of the C API.
+- Kotlin/Android bindings on top of `yggdrasil-embed`.
