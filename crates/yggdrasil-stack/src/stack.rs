@@ -169,11 +169,29 @@ impl State {
     /// `tcp_backlog` pending connections. smoltcp would answer a SYN that finds
     /// no listening socket with RST; dropping it instead lets the client
     /// retransmit once `accept` has made room, as kernel stacks do.
-    fn make_room_for_syn(&mut self, port: u16, config: &StackConfig) -> bool {
+    ///
+    /// A SYN whose 4-tuple already has a socket (a retransmission, typically
+    /// because the first SYN was held up by the key lookup) is dropped too:
+    /// smoltcp hands a SYN to the first listening socket in the set, which
+    /// may come before the existing one and would open a second, duplicate
+    /// half-connection that later steals the client's segments.
+    fn make_room_for_syn(&mut self, syn: &Syn, config: &StackConfig) -> bool {
+        let port = syn.dst_port;
         let Some(backlog) = self.listeners.get_mut(&port) else {
             return true;
         };
         let sockets = &mut self.sockets;
+        let duplicate = sockets.iter().any(|(_, s)| match s {
+            Socket::Tcp(t) => {
+                t.remote_endpoint() == Some(syn.src)
+                    && t.local_endpoint().is_some_and(|e| e.port == port)
+            }
+            _ => false,
+        });
+        if duplicate {
+            tracing::trace!("stack: dropping retransmitted SYN from {}", syn.src);
+            return false;
+        }
         if backlog
             .iter()
             .any(|&h| sockets.get::<tcp::Socket>(h).state() == tcp::State::Listen)
@@ -227,17 +245,26 @@ impl State {
     }
 }
 
-/// Destination port of a TCP connection request (SYN without ACK). Only the
-/// fixed IPv6 header directly followed by TCP is recognised; anything else is
-/// left to smoltcp.
-fn syn_port(packet: &[u8]) -> Option<u16> {
+/// A TCP connection request (SYN without ACK).
+struct Syn {
+    src: IpEndpoint,
+    dst_port: u16,
+}
+
+/// Parse a connection request. Only the fixed IPv6 header directly followed
+/// by TCP is recognised; anything else is left to smoltcp.
+fn parse_syn(packet: &[u8]) -> Option<Syn> {
     const TCP: u8 = 6;
     const SYN: u8 = 0x02;
     const ACK: u8 = 0x10;
     if packet.len() < 40 + 20 || packet[6] != TCP || packet[40 + 13] & (SYN | ACK) != SYN {
         return None;
     }
-    Some(u16::from_be_bytes([packet[42], packet[43]]))
+    let src: [u8; 16] = packet[8..24].try_into().ok()?;
+    Some(Syn {
+        src: IpEndpoint::new(IpAddress::Ipv6(Ipv6Addr::from(src)), u16::from_be_bytes([packet[40], packet[41]])),
+        dst_port: u16::from_be_bytes([packet[42], packet[43]]),
+    })
 }
 
 fn alloc_port(used: impl Fn(u16) -> bool) -> io::Result<u16> {
@@ -265,6 +292,33 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    fn new(address: Ipv6Addr, mtu: usize, config: StackConfig) -> Self {
+        let mut device = QueueDevice::new(mtu);
+        let mut iface_config = Config::new(HardwareAddress::Ip);
+        iface_config.random_seed = rand::random();
+        let mut iface = Interface::new(iface_config, &mut device, SmolInstant::now());
+        iface.update_ip_addrs(|addrs| {
+            addrs
+                .push(IpCidr::new(IpAddress::Ipv6(address), YGGDRASIL_PREFIX_LEN))
+                .expect("interface has room for one address");
+        });
+        Self {
+            state: Mutex::new(State {
+                iface,
+                device,
+                sockets: SocketSet::new(Vec::new()),
+                listeners: FxHashMap::default(),
+                icmp_idents: FxHashSet::default(),
+                orphans: Vec::new(),
+                closed: false,
+            }),
+            notify: Notify::new(),
+            address,
+            mtu,
+            config,
+        }
+    }
+
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -284,8 +338,8 @@ impl Shared {
         // time so SYNs can be checked against the backlog as it fills up.
         st.iface.poll_maintenance(now);
         while let Some(packet) = st.device.rx.front() {
-            if let Some(port) = syn_port(packet)
-                && !st.make_room_for_syn(port, &self.config)
+            if let Some(syn) = parse_syn(packet)
+                && !st.make_room_for_syn(&syn, &self.config)
             {
                 st.device.rx.pop_front();
                 continue;
@@ -377,32 +431,7 @@ impl YggStack {
             .mtu
             .unwrap_or(rwc.mtu() as usize)
             .clamp(1280, 65535);
-        let mut device = QueueDevice::new(mtu);
-
-        let mut iface_config = Config::new(HardwareAddress::Ip);
-        iface_config.random_seed = rand::random();
-        let mut iface = Interface::new(iface_config, &mut device, SmolInstant::now());
-        iface.update_ip_addrs(|addrs| {
-            addrs
-                .push(IpCidr::new(IpAddress::Ipv6(address), YGGDRASIL_PREFIX_LEN))
-                .expect("interface has room for one address");
-        });
-
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State {
-                iface,
-                device,
-                sockets: SocketSet::new(Vec::new()),
-                listeners: FxHashMap::default(),
-                icmp_idents: FxHashSet::default(),
-                orphans: Vec::new(),
-                closed: false,
-            }),
-            notify: Notify::new(),
-            address,
-            mtu,
-            config,
-        });
+        let shared = Arc::new(Shared::new(address, mtu, config));
 
         let cancel = CancellationToken::new();
         let (inbound_tx, inbound_rx) = mpsc::channel(PACKET_QUEUE);
@@ -599,4 +628,97 @@ async fn drive(
     }
     shared.shutdown();
     cancel.cancel();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smoltcp::phy::ChecksumCapabilities;
+    use smoltcp::wire::{IpProtocol, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber};
+
+    const LOCAL: Ipv6Addr = Ipv6Addr::new(0x200, 0, 0, 0, 0, 0, 0, 1);
+    const REMOTE: Ipv6Addr = Ipv6Addr::new(0x200, 0, 0, 0, 0, 0, 0, 2);
+
+    fn syn(src_port: u16, dst_port: u16) -> Vec<u8> {
+        let tcp = TcpRepr {
+            src_port,
+            dst_port,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(1000),
+            ack_number: None,
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: Some(1400),
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        let ip = Ipv6Repr {
+            src_addr: REMOTE,
+            dst_addr: LOCAL,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut packet = vec![0u8; ip.buffer_len() + tcp.buffer_len()];
+        ip.emit(&mut Ipv6Packet::new_unchecked(&mut packet[..]));
+        tcp.emit(
+            &mut TcpPacket::new_unchecked(&mut packet[40..]),
+            &IpAddress::Ipv6(REMOTE),
+            &IpAddress::Ipv6(LOCAL),
+            &ChecksumCapabilities::default(),
+        );
+        packet
+    }
+
+    fn states(shared: &Shared) -> Vec<tcp::State> {
+        let st = shared.lock();
+        st.sockets
+            .iter()
+            .filter_map(|(_, s)| match s {
+                Socket::Tcp(t) => Some(t.state()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A retransmitted SYN must not open a second half-connection on a
+    /// listening socket that sits earlier in the socket set.
+    #[test]
+    fn retransmitted_syn_is_not_duplicated() {
+        let shared = Shared::new(LOCAL, 1500, StackConfig::default());
+        {
+            let mut st = shared.lock();
+            // Occupy and free slot 0 so the next socket created on demand
+            // lands before the listener's first socket.
+            let filler = st.sockets.add(new_listen_socket(&shared.config, 81).unwrap());
+            let first = st.sockets.add(new_listen_socket(&shared.config, 80).unwrap());
+            st.sockets.remove(filler);
+            st.listeners.insert(80, vec![first]);
+        }
+
+        shared.lock().device.rx.push_back(syn(5000, 80));
+        let (out, _) = shared.poll();
+        assert_eq!(out.len(), 1, "SYN-ACK expected");
+        assert_eq!(states(&shared), vec![tcp::State::SynReceived]);
+
+        // The same SYN again (e.g. delayed original plus retransmission).
+        shared.lock().device.rx.push_back(syn(5000, 80));
+        shared.poll();
+        let syn_received = states(&shared)
+            .into_iter()
+            .filter(|s| *s == tcp::State::SynReceived)
+            .count();
+        assert_eq!(syn_received, 1, "duplicate half-connection: {:?}", states(&shared));
+
+        // A SYN from another client still gets a fresh listening socket.
+        shared.lock().device.rx.push_back(syn(5001, 80));
+        shared.poll();
+        let syn_received = states(&shared)
+            .into_iter()
+            .filter(|s| *s == tcp::State::SynReceived)
+            .count();
+        assert_eq!(syn_received, 2);
+    }
 }
