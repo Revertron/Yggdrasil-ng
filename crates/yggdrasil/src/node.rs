@@ -348,6 +348,14 @@ impl Node {
         self.core.public_key()
     }
 
+    /// Whether a TUN adapter is running (and therefore owns the RWC read side).
+    pub fn has_tun(&self) -> bool {
+        #[cfg(feature = "tun")]
+        return self.tun.is_some();
+        #[cfg(not(feature = "tun"))]
+        return false;
+    }
+
     /// Name of the TUN interface, if one is running.
     #[cfg(feature = "tun")]
     pub fn tun_name(&self) -> Option<&str> {
