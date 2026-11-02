@@ -1,0 +1,28 @@
+[package]
+name = "yggdrasil-uniffi"
+version = "0.1.0"
+edition = "2024"
+description = "UniFFI (Kotlin/Swift) bindings for an embedded Yggdrasil node"
+license = "MPL-2.0"
+
+[lib]
+name = "yggdrasil_uniffi"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[dependencies]
+yggdrasil-embed = { path = "../yggdrasil-embed", default-features = false }
+uniffi = "0.32"
+thiserror = "2"
+hex = "0.4"
+
+[features]
+default = ["ws", "quic"]
+ws = ["yggdrasil-embed/ws"]
+quic = ["yggdrasil-embed/quic"]
+# The uniffi-bindgen tool used to generate the Kotlin sources.
+cli = ["uniffi/cli"]

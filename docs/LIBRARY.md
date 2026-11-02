@@ -14,6 +14,7 @@ an ordinary Yggdrasil node and talk to it with their kernel stacks.
 | `yggdrasil-embed` | Shared core of the bindings below: `EmbeddedNode`, a synchronous Rust API that returns connections as OS sockets. |
 | `yggdrasil-ffi` | C ABI (`libygg.so` / `ygg.dll` / `libygg.dylib`, plus static `libygg.a`), header `crates/yggdrasil-ffi/include/ygg.h`. |
 | `yggdrasil-py` | Python package `ygg` (PyO3, abi3 wheel for CPython ≥ 3.9). |
+| `yggdrasil-uniffi` | UniFFI bindings (Kotlin; Swift possible); generated Kotlin in `bindings/kotlin`. |
 | `yggdrasil-stack` | `YggStack`: TCP streams/listeners, UDP sockets and ICMPv6 ping over an embedded node. Feature `proxy` (default): SOCKS5 server and port forwarding. Feature `cli`: the `yggdrasil-proxy` tool. |
 
 ## Rust example
@@ -239,6 +240,55 @@ See `crates/yggdrasil-py/README.md`.
 The crate is its own Cargo workspace (built by maturin), so the main
 workspace builds without Python.
 
+## Kotlin / Android (`org.yggdrasil.embed`)
+
+UniFFI bindings in `crates/yggdrasil-uniffi`; the generated Kotlin
+(`yggdrasil_uniffi.kt`, uses JNA) and hand-written helpers (`YggStreams.kt`)
+are in `bindings/kotlin/src/main/kotlin`. Regenerate after changing the
+Rust API with `bindings/kotlin/generate.sh`.
+
+```kotlin
+import org.yggdrasil.embed.*
+
+val node = YggNode(configToml)                      // null: ephemeral key
+node.connect("<hex key>.pk.ygg", 80).use { s ->     // YggStream
+    s.output.write(request)
+    s.shutdownOutput()                              // FIN, keep reading
+    val reply = s.input.readBytes()
+}
+node.listen(8080).use { l -> val conn = l.accept() }   // conn.peer = "[addr]:port"
+node.udp().use { u -> u.send("200:1234::1", 5353, data); val d = u.receive() }
+node.pingMillis("200:1234::1")
+node.admin("""{"request":"getPeers"}""")
+setLogger(object : LogSink { override fun log(level: Int, message: String) = Log.i("ygg", message) }, "info")
+node.close()                                        // stops the node, frees the handle
+```
+
+All calls block, so run them off the main thread (`Dispatchers.IO`). Errors
+are `YggException` subclasses (`ConnectionRefused`, `TimedOut`, `WouldBlock`,
+`Closed`, ...). The raw API (`tcpConnect`, `tcpAccept`, `udpBind`, ... returning
+descriptors as `Int`) is available too; on Android wrap a descriptor with
+`ParcelFileDescriptor.adoptFd(fd)`.
+
+Android integration (not built in this repository):
+
+1. Build the library per ABI, e.g. with
+   [cargo-ndk](https://github.com/bbqsrc/cargo-ndk):
+   `cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o app/src/main/jniLibs build --release -p yggdrasil-uniffi`
+2. Add `bindings/kotlin/src/main/kotlin` to the module's sources and
+   `implementation("net.java.dev.jna:jna:5.17.0@aar")` to its dependencies.
+3. With R8/ProGuard, keep JNA and the bindings:
+   `-keep class com.sun.jna.** { *; }` and `-keep class org.yggdrasil.embed.** { *; }`.
+4. The app needs the `INTERNET` permission; no `VpnService` is involved.
+
+If the app already ships a UniFFI library, depend on `yggdrasil-uniffi` from
+that crate instead of shipping a second copy of the runtime; the exports are
+picked up when its bindings are generated.
+
+`bindings/kotlin` is also a Gradle JVM project whose tests run the bindings
+against `target/debug` (`cargo build -p yggdrasil-uniffi`, then
+`gradle test` in `bindings/kotlin`).
+
 ## Roadmap
 
-- Kotlin/Android bindings on top of `yggdrasil-embed`.
+- Swift bindings from the same UniFFI crate.

@@ -42,3 +42,27 @@ jobs:
           pip install maturin pytest
           maturin develop
           pytest -q tests
+
+  kotlin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Generated bindings are up to date
+        run: |
+          bindings/kotlin/generate.sh
+          git diff --exit-code -- bindings/kotlin/src/main/kotlin
+
+      - name: Test the Kotlin bindings on the JVM
+        working-directory: bindings/kotlin
+        run: gradle test

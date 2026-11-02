@@ -149,6 +149,16 @@ mod imp {
         drop(unsafe { OwnedFd::from_raw_fd(s) });
     }
 
+    /// Half-close: send FIN / EOF on an application stream socket.
+    pub fn shutdown_write(s: CSocket) -> io::Result<()> {
+        // SAFETY: shutdown(2) on a caller-provided descriptor.
+        if unsafe { libc::shutdown(s, libc::SHUT_WR) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     /// Consume one notification byte from `s` if one is available, without
     /// blocking and without changing the socket's mode.
     pub fn drain_byte(s: CSocket) {
@@ -163,7 +173,7 @@ mod imp {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
     use std::os::windows::io::{FromRawSocket, IntoRawSocket, OwnedSocket, RawSocket};
-    use windows_sys::Win32::Networking::WinSock::{FIONREAD, ioctlsocket, recv};
+    use windows_sys::Win32::Networking::WinSock::{FIONREAD, SD_SEND, WSAGetLastError, ioctlsocket, recv, shutdown};
 
     pub type LibStream = tokio::net::TcpStream;
 
@@ -216,6 +226,15 @@ mod imp {
     pub fn close(s: CSocket) {
         // SAFETY: the caller hands over ownership of `s`.
         drop(unsafe { OwnedSocket::from_raw_socket(s as RawSocket) });
+    }
+
+    pub fn shutdown_write(s: CSocket) -> io::Result<()> {
+        // SAFETY: shutdown on a caller-provided socket.
+        if unsafe { shutdown(s as _, SD_SEND) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        }
     }
 
     pub fn drain_byte(s: CSocket) {
