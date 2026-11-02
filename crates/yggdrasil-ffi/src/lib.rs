@@ -4,319 +4,54 @@
 //! one end of a socket pair whose other end the library bridges to the
 //! Yggdrasil network. Applications use their usual `read`/`write`/`poll`
 //! (or asyncio, epoll, IOCP, ...) on it and never call into the library on
-//! the data path.
+//! the data path. The implementation lives in `yggdrasil-embed`; this crate
+//! only adapts it to C conventions.
 
 #![allow(clippy::missing_safety_doc)]
 
 mod error;
-mod logger;
-mod sockpair;
 
-use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::net::SocketAddr;
+use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::runtime::Runtime;
-use tokio::task::JoinHandle;
-use yggdrasil::config::Config;
-use yggdrasil::node::{Node, NodeBuilder};
-use yggdrasil_stack::{Host, Target, TcpStream, UdpSocket, YggStack, proxy};
+use yggdrasil_embed::{EmbeddedNode, Host, StartOptions, Target};
 
 pub use error::*;
-pub use logger::{LogFn, YGG_LOG_DEBUG, YGG_LOG_ERROR, YGG_LOG_INFO, YGG_LOG_TRACE, YGG_LOG_WARN};
-pub use sockpair::{CSocket, INVALID_SOCKET};
+pub use yggdrasil_embed::{CSocket, INVALID_SOCKET};
+
+/// Opaque node handle (`ygg_node` in C).
+pub type YggNode = EmbeddedNode;
+
+pub const YGG_LOG_ERROR: i32 = yggdrasil_embed::LOG_ERROR;
+pub const YGG_LOG_WARN: i32 = yggdrasil_embed::LOG_WARN;
+pub const YGG_LOG_INFO: i32 = yggdrasil_embed::LOG_INFO;
+pub const YGG_LOG_DEBUG: i32 = yggdrasil_embed::LOG_DEBUG;
+pub const YGG_LOG_TRACE: i32 = yggdrasil_embed::LOG_TRACE;
 
 /// `ygg_node_start` flag: also start the admin socket on `admin_listen`.
 pub const YGG_START_ADMIN: u32 = 1;
 /// Header in front of every datagram on a UDP socket: 16-byte IPv6 address
 /// and 2-byte big-endian port of the remote side.
-pub const YGG_UDP_HEADER_LEN: usize = 18;
+pub const YGG_UDP_HEADER_LEN: usize = yggdrasil_embed::UDP_HEADER_LEN;
 
-const RUNTIME_WORKERS: usize = 2;
-const UDP_BUFFER: usize = 65536 + YGG_UDP_HEADER_LEN;
+pub type LogFn = extern "C" fn(userdata: *mut c_void, level: i32, message: *const c_char);
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+/// C callback plus its userdata, callable from any thread per the API contract.
+#[derive(Clone, Copy)]
+struct CLogger {
+    f: LogFn,
+    userdata: *mut c_void,
 }
 
-/// Pending connections of a listener, shared with its accept task.
-struct Listener {
-    queue: Mutex<VecDeque<(TcpStream, SocketAddrV6)>>,
-    ready: Condvar,
-    closed: AtomicBool,
-    task: Mutex<Option<JoinHandle<()>>>,
-}
+// SAFETY: the API requires the callback and userdata to be usable from any thread.
+unsafe impl Send for CLogger {}
+unsafe impl Sync for CLogger {}
 
-/// An embedded node with its runtime and userspace stack. Opaque to C.
-pub struct YggNode {
-    runtime: Runtime,
-    node: Mutex<Option<Node>>,
-    stack: YggStack,
-    listeners: Mutex<HashMap<CSocket, Arc<Listener>>>,
-    udp: Mutex<HashMap<CSocket, JoinHandle<()>>>,
-    services: Mutex<HashMap<i32, JoinHandle<()>>>,
-    next_service: AtomicI32,
-}
-
-impl YggNode {
-    fn start(config: Config, flags: u32) -> Result<Box<Self>> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(RUNTIME_WORKERS)
-            .thread_name("ygg")
-            .enable_all()
-            .build()
-            .map_err(Error::from)?;
-        let admin = flags & YGG_START_ADMIN != 0;
-        let node = runtime
-            .block_on(
-                NodeBuilder::new(config)
-                    .embedded()
-                    .admin(admin)
-                    .admin_required(admin)
-                    .start(),
-            )
-            .map_err(|e| Error::new(YGG_ERR_CONFIG, e.to_string()))?;
-        let stack = {
-            let _enter = runtime.enter();
-            YggStack::new(&node)?
-        };
-        Ok(Box::new(Self {
-            runtime,
-            node: Mutex::new(Some(node)),
-            stack,
-            listeners: Mutex::default(),
-            udp: Mutex::default(),
-            services: Mutex::default(),
-            next_service: AtomicI32::new(1),
-        }))
-    }
-
-    fn with_node<R>(&self, f: impl FnOnce(&Node) -> R) -> Result<R> {
-        let node = lock(&self.node);
-        let node = node.as_ref().ok_or_else(|| Error::new(YGG_ERR_CLOSED, "node is stopped"))?;
-        Ok(f(node))
-    }
-
-    /// Hand `stream` to the application as a socket.
-    fn bridge_tcp(&self, stream: TcpStream) -> Result<CSocket> {
-        let _enter = self.runtime.enter();
-        let (app, mut lib) = sockpair::stream_pair()?;
-        self.runtime.spawn(async move {
-            let mut stream = stream;
-            if let Err(e) = tokio::io::copy_bidirectional(&mut lib, &mut stream).await {
-                tracing::debug!("ffi: tcp bridge ended: {}", e);
-            }
-        });
-        Ok(app)
-    }
-
-    fn tcp_connect(&self, target: Target, timeout: Option<Duration>) -> Result<CSocket> {
-        let stream = self.runtime.block_on(async {
-            let connect = self.stack.tcp_connect_target(&target);
-            match timeout {
-                Some(t) => tokio::time::timeout(t, connect).await.unwrap_or_else(|_| {
-                    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out"))
-                }),
-                None => connect.await,
-            }
-        })?;
-        self.bridge_tcp(stream)
-    }
-
-    fn tcp_listen(&self, port: u16) -> Result<CSocket> {
-        let listener = self.stack.tcp_listen(port)?;
-        let _enter = self.runtime.enter();
-        let (app, mut lib) = sockpair::stream_pair()?;
-        let state = Arc::new(Listener {
-            queue: Mutex::default(),
-            ready: Condvar::new(),
-            closed: AtomicBool::new(false),
-            task: Mutex::new(None),
-        });
-        lock(&self.listeners).insert(app, state.clone());
-
-        let task_state = state.clone();
-        let task = self.runtime.spawn(async move {
-            let state = task_state;
-            let mut probe = [0u8; 64];
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => match accepted {
-                        Ok(conn) => {
-                            lock(&state.queue).push_back(conn);
-                            state.ready.notify_all();
-                            // One byte per queued connection makes the
-                            // application's socket readable.
-                            if lib.write_all(&[1]).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    },
-                    // EOF: the application closed its end.
-                    r = lib.read(&mut probe) => if matches!(r, Ok(0) | Err(_)) {
-                        break;
-                    },
-                }
-            }
-            state.closed.store(true, Ordering::Release);
-            lock(&state.queue).clear();
-            state.ready.notify_all();
-        });
-        *lock(&state.task) = Some(task);
-        Ok(app)
-    }
-
-    fn listener(&self, sock: CSocket) -> Result<Arc<Listener>> {
-        lock(&self.listeners)
-            .get(&sock)
-            .cloned()
-            .ok_or_else(|| Error::new(YGG_ERR_NOT_FOUND, "not a listener socket"))
-    }
-
-    fn tcp_accept(&self, sock: CSocket, timeout: Option<Duration>) -> Result<(CSocket, SocketAddrV6)> {
-        let listener = self.listener(sock)?;
-        let deadline = timeout.map(|t| Instant::now() + t);
-        let (stream, peer) = {
-            let mut queue = lock(&listener.queue);
-            loop {
-                if let Some(conn) = queue.pop_front() {
-                    break conn;
-                }
-                if listener.closed.load(Ordering::Acquire) {
-                    return Err(Error::new(YGG_ERR_CLOSED, "listener closed"));
-                }
-                match deadline {
-                    Some(d) => {
-                        let now = Instant::now();
-                        if now >= d {
-                            // Readability may have been spurious; clear it.
-                            sockpair::drain_byte(sock);
-                            return Err(Error::new(YGG_ERR_WOULD_BLOCK, "no pending connection"));
-                        }
-                        queue = listener
-                            .ready
-                            .wait_timeout(queue, d - now)
-                            .unwrap_or_else(|e| e.into_inner())
-                            .0;
-                    }
-                    None => queue = listener.ready.wait(queue).unwrap_or_else(|e| e.into_inner()),
-                }
-            }
-        };
-        sockpair::drain_byte(sock);
-        Ok((self.bridge_tcp(stream)?, peer))
-    }
-
-    fn tcp_listener_close(&self, sock: CSocket) -> Result<()> {
-        let listener = lock(&self.listeners)
-            .remove(&sock)
-            .ok_or_else(|| Error::new(YGG_ERR_NOT_FOUND, "not a listener socket"))?;
-        if let Some(task) = lock(&listener.task).take() {
-            task.abort();
-        }
-        listener.closed.store(true, Ordering::Release);
-        lock(&listener.queue).clear();
-        listener.ready.notify_all();
-        sockpair::close(sock);
-        Ok(())
-    }
-
-    fn udp_bind(&self, port: u16) -> Result<(CSocket, u16)> {
-        let socket = self.stack.udp_bind(port)?;
-        let bound = socket.local_addr().port();
-        let _enter = self.runtime.enter();
-        let (app, lib) = sockpair::dgram_pair()?;
-        let task = self.runtime.spawn(bridge_udp(socket, lib));
-        lock(&self.udp).insert(app, task);
-        Ok((app, bound))
-    }
-
-    fn udp_close(&self, sock: CSocket) -> Result<()> {
-        let task = lock(&self.udp)
-            .remove(&sock)
-            .ok_or_else(|| Error::new(YGG_ERR_NOT_FOUND, "not a UDP socket"))?;
-        task.abort();
-        sockpair::close(sock);
-        Ok(())
-    }
-
-    fn spawn_service<F>(&self, what: String, service: F) -> i32
-    where
-        F: Future<Output = std::io::Result<()>> + Send + 'static,
-    {
-        let id = self.next_service.fetch_add(1, Ordering::Relaxed);
-        let task = self.runtime.spawn(async move {
-            if let Err(e) = service.await {
-                tracing::warn!("{} stopped: {}", what, e);
-            }
-        });
-        lock(&self.services).insert(id, task);
-        id
-    }
-
-    fn stop(self: Box<Self>) {
-        let this = *self;
-        for (_, task) in lock(&this.services).drain() {
-            task.abort();
-        }
-        for (_, listener) in lock(&this.listeners).drain() {
-            if let Some(task) = lock(&listener.task).take() {
-                task.abort();
-            }
-            listener.closed.store(true, Ordering::Release);
-            listener.ready.notify_all();
-        }
-        for (_, task) in lock(&this.udp).drain() {
-            task.abort();
-        }
-        let node = lock(&this.node).take();
-        this.runtime.block_on(async {
-            this.stack.close();
-            if let Some(node) = node {
-                node.close().await;
-            }
-        });
-        drop(this.stack);
-        this.runtime.shutdown_timeout(Duration::from_secs(2));
-    }
-}
-
-/// Moves datagrams between a Yggdrasil UDP socket and the application's
-/// datagram socket, adding/stripping the address header.
-async fn bridge_udp(socket: UdpSocket, lib: sockpair::LibDgram) {
-    let mut from_app = vec![0u8; UDP_BUFFER];
-    let mut to_app = vec![0u8; UDP_BUFFER];
-    loop {
-        tokio::select! {
-            r = lib.recv(&mut from_app) => match r {
-                Ok(0) if sockpair::LibDgram::ZERO_IS_EOF => break,
-                Ok(n) if n >= YGG_UDP_HEADER_LEN => {
-                    let mut addr = [0u8; 16];
-                    addr.copy_from_slice(&from_app[..16]);
-                    let port = u16::from_be_bytes([from_app[16], from_app[17]]);
-                    let dst = SocketAddrV6::new(Ipv6Addr::from(addr), port, 0, 0);
-                    if let Err(e) = socket.send_to(&from_app[YGG_UDP_HEADER_LEN..n], dst).await {
-                        tracing::debug!("ffi: udp send to {}: {}", dst, e);
-                    }
-                }
-                Ok(_) => tracing::debug!("ffi: dropping datagram without header"),
-                Err(_) => break,
-            },
-            r = socket.recv_from(&mut to_app[YGG_UDP_HEADER_LEN..]) => match r {
-                Ok((n, from)) => {
-                    to_app[..16].copy_from_slice(&from.ip().octets());
-                    to_app[16..18].copy_from_slice(&from.port().to_be_bytes());
-                    if lib.send(&to_app[..YGG_UDP_HEADER_LEN + n]).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            },
+impl CLogger {
+    fn log(&self, level: i32, message: &str) {
+        if let Ok(msg) = CString::new(message.replace('\0', " ")) {
+            (self.f)(self.userdata, level, msg.as_ptr());
         }
     }
 }
@@ -421,7 +156,7 @@ pub unsafe extern "C" fn ygg_free_string(s: *mut c_char) {
 /// A new configuration (TOML) with a freshly generated private key.
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_generate_config() -> *mut c_char {
-    guard(std::ptr::null_mut(), || Ok(into_c_string(Config::generate_config_text())))
+    guard(std::ptr::null_mut(), || Ok(into_c_string(EmbeddedNode::generate_config())))
 }
 
 /// Route the library's log output to `callback`. Can be set once per process.
@@ -429,7 +164,9 @@ pub extern "C" fn ygg_generate_config() -> *mut c_char {
 pub extern "C" fn ygg_set_logger(callback: Option<LogFn>, userdata: *mut c_void, filter: *const c_char) -> i32 {
     guard_int(|| {
         let callback = callback.ok_or_else(|| Error::invalid("callback is NULL"))?;
-        logger::install(callback, userdata, filter)?;
+        let filter = opt_str_arg(filter, "filter")?.unwrap_or("info");
+        let logger = CLogger { f: callback, userdata };
+        yggdrasil_embed::set_logger(move |level, message| logger.log(level, message), filter)?;
         Ok(0)
     })
 }
@@ -442,12 +179,9 @@ pub extern "C" fn ygg_set_logger(callback: Option<LogFn>, userdata: *mut c_void,
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_node_start(config_toml: *const c_char, flags: u32) -> *mut YggNode {
     guard(std::ptr::null_mut(), || {
-        let config = match opt_str_arg(config_toml, "config")? {
-            Some(text) if !text.trim().is_empty() => toml::from_str::<Config>(text)
-                .map_err(|e| Error::new(YGG_ERR_CONFIG, format!("invalid config: {e}")))?,
-            _ => Config::default(),
-        };
-        Ok(Box::into_raw(YggNode::start(config, flags)?))
+        let options = StartOptions { admin: flags & YGG_START_ADMIN != 0 };
+        let node = EmbeddedNode::start_toml(opt_str_arg(config_toml, "config")?, options)?;
+        Ok(Box::into_raw(Box::new(node)))
     })
 }
 
@@ -466,13 +200,13 @@ pub unsafe extern "C" fn ygg_node_stop(node: *mut YggNode) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_node_address(node: *const YggNode, buf: *mut c_char, len: usize) -> i32 {
-    guard_int(|| Ok(write_str(&node_arg(node)?.stack.address().to_string(), buf, len)))
+    guard_int(|| Ok(write_str(&node_arg(node)?.address().to_string(), buf, len)))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_node_subnet(node: *const YggNode, buf: *mut c_char, len: usize) -> i32 {
     guard_int(|| {
-        let subnet = node_arg(node)?.with_node(|n| n.subnet().to_string())?;
+        let subnet = node_arg(node)?.subnet()?;
         Ok(write_str(&subnet, buf, len))
     })
 }
@@ -480,7 +214,7 @@ pub extern "C" fn ygg_node_subnet(node: *const YggNode, buf: *mut c_char, len: u
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_node_public_key(node: *const YggNode, buf: *mut c_char, len: usize) -> i32 {
     guard_int(|| {
-        let key = node_arg(node)?.with_node(|n| hex::encode(n.public_key()))?;
+        let key = hex::encode(node_arg(node)?.public_key()?);
         Ok(write_str(&key, buf, len))
     })
 }
@@ -488,10 +222,7 @@ pub extern "C" fn ygg_node_public_key(node: *const YggNode, buf: *mut c_char, le
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_node_add_peer(node: *const YggNode, uri: *const c_char) -> i32 {
     guard_int(|| {
-        let node = node_arg(node)?;
-        let uri = str_arg(uri, "uri")?;
-        let core = node.with_node(|n| n.core().clone())?;
-        node.runtime.block_on(core.add_peer(uri)).map_err(Error::invalid)?;
+        node_arg(node)?.add_peer(str_arg(uri, "uri")?)?;
         Ok(0)
     })
 }
@@ -499,10 +230,7 @@ pub extern "C" fn ygg_node_add_peer(node: *const YggNode, uri: *const c_char) ->
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_node_remove_peer(node: *const YggNode, uri: *const c_char) -> i32 {
     guard_int(|| {
-        let node = node_arg(node)?;
-        let uri = str_arg(uri, "uri")?;
-        let core = node.with_node(|n| n.core().clone())?;
-        node.runtime.block_on(core.remove_peer(uri)).map_err(|e| Error::new(YGG_ERR_NOT_FOUND, e))?;
+        node_arg(node)?.remove_peer(str_arg(uri, "uri")?)?;
         Ok(0)
     })
 }
@@ -512,10 +240,7 @@ pub extern "C" fn ygg_node_remove_peer(node: *const YggNode, uri: *const c_char)
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_node_admin(node: *const YggNode, request_json: *const c_char) -> *mut c_char {
     guard(std::ptr::null_mut(), || {
-        let node = node_arg(node)?;
-        let request = str_arg(request_json, "request")?;
-        let core = node.with_node(|n| n.core().clone())?;
-        let response = node.runtime.block_on(yggdrasil::admin::handle_json(&core, request));
+        let response = node_arg(node)?.admin(str_arg(request_json, "request")?)?;
         Ok(into_c_string(response))
     })
 }
@@ -528,8 +253,7 @@ pub extern "C" fn ygg_node_admin(node: *const YggNode, request_json: *const c_ch
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_tcp_connect(node: *const YggNode, host: *const c_char, port: u16, timeout_ms: i32) -> CSocket {
     guard(INVALID_SOCKET, || {
-        let node = node_arg(node)?;
-        node.tcp_connect(target_arg(host, port)?, timeout_arg(timeout_ms))
+        node_arg(node)?.tcp_connect(&target_arg(host, port)?, timeout_arg(timeout_ms))
     })
 }
 
@@ -592,13 +316,8 @@ pub extern "C" fn ygg_udp_close(node: *const YggNode, sock: CSocket) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_ping(node: *const YggNode, host: *const c_char, timeout_ms: i32) -> i64 {
     let r = guard(i64::MIN, || {
-        let node = node_arg(node)?;
         let host: Host = str_arg(host, "host")?.parse()?;
-        let timeout = timeout_arg(timeout_ms).unwrap_or(Duration::from_secs(5));
-        let rtt = node.runtime.block_on(async {
-            let addr = node.stack.resolve(&host).await;
-            node.stack.ping(addr, timeout).await
-        })?;
+        let rtt = node_arg(node)?.ping(&host, timeout_arg(timeout_ms))?;
         Ok(rtt.as_micros().min(i64::MAX as u128) as i64)
     });
     if r == i64::MIN { -(ygg_last_error() as i64) } else { r }
@@ -617,16 +336,13 @@ pub extern "C" fn ygg_socks5_start(
     password: *const c_char,
 ) -> i32 {
     guard_int(|| {
-        let node = node_arg(node)?;
         let listen = socket_addr_arg(listen, "listen")?;
-        let mut server = proxy::Socks5Server::new(node.stack.clone());
-        match (opt_str_arg(username, "username")?, opt_str_arg(password, "password")?) {
-            (Some(u), Some(p)) => server = server.with_credentials(u, p),
-            (None, None) => {}
+        let credentials = match (opt_str_arg(username, "username")?, opt_str_arg(password, "password")?) {
+            (Some(u), Some(p)) => Some((u, p)),
+            (None, None) => None,
             _ => return Err(Error::invalid("give both username and password, or neither")),
-        }
-        let listener = node.runtime.block_on(tokio::net::TcpListener::bind(listen))?;
-        Ok(node.spawn_service(format!("SOCKS5 on {listen}"), server.serve(listener)))
+        };
+        node_arg(node)?.socks5_start(listen, credentials)
     })
 }
 
@@ -635,12 +351,9 @@ pub extern "C" fn ygg_socks5_start(
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_forward_local_tcp(node: *const YggNode, listen: *const c_char, target: *const c_char) -> i32 {
     guard_int(|| {
-        let node = node_arg(node)?;
         let listen = socket_addr_arg(listen, "listen")?;
         let target: Target = str_arg(target, "target")?.parse()?;
-        let listener = node.runtime.block_on(tokio::net::TcpListener::bind(listen))?;
-        let what = format!("TCP forward {listen} -> {target}");
-        Ok(node.spawn_service(what, proxy::forward_local_tcp(node.stack.clone(), listener, target)))
+        node_arg(node)?.forward_local_tcp(listen, target)
     })
 }
 
@@ -648,12 +361,9 @@ pub extern "C" fn ygg_forward_local_tcp(node: *const YggNode, listen: *const c_c
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_forward_local_udp(node: *const YggNode, listen: *const c_char, target: *const c_char) -> i32 {
     guard_int(|| {
-        let node = node_arg(node)?;
         let listen = socket_addr_arg(listen, "listen")?;
         let target: Target = str_arg(target, "target")?.parse()?;
-        let socket = node.runtime.block_on(tokio::net::UdpSocket::bind(listen))?;
-        let what = format!("UDP forward {listen} -> {target}");
-        Ok(node.spawn_service(what, proxy::forward_local_udp(node.stack.clone(), socket, target)))
+        node_arg(node)?.forward_local_udp(listen, target)
     })
 }
 
@@ -661,11 +371,8 @@ pub extern "C" fn ygg_forward_local_udp(node: *const YggNode, listen: *const c_c
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_forward_remote_tcp(node: *const YggNode, port: u16, target: *const c_char) -> i32 {
     guard_int(|| {
-        let node = node_arg(node)?;
         let target = socket_addr_arg(target, "target")?;
-        let listener = node.stack.tcp_listen(port)?;
-        let what = format!("TCP forward :{port} -> {target}");
-        Ok(node.spawn_service(what, proxy::serve_remote_tcp(listener, target)))
+        node_arg(node)?.forward_remote_tcp(port, target)
     })
 }
 
@@ -673,11 +380,8 @@ pub extern "C" fn ygg_forward_remote_tcp(node: *const YggNode, port: u16, target
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_forward_remote_udp(node: *const YggNode, port: u16, target: *const c_char) -> i32 {
     guard_int(|| {
-        let node = node_arg(node)?;
         let target = socket_addr_arg(target, "target")?;
-        let socket = node.stack.udp_bind(port)?;
-        let what = format!("UDP forward :{port} -> {target}");
-        Ok(node.spawn_service(what, proxy::serve_remote_udp(socket, target)))
+        node_arg(node)?.forward_remote_udp(port, target)
     })
 }
 
@@ -685,10 +389,7 @@ pub extern "C" fn ygg_forward_remote_udp(node: *const YggNode, port: u16, target
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_service_stop(node: *const YggNode, id: i32) -> i32 {
     guard_int(|| {
-        let task = lock(&node_arg(node)?.services)
-            .remove(&id)
-            .ok_or_else(|| Error::new(YGG_ERR_NOT_FOUND, "no such service"))?;
-        task.abort();
+        node_arg(node)?.service_stop(id)?;
         Ok(0)
     })
 }

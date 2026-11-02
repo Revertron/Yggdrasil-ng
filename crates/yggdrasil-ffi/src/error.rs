@@ -3,55 +3,21 @@
 
 use std::cell::RefCell;
 use std::ffi::{CString, c_char};
-use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+pub use yggdrasil_embed::{Error, Result};
+
 pub const YGG_OK: i32 = 0;
-pub const YGG_ERR_INVALID_ARGUMENT: i32 = 1;
-pub const YGG_ERR_CONFIG: i32 = 2;
-pub const YGG_ERR_CONNECTION_REFUSED: i32 = 3;
-pub const YGG_ERR_TIMED_OUT: i32 = 4;
-pub const YGG_ERR_ADDR_IN_USE: i32 = 5;
-pub const YGG_ERR_CLOSED: i32 = 6;
-pub const YGG_ERR_WOULD_BLOCK: i32 = 7;
-pub const YGG_ERR_IO: i32 = 8;
-pub const YGG_ERR_PANIC: i32 = 9;
-pub const YGG_ERR_NOT_FOUND: i32 = 10;
-
-#[derive(Debug)]
-pub struct Error {
-    pub code: i32,
-    pub message: String,
-}
-
-impl Error {
-    pub fn new(code: i32, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
-    }
-
-    pub fn invalid(message: impl Into<String>) -> Self {
-        Self::new(YGG_ERR_INVALID_ARGUMENT, message)
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(e: io::Error) -> Self {
-        use io::ErrorKind::*;
-        let code = match e.kind() {
-            InvalidInput | InvalidData => YGG_ERR_INVALID_ARGUMENT,
-            ConnectionRefused => YGG_ERR_CONNECTION_REFUSED,
-            TimedOut => YGG_ERR_TIMED_OUT,
-            AddrInUse => YGG_ERR_ADDR_IN_USE,
-            NotConnected | BrokenPipe | ConnectionReset | ConnectionAborted => YGG_ERR_CLOSED,
-            WouldBlock => YGG_ERR_WOULD_BLOCK,
-            NotFound => YGG_ERR_NOT_FOUND,
-            _ => YGG_ERR_IO,
-        };
-        Self::new(code, e.to_string())
-    }
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
+pub const YGG_ERR_INVALID_ARGUMENT: i32 = yggdrasil_embed::ERR_INVALID_ARGUMENT;
+pub const YGG_ERR_CONFIG: i32 = yggdrasil_embed::ERR_CONFIG;
+pub const YGG_ERR_CONNECTION_REFUSED: i32 = yggdrasil_embed::ERR_CONNECTION_REFUSED;
+pub const YGG_ERR_TIMED_OUT: i32 = yggdrasil_embed::ERR_TIMED_OUT;
+pub const YGG_ERR_ADDR_IN_USE: i32 = yggdrasil_embed::ERR_ADDR_IN_USE;
+pub const YGG_ERR_CLOSED: i32 = yggdrasil_embed::ERR_CLOSED;
+pub const YGG_ERR_WOULD_BLOCK: i32 = yggdrasil_embed::ERR_WOULD_BLOCK;
+pub const YGG_ERR_IO: i32 = yggdrasil_embed::ERR_IO;
+pub const YGG_ERR_PANIC: i32 = yggdrasil_embed::ERR_PANIC;
+pub const YGG_ERR_NOT_FOUND: i32 = yggdrasil_embed::ERR_NOT_FOUND;
 
 thread_local! {
     static LAST_ERROR: RefCell<(i32, CString)> = RefCell::new((YGG_OK, CString::default()));

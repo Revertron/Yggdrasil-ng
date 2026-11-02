@@ -2868,12 +2868,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "yggdrasil-ffi"
+name = "yggdrasil-embed"
 version = "0.1.0"
 dependencies = [
  "hex",
  "libc",
- "serde_json",
  "socket2",
  "tokio",
  "toml",
@@ -2882,6 +2881,15 @@ dependencies = [
  "windows-sys 0.61.2",
  "yggdrasil",
  "yggdrasil-stack",
+]
+
+[[package]]
+name = "yggdrasil-ffi"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde_json",
+ "yggdrasil-embed",
 ]
 
 [[package]]
