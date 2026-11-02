@@ -2872,12 +2872,15 @@ name = "yggdrasil-stack"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "getopts",
  "rand 0.8.8",
  "rustc-hash",
  "smoltcp",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
+ "tracing-subscriber",
  "yggdrasil",
 ]
 

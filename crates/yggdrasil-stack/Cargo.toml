@@ -5,6 +5,11 @@ edition = "2024"
 description = "Userspace TCP/UDP/ICMPv6 stack over an embedded Yggdrasil node (no TUN)"
 license = "MPL-2.0"
 
+[[bin]]
+name = "yggdrasil-proxy"
+path = "src/bin/yggdrasil-proxy.rs"
+required-features = ["cli"]
+
 [dependencies]
 yggdrasil = { path = "../yggdrasil", default-features = false }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "io-util"] }
@@ -12,6 +17,11 @@ tokio-util = "0.7"
 tracing = "0.1"
 rand = "0.8"
 rustc-hash = "2.1.3"
+
+# `cli` feature (yggdrasil-proxy binary) only.
+getopts = { version = "0.2", optional = true }
+toml = { version = "1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [dependencies.smoltcp]
 version = "0.14"
@@ -29,7 +39,11 @@ features = [
 ]
 
 [features]
-default = []
+default = ["proxy"]
+# SOCKS5 server and TCP/UDP port forwarding between host sockets and the network.
+proxy = ["tokio/net"]
+# The yggdrasil-proxy command-line tool.
+cli = ["proxy", "dep:getopts", "dep:toml", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/signal"]
 # Pass-through peering transports of the node (tcp:// and tls:// are always on).
 ws = ["yggdrasil/ws"]
 quic = ["yggdrasil/quic"]

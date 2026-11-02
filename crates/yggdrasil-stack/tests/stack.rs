@@ -1,74 +1,12 @@
 //! Two embedded nodes peered over loopback, each running a userspace stack.
 
+mod common;
+
 use std::io::ErrorKind;
-use std::net::SocketAddrV6;
 use std::time::Duration;
 
+use common::{within, Pair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use yggdrasil::config::Config;
-use yggdrasil::node::{Node, NodeBuilder};
-use yggdrasil_stack::YggStack;
-
-const TIMEOUT: Duration = Duration::from_secs(20);
-
-struct Pair {
-    a: Node,
-    b: Node,
-    sa: YggStack,
-    sb: YggStack,
-}
-
-impl Pair {
-    async fn new() -> Self {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let base = || {
-            let mut c = Config::default();
-            c.multicast_interfaces.clear();
-            c.admin_listen = "none".into();
-            c.if_name = "none".into();
-            c
-        };
-        let mut ca = base();
-        ca.listen = vec![format!("tcp://127.0.0.1:{port}")];
-        let mut cb = base();
-        cb.peers = vec![format!("tcp://127.0.0.1:{port}")];
-
-        let a = NodeBuilder::new(ca).embedded().start().await.unwrap();
-        let b = NodeBuilder::new(cb).embedded().start().await.unwrap();
-        tokio::time::timeout(TIMEOUT, async {
-            while a.core().get_peer_keys().await.is_empty()
-                || b.core().get_peer_keys().await.is_empty()
-            {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("nodes did not peer");
-
-        let sa = YggStack::new(&a).unwrap();
-        let sb = YggStack::new(&b).unwrap();
-        Pair { a, b, sa, sb }
-    }
-
-    fn b_addr(&self, port: u16) -> SocketAddrV6 {
-        SocketAddrV6::new(self.sb.address(), port, 0, 0)
-    }
-
-    async fn close(self) {
-        self.sa.close();
-        self.sb.close();
-        self.a.close().await;
-        self.b.close().await;
-    }
-}
-
-async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(TIMEOUT, f).await.expect("timed out")
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_echo_bulk() {

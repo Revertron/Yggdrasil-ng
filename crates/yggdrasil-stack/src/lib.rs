@@ -29,11 +29,15 @@
 //! address (the node's own; its /64 subnet is not served).
 
 mod device;
+mod host;
 mod icmp;
+#[cfg(feature = "proxy")]
+pub mod proxy;
 mod stack;
 mod tcp;
 mod udp;
 
+pub use host::{Host, Target, KEY_DOMAIN_SUFFIX};
 pub use stack::{StackConfig, YggStack};
 pub use tcp::{TcpListener, TcpStream};
 pub use udp::UdpSocket;

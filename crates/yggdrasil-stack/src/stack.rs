@@ -18,6 +18,7 @@ use yggdrasil::ipv6rwc::ReadWriteCloser;
 use yggdrasil::node::Node;
 
 use crate::device::QueueDevice;
+use crate::host::{Host, Target};
 use crate::tcp::{new_listen_socket, TcpListener, TcpStream};
 use crate::udp::UdpSocket;
 
@@ -464,6 +465,21 @@ impl YggStack {
     /// keeps running.
     pub fn close(&self) {
         self.inner.cancel.cancel();
+    }
+
+    /// Address of `host`. For a key, the key is also registered with the
+    /// node so the first packet does not wait for an address-to-key lookup.
+    pub async fn resolve(&self, host: &Host) -> Ipv6Addr {
+        match host {
+            Host::Addr(a) => *a,
+            Host::Key(k) => self.prepare_key(k).await,
+        }
+    }
+
+    /// Open a TCP connection to `target` (address or public key).
+    pub async fn tcp_connect_target(&self, target: &Target) -> io::Result<TcpStream> {
+        let addr = self.resolve(&target.host).await;
+        self.tcp_connect(SocketAddrV6::new(addr, target.port, 0, 0)).await
     }
 
     async fn prepare_key(&self, key: &[u8; 32]) -> Ipv6Addr {
