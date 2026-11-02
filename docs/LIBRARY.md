@@ -11,6 +11,7 @@ an ordinary Yggdrasil node and talk to it with their kernel stacks.
 | Crate | Purpose |
 |---|---|
 | `yggdrasil` | The node. `node::NodeBuilder` starts it; `.embedded()` disables TUN and the admin socket. |
+| `yggdrasil-ffi` | C ABI (`libygg.so` / `ygg.dll` / `libygg.dylib`, plus static `libygg.a`), header `crates/yggdrasil-ffi/include/ygg.h`. |
 | `yggdrasil-stack` | `YggStack`: TCP streams/listeners, UDP sockets and ICMPv6 ping over an embedded node. Feature `proxy` (default): SOCKS5 server and port forwarding. Feature `cli`: the `yggdrasil-proxy` tool. |
 
 ## Rust example
@@ -128,8 +129,88 @@ an ephemeral key is used. `--admin` starts the admin socket from the config.
 - The first packets to a node not contacted before are delayed while the
   encrypted session is set up; TCP retransmits the SYN after about 1 s.
 
+## C library (`libygg`)
+
+```bash
+cargo build --release -p yggdrasil-ffi   # target/release/libygg.{so,a}
+cargo build --release -p yggdrasil-ffi --no-default-features   # without ws/quic, smaller
+```
+
+Every connection is returned as an ordinary OS socket: one end of a socket
+pair whose other end the library bridges to the Yggdrasil network. The
+application reads, writes and polls it with its own I/O (select/poll, epoll,
+kqueue, IOCP, Python `socket`/`asyncio`, ...); the data path never calls back
+into the library, and there are no callbacks to marshal across threads.
+
+| Platform | Stream sockets | Datagram sockets |
+|---|---|---|
+| Linux, Android, *BSD | `socketpair(AF_UNIX, SOCK_STREAM)` | `SOCK_SEQPACKET` |
+| macOS, iOS | `socketpair(AF_UNIX, SOCK_STREAM)` | `SOCK_DGRAM` |
+| Windows | loopback TCP pair (`SOCKET`) | connected loopback UDP pair |
+
+```c
+#include "ygg.h"
+
+ygg_node *node = ygg_node_start(config_toml, 0);   /* NULL config: ephemeral */
+if (!node) fprintf(stderr, "%s\n", ygg_last_error_message());
+
+/* Client: a connected stream socket */
+ygg_socket s = ygg_tcp_connect(node, "<hex key>.pk.ygg", 80, 0);
+write(s, req, len); read(s, buf, sizeof buf); close(s);
+
+/* Server: the listener handle becomes readable when a connection is pending */
+ygg_socket l = ygg_tcp_listen(node, 7000);
+/* poll(l, POLLIN) ... */
+char peer[64];
+ygg_socket c = ygg_tcp_accept(node, l, peer, sizeof peer, 0);  /* 0 = don't wait */
+
+/* UDP: each datagram = 16-byte IPv6 address + 2-byte port (BE) + payload */
+uint16_t port;
+ygg_socket u = ygg_udp_bind(node, 0, &port);
+
+int64_t rtt_us = ygg_ping(node, "200:1234::1", 5000);
+char *json = ygg_node_admin(node, "{\"request\":\"getPeers\"}");
+ygg_free_string(json);
+
+int id = ygg_socks5_start(node, "127.0.0.1:1080", NULL, NULL);
+ygg_service_stop(node, id);
+
+ygg_tcp_listener_close(node, l);
+ygg_udp_close(node, u);
+ygg_node_stop(node);
+```
+
+Conventions (details in the header):
+
+- `int` results are `>= 0` on success and `-YGG_ERR_*` on failure; socket
+  results are `YGG_INVALID_SOCKET` and pointer results `NULL` on failure.
+  `ygg_last_error()` / `ygg_last_error_message()` describe the last failure
+  on the calling thread.
+- Calls that wait (start, connect, accept with a timeout, ping, admin) block
+  the calling thread; everything else runs on the library's own threads.
+- Stream sockets close like TCP: `shutdown(SHUT_WR)` sends FIN, `close()`
+  ends the connection.
+- Listener handles and UDP sockets are closed with `ygg_tcp_listener_close` /
+  `ygg_udp_close`, which also stop the network side.
+- `ygg_node_stop` ends every connection (the application's sockets see EOF);
+  the application still closes its own sockets.
+- Logs go nowhere until `ygg_set_logger` installs a callback. Never call
+  `ygg_*` functions from inside the callback.
+- On Windows, initialise Winsock (`WSAStartup`) before using the sockets.
+
+Examples:
+
+- `crates/yggdrasil-ffi/examples/c/ygg_echo.c`: `poll()`-based echo server.
+- `crates/yggdrasil-ffi/examples/python/ygg.py`: ctypes binding returning
+  `socket.socket` objects, with an asyncio client demo:
+
+```python
+from ygg import Node
+with Node('peers = ["tls://peer.example.org:443"]') as node:
+    sock = node.connect("<hex key>.pk.ygg", 7000)      # a normal socket.socket
+    reader, writer = await asyncio.open_connection(sock=sock)
+```
+
 ## Roadmap
 
-- C ABI (`cdylib`/`staticlib`) where each connection is a real OS socket
-  (socketpair), usable from C/C++ event loops, Python `asyncio`, etc.
-- Python and Kotlin bindings on top of it.
+- Native Python package (PyO3) and Kotlin/Android bindings on top of the C API.

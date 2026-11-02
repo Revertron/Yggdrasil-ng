@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use super::UDP_SESSION_TIMEOUT;
 use crate::host::Target;
-use crate::{UdpSocket as YggUdpSocket, YggStack};
+use crate::{TcpListener, UdpSocket as YggUdpSocket, YggStack};
 
 const UDP_BUFFER: usize = 65536;
 
@@ -45,7 +45,11 @@ pub async fn forward_local_tcp(
 /// Accept TCP connections on Yggdrasil `port` and forward them to `target`
 /// on the host network (exposes a local service on the node's address).
 pub async fn forward_remote_tcp(stack: YggStack, port: u16, target: SocketAddr) -> io::Result<()> {
-    let listener = stack.tcp_listen(port)?;
+    serve_remote_tcp(stack.tcp_listen(port)?, target).await
+}
+
+/// [`forward_remote_tcp`] on an already bound Yggdrasil listener.
+pub async fn serve_remote_tcp(listener: TcpListener, target: SocketAddr) -> io::Result<()> {
     loop {
         let (mut remote, from) = listener.accept().await?;
         tokio::spawn(async move {
@@ -161,7 +165,12 @@ async fn local_udp_replies(
 /// the host network. Each Yggdrasil peer gets its own host socket, and replies
 /// from `target` are sent back to that peer.
 pub async fn forward_remote_udp(stack: YggStack, port: u16, target: SocketAddr) -> io::Result<()> {
-    let ygg = Arc::new(stack.udp_bind(port)?);
+    serve_remote_udp(stack.udp_bind(port)?, target).await
+}
+
+/// [`forward_remote_udp`] on an already bound Yggdrasil socket.
+pub async fn serve_remote_udp(socket: YggUdpSocket, target: SocketAddr) -> io::Result<()> {
+    let ygg = Arc::new(socket);
     let sessions: Sessions<SocketAddrV6, tokio::net::UdpSocket> = Arc::default();
     let bind_addr: SocketAddr = if target.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()

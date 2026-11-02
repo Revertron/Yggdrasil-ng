@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ironwood", "crates/yggdrasil", "crates/yggdrasil-stack", "crates/salsa20-simd"]
+members = ["crates/ironwood", "crates/yggdrasil", "crates/yggdrasil-stack", "crates/yggdrasil-ffi", "crates/salsa20-simd"]
 
 # Redirect the transitive salsa20 (ironwood -> crypto_box -> crypto_secretbox ->
 # salsa20) to the local SIMD fork (AVX2/SSE2 on x86, NEON on aarch64; scalar

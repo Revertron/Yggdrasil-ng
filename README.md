@@ -95,7 +95,9 @@ See [docs/CONTAINER.md](docs/CONTAINER.md) for tags, supported platforms, and Do
 
 The node can run inside an application without a TUN adapter or elevated
 privileges. The `yggdrasil-stack` crate puts a userspace TCP/UDP/ICMPv6 stack
-on top of an embedded node and exposes tokio-style sockets.
+on top of an embedded node and exposes tokio-style sockets, a SOCKS5 proxy and
+port forwarding (also as the `yggdrasil-proxy` tool); `yggdrasil-ffi` builds a
+C library (`libygg`) that hands out connections as ordinary OS sockets.
 See [docs/LIBRARY.md](docs/LIBRARY.md).
 
 ## Usage
