@@ -46,6 +46,12 @@ internal object Descriptors {
         }
     }
 
+    /** Close a raw descriptor the library handed over. */
+    fun close(fd: Int) {
+        val (fileDescriptor, owner) = adopt(fd)
+        owner?.close() ?: FileInputStream(fileDescriptor).close()
+    }
+
     private val fdField by lazy {
         FileDescriptor::class.java.getDeclaredField("fd").apply { isAccessible = true }
     }
@@ -89,8 +95,18 @@ class YggListener internal constructor(private val node: YggNode, val port: Int)
         return YggStream(accepted.fd, accepted.peer)
     }
 
+    private var closed = false
+
+    @Synchronized
     override fun close() {
-        if (!node.isClosed()) node.tcpListenerClose(fd)
+        if (closed) return
+        closed = true
+        if (!node.isClosed()) {
+            node.tcpListenerClose(fd)
+        } else {
+            // The node is gone; the handle is ours to close.
+            Descriptors.close(fd)
+        }
     }
 }
 
@@ -132,9 +148,9 @@ class YggUdpSocket internal constructor(private val node: YggNode, requestedPort
         val buf = ByteArray(maxSize + headerLen)
         val n = input.read(buf)
         require(n >= headerLen) { "short datagram" }
-        val host = InetAddress.getByAddress(buf.copyOfRange(0, 16)).hostAddress
+        val host = formatIpv6(buf.copyOfRange(0, 16))
         val port = ((buf[16].toInt() and 0xff) shl 8) or (buf[17].toInt() and 0xff)
-        return YggDatagram(host.substringBefore('%'), port, buf.copyOfRange(headerLen, n))
+        return YggDatagram(host, port, buf.copyOfRange(headerLen, n))
     }
 
     override fun close() {
@@ -146,6 +162,39 @@ class YggUdpSocket internal constructor(private val node: YggNode, requestedPort
             owner?.close() ?: input.close()
         }
     }
+}
+
+/**
+ * RFC 5952 text form of a 16-byte IPv6 address, as the library prints it
+ * (`InetAddress.hostAddress` differs between desktop Java and Android).
+ */
+fun formatIpv6(bytes: ByteArray): String {
+    require(bytes.size == 16) { "IPv6 address must be 16 bytes" }
+    val groups = IntArray(8) { ((bytes[2 * it].toInt() and 0xff) shl 8) or (bytes[2 * it + 1].toInt() and 0xff) }
+    // Longest run of two or more zero groups (first one on ties) becomes "::".
+    var bestStart = -1
+    var bestLen = 1
+    var i = 0
+    while (i < 8) {
+        if (groups[i] != 0) { i++; continue }
+        var j = i
+        while (j < 8 && groups[j] == 0) j++
+        if (j - i > bestLen) { bestStart = i; bestLen = j - i }
+        i = j
+    }
+    val out = StringBuilder()
+    i = 0
+    while (i < 8) {
+        if (i == bestStart) {
+            out.append("::")
+            i += bestLen
+            continue
+        }
+        if (out.isNotEmpty() && out.last() != ':') out.append(':')
+        out.append(Integer.toHexString(groups[i]))
+        i++
+    }
+    return out.toString()
 }
 
 /** Connect over TCP; `host` is an address, hex key or "<key>.pk.ygg". */

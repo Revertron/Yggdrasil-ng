@@ -270,7 +270,7 @@ are `YggException` subclasses (`ConnectionRefused`, `TimedOut`, `WouldBlock`,
 descriptors as `Int`) is available too; on Android wrap a descriptor with
 `ParcelFileDescriptor.adoptFd(fd)`.
 
-Android integration (not built in this repository):
+Android integration in an app:
 
 1. Build the library per ABI, e.g. with
    [cargo-ndk](https://github.com/bbqsrc/cargo-ndk):
@@ -288,6 +288,21 @@ picked up when its bindings are generated.
 `bindings/kotlin` is also a Gradle JVM project whose tests run the bindings
 against `target/debug` (`cargo build -p yggdrasil-uniffi`, then
 `gradle test` in `bindings/kotlin`).
+
+`bindings/android` is an Android library module (AGP 8.7, Gradle 8.14) over
+the same sources. Its instrumented tests run the JVM suite unchanged plus
+Android-specific checks (descriptors adopted by `ParcelFileDescriptor` under
+fdsan, no leaks or double closes over many open/close cycles):
+
+```bash
+rustup target add x86_64-linux-android      # plus aarch64-linux-android etc.
+cargo install cargo-ndk
+ABIS="x86_64" bindings/android/build-native.sh   # needs ANDROID_NDK_HOME
+cd bindings/android && gradle connectedDebugAndroidTest   # device or emulator attached
+```
+
+CI runs them on an API 30 x86_64 emulator. The module can also serve as the
+starting point for an AAR (`gradle assembleRelease` after building all ABIs).
 
 ## Roadmap
 

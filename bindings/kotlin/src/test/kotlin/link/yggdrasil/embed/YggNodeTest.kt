@@ -13,7 +13,19 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
-/** Two nodes in this JVM, peered over loopback. */
+/** InputStream.readNBytes needs Android API 33; tests also run on older devices. */
+internal fun java.io.InputStream.readExactly(n: Int): ByteArray {
+    val buf = ByteArray(n)
+    var off = 0
+    while (off < n) {
+        val r = read(buf, off, n - off)
+        if (r < 0) throw java.io.EOFException("got $off of $n bytes")
+        off += r
+    }
+    return buf
+}
+
+/** Two nodes in this JVM (or Android process), peered over loopback. */
 class YggNodeTest {
     private lateinit var a: YggNode
     private lateinit var b: YggNode
@@ -95,7 +107,7 @@ class YggNodeTest {
     fun forwards() {
         val echo = ServerSocket(0)
         thread(isDaemon = true) {
-            echo.accept().use { c -> c.getOutputStream().write(c.getInputStream().readNBytes(5)) }
+            echo.accept().use { c -> c.getOutputStream().write(c.getInputStream().readExactly(5)) }
         }
         val front = freePort()
         val remote = b.forwardRemoteTcp(80u, "127.0.0.1:${echo.localPort}")
@@ -104,7 +116,7 @@ class YggNodeTest {
         Socket("127.0.0.1", front).use { s ->
             s.soTimeout = 20_000
             s.getOutputStream().write("hello".toByteArray())
-            assertEquals("hello", String(s.getInputStream().readNBytes(5)))
+            assertEquals("hello", String(s.getInputStream().readExactly(5)))
         }
         a.serviceStop(local)
         b.serviceStop(remote)
@@ -127,7 +139,12 @@ class YggNodeTest {
         b.shutdown()
         waiter.join(10_000)
         assertTrue(errors.single() is YggException.Closed)
+        // After shutdown the listener handle is closed by the wrapper itself.
+        val handle = java.io.File("/proc/self/fd/${listener.fd}")
+        val procFs = java.io.File("/proc/self/fd").isDirectory
+        if (procFs) assertTrue(handle.exists(), "listener handle should be open")
         listener.close()
+        if (procFs) assertTrue(!handle.exists(), "listener handle leaked after close")
         assertTrue(b.isClosed())
         assertFailsWith<YggException.Closed> { b.address() }
     }
@@ -151,5 +168,21 @@ class LoggingTest {
         val node = YggNode("multicast_interfaces = []\nadmin_listen = \"none\"\n")
         val key = node.use { it.publicKey() }
         assertTrue(lines.any { it.startsWith("3 ") && it.contains(key) }, lines.joinToString("\n"))
+    }
+}
+
+class FormatTest {
+    private fun bytes(vararg groups: Int) =
+        ByteArray(16) { i -> (groups[i / 2] shr (if (i % 2 == 0) 8 else 0)).toByte() }
+
+    @Test
+    fun matchesRustAddressFormatting() {
+        assertEquals("200:1234:5678:9abc:def0:1:2:3", formatIpv6(bytes(0x200, 0x1234, 0x5678, 0x9abc, 0xdef0, 1, 2, 3)))
+        assertEquals("200:0:1:2:3:4:5:6", formatIpv6(bytes(0x200, 0, 1, 2, 3, 4, 5, 6)))       // single zero group stays
+        assertEquals("200:0:0:1::1", formatIpv6(bytes(0x200, 0, 0, 1, 0, 0, 0, 1)))            // longest run wins
+        assertEquals("200::1:0:0:1:1", formatIpv6(bytes(0x200, 0, 0, 1, 0, 0, 1, 1)))        // tie: first run
+        assertEquals("300::", formatIpv6(bytes(0x300, 0, 0, 0, 0, 0, 0, 0)))
+        assertEquals("::1", formatIpv6(bytes(0, 0, 0, 0, 0, 0, 0, 1)))
+        assertEquals("200:0:0:1:2::", formatIpv6(bytes(0x200, 0, 0, 1, 2, 0, 0, 0)))
     }
 }
