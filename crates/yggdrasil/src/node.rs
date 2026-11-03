@@ -31,6 +31,7 @@ use crate::config::Config;
 use crate::core::Core;
 use crate::firewall::Firewall;
 use crate::ipv6rwc::ReadWriteCloser;
+use crate::multicast::NetworkInterface;
 #[cfg(feature = "tun")]
 use crate::tun::TunAdapter;
 
@@ -64,6 +65,7 @@ pub struct NodeBuilder {
     admin: bool,
     admin_required: bool,
     multicast: bool,
+    network_interfaces: Option<Vec<NetworkInterface>>,
 }
 
 impl NodeBuilder {
@@ -74,6 +76,7 @@ impl NodeBuilder {
             admin: true,
             admin_required: false,
             multicast: true,
+            network_interfaces: None,
             signing_key: None,
             config,
         }
@@ -109,6 +112,16 @@ impl NodeBuilder {
     }
 
     /// Enable or disable multicast peer discovery.
+    /// Network interfaces for multicast discovery from an external source
+    /// (e.g. Android's ConnectivityManager, where `getifaddrs()` is
+    /// restricted). Multicast only follows external interfaces if they are
+    /// known when it starts, so mobile apps should pass them here and update
+    /// them later with `Core::update_network_interfaces`.
+    pub fn network_interfaces(mut self, interfaces: Vec<NetworkInterface>) -> Self {
+        self.network_interfaces = Some(interfaces);
+        self
+    }
+
     pub fn multicast(mut self, enable: bool) -> Self {
         self.multicast = enable;
         self
@@ -160,6 +173,9 @@ impl NodeBuilder {
         };
 
         let core = Core::new(signing_key, config.clone());
+        if let Some(interfaces) = self.network_interfaces {
+            core.update_network_interfaces(interfaces);
+        }
         tracing::info!("Your IPv6 address is {}", core.address());
         tracing::info!("Your IPv6 subnet is {}", core.subnet());
         tracing::info!("Your public key is {}", hex::encode(core.public_key()));

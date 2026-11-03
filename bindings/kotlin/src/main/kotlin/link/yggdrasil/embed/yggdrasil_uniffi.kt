@@ -31,6 +31,13 @@ import java.nio.charset.CodingErrorAction
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 
 // This is a helper for safely working with byte buffers returned from the Rust code.
 // A rust-owned buffer is represented by its capacity, its current length, and a
@@ -723,6 +730,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_yggdrasil_uniffi_checksum_method_yggnode_is_closed(
     ): Int
+    external fun uniffi_yggdrasil_uniffi_checksum_method_yggnode_network_changed(
+    ): Int
     external fun uniffi_yggdrasil_uniffi_checksum_method_yggnode_ping(
     ): Int
     external fun uniffi_yggdrasil_uniffi_checksum_method_yggnode_public_key(
@@ -733,6 +742,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_yggdrasil_uniffi_checksum_method_yggnode_service_stop(
     ): Int
+    external fun uniffi_yggdrasil_uniffi_checksum_method_yggnode_set_network_interfaces(
+    ): Int
     external fun uniffi_yggdrasil_uniffi_checksum_method_yggnode_shutdown(
     ): Int
     external fun uniffi_yggdrasil_uniffi_checksum_method_yggnode_socks5_start(
@@ -742,6 +753,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_yggdrasil_uniffi_checksum_method_yggnode_tcp_accept(
     ): Int
     external fun uniffi_yggdrasil_uniffi_checksum_method_yggnode_tcp_connect(
+    ): Int
+    external fun uniffi_yggdrasil_uniffi_checksum_method_yggnode_tcp_connect_async(
     ): Int
     external fun uniffi_yggdrasil_uniffi_checksum_method_yggnode_tcp_listen(
     ): Int
@@ -786,7 +799,7 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_yggdrasil_uniffi_fn_free_yggnode(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    external fun uniffi_yggdrasil_uniffi_fn_constructor_yggnode_new(`configToml`: RustBuffer.ByValue,`admin`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_yggdrasil_uniffi_fn_constructor_yggnode_new(`configToml`: RustBuffer.ByValue,`admin`: Byte,`networkInterfaces`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_add_peer(`ptr`: Long,`uri`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -804,6 +817,8 @@ internal object UniffiLib {
     ): Int
     external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_is_closed(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_network_changed(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_ping(`ptr`: Long,`host`: RustBuffer.ByValue,`timeoutMs`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_public_key(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -813,6 +828,8 @@ internal object UniffiLib {
     external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_resolve(`ptr`: Long,`host`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_service_stop(`ptr`: Long,`id`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_set_network_interfaces(`ptr`: Long,`interfaces`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_shutdown(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -824,6 +841,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_tcp_connect(`ptr`: Long,`host`: RustBuffer.ByValue,`port`: Short,`timeoutMs`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
+    external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_tcp_connect_async(`ptr`: Long,`host`: RustBuffer.ByValue,`port`: Short,`timeoutMs`: RustBuffer.ByValue,
+    ): Long
     external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_tcp_listen(`ptr`: Long,`port`: Short,uniffi_out_err: UniffiRustCallStatus, 
     ): Int
     external fun uniffi_yggdrasil_uniffi_fn_method_yggnode_tcp_listener_close(`ptr`: Long,`listener`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -998,6 +1017,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_yggdrasil_uniffi_checksum_method_yggnode_is_closed() and 0xFFFF) != 21054) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_yggdrasil_uniffi_checksum_method_yggnode_network_changed() and 0xFFFF) != 54718) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_yggdrasil_uniffi_checksum_method_yggnode_ping() and 0xFFFF) != 45233) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1011,6 +1033,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_yggdrasil_uniffi_checksum_method_yggnode_service_stop() and 0xFFFF) != 58743) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_yggdrasil_uniffi_checksum_method_yggnode_set_network_interfaces() and 0xFFFF) != 43677) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_yggdrasil_uniffi_checksum_method_yggnode_shutdown() and 0xFFFF) != 51851) {
@@ -1028,6 +1053,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_yggdrasil_uniffi_checksum_method_yggnode_tcp_connect() and 0xFFFF) != 62260) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_yggdrasil_uniffi_checksum_method_yggnode_tcp_connect_async() and 0xFFFF) != 60564) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_yggdrasil_uniffi_checksum_method_yggnode_tcp_listen() and 0xFFFF) != 24093) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1040,7 +1068,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_yggdrasil_uniffi_checksum_method_yggnode_udp_close() and 0xFFFF) != 62312) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_yggdrasil_uniffi_checksum_constructor_yggnode_new() and 0xFFFF) != 49728) {
+    if ((lib.uniffi_yggdrasil_uniffi_checksum_constructor_yggnode_new() and 0xFFFF) != 53152) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1056,6 +1084,46 @@ public fun uniffiEnsureInitialized() {
 }
 
 // Async support
+// Async return type handlers
+
+internal const val UNIFFI_RUST_FUTURE_POLL_READY = 0.toByte()
+internal const val UNIFFI_RUST_FUTURE_POLL_WAKE = 1.toByte()
+
+internal val uniffiContinuationHandleMap = UniffiHandleMap<CancellableContinuation<Byte>>()
+
+// FFI type for Rust future continuations
+internal object uniffiRustFutureContinuationCallbackImpl: UniffiRustFutureContinuationCallback {
+    override fun callback(data: Long, pollResult: Byte) {
+        uniffiContinuationHandleMap.remove(data).resume(pollResult)
+    }
+}
+
+internal suspend fun<T, F, E: kotlin.Exception> uniffiRustCallAsync(
+    rustFuture: Long,
+    pollFunc: (Long, UniffiRustFutureContinuationCallback, Long) -> Unit,
+    completeFunc: (Long, UniffiRustCallStatus) -> F,
+    freeFunc: (Long) -> Unit,
+    liftFunc: (F) -> T,
+    errorHandler: UniffiRustCallStatusErrorHandler<E>
+): T {
+    try {
+        do {
+            val pollResult = suspendCancellableCoroutine<Byte> { continuation ->
+                pollFunc(
+                    rustFuture,
+                    uniffiRustFutureContinuationCallbackImpl,
+                    uniffiContinuationHandleMap.insert(continuation)
+                )
+            }
+        } while (pollResult != UNIFFI_RUST_FUTURE_POLL_READY);
+
+        return liftFunc(
+            uniffiRustCallWithError(errorHandler, { status -> completeFunc(rustFuture, status) })
+        )
+    } finally {
+        freeFunc(rustFuture)
+    }
+}
 
 // Public interface members begin here.
 
@@ -1862,6 +1930,13 @@ public interface YggNodeInterface {
     fun `isClosed`(): kotlin.Boolean
     
     /**
+     * Call when the network changed (`ConnectivityManager.NetworkCallback`,
+     * Wi-Fi <-> mobile, resume from Doze): peers that are down are redialled
+     * now instead of after their backoff, and the node re-announces itself.
+     */
+    fun `networkChanged`()
+    
+    /**
      * Round-trip time in microseconds. `timeout_ms` null: 5 s.
      */
     fun `ping`(`host`: kotlin.String, `timeoutMs`: kotlin.UInt? = null): kotlin.ULong
@@ -1879,6 +1954,11 @@ public interface YggNodeInterface {
     fun `resolve`(`host`: kotlin.String): kotlin.String
     
     fun `serviceStop`(`id`: kotlin.Int)
+    
+    /**
+     * Replace the interfaces used by multicast discovery.
+     */
+    fun `setNetworkInterfaces`(`interfaces`: List<NetworkInterface>)
     
     /**
      * Stop the node. Idempotent; wakes threads blocked in `tcp_accept`.
@@ -1906,6 +1986,13 @@ public interface YggNodeInterface {
      * null: 30 s.
      */
     fun `tcpConnect`(`host`: kotlin.String, `port`: kotlin.UShort, `timeoutMs`: kotlin.UInt? = null): kotlin.Int
+    
+    /**
+     * Connect without blocking a thread (a Kotlin `suspend fun`); returns the
+     * connected stream socket (fd). Cancelling the coroutine abandons the
+     * connect. `timeout_ms` null: 30 s.
+     */
+    suspend fun `tcpConnectAsync`(`host`: kotlin.String, `port`: kotlin.UShort, `timeoutMs`: kotlin.UInt? = null): kotlin.Int
     
     /**
      * Listen on `port`. The returned fd becomes readable when a connection
@@ -1958,15 +2045,20 @@ open class YggNode: Disposable, AutoCloseable, YggNodeInterface
     /**
      * Start a node from TOML configuration (null: defaults with an ephemeral
      * key). TUN settings are ignored; `admin` also starts the admin socket.
+     * `network_interfaces`: interfaces for multicast discovery supplied by
+     * the app (on Android from ConnectivityManager, as `getifaddrs()` is
+     * restricted). Multicast only follows supplied interfaces if they are
+     * given here; update them with [`set_network_interfaces`].
      */
-    constructor(`configToml`: kotlin.String? = null, `admin`: kotlin.Boolean = false) :
+    constructor(`configToml`: kotlin.String? = null, `admin`: kotlin.Boolean = false, `networkInterfaces`: List<NetworkInterface>? = null) :
         this(UniffiWithHandle, 
     uniffiRustCallWithError(YggException) { _status ->
     UniffiLib.uniffi_yggdrasil_uniffi_fn_constructor_yggnode_new(
     
         
         FfiConverterOptionalString.lower(`configToml`),
-        FfiConverterBoolean.lower(`admin`),_status)
+        FfiConverterBoolean.lower(`admin`),
+        FfiConverterOptionalSequenceTypeNetworkInterface.lower(`networkInterfaces`),_status)
 }
     )
 
@@ -2177,6 +2269,24 @@ open class YggNode: Disposable, AutoCloseable, YggNodeInterface
 
     
     /**
+     * Call when the network changed (`ConnectivityManager.NetworkCallback`,
+     * Wi-Fi <-> mobile, resume from Doze): peers that are down are redialled
+     * now instead of after their backoff, and the node re-announces itself.
+     */
+    @Throws(YggException::class)override fun `networkChanged`()
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(YggException) { _status ->
+    UniffiLib.uniffi_yggdrasil_uniffi_fn_method_yggnode_network_changed(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
      * Round-trip time in microseconds. `timeout_ms` null: 5 s.
      */
     @Throws(YggException::class)override fun `ping`(`host`: kotlin.String, `timeoutMs`: kotlin.UInt?): kotlin.ULong {
@@ -2252,6 +2362,23 @@ open class YggNode: Disposable, AutoCloseable, YggNodeInterface
         it,
         
         FfiConverterInt.lower(`id`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Replace the interfaces used by multicast discovery.
+     */
+    @Throws(YggException::class)override fun `setNetworkInterfaces`(`interfaces`: List<NetworkInterface>)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(YggException) { _status ->
+    UniffiLib.uniffi_yggdrasil_uniffi_fn_method_yggnode_set_network_interfaces(
+        it,
+        
+        FfiConverterSequenceTypeNetworkInterface.lower(`interfaces`),_status)
 }
     }
     
@@ -2349,6 +2476,35 @@ open class YggNode: Disposable, AutoCloseable, YggNodeInterface
     )
     }
     
+
+    
+    /**
+     * Connect without blocking a thread (a Kotlin `suspend fun`); returns the
+     * connected stream socket (fd). Cancelling the coroutine abandons the
+     * connect. `timeout_ms` null: 30 s.
+     */
+    @Throws(YggException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `tcpConnectAsync`(`host`: kotlin.String, `port`: kotlin.UShort, `timeoutMs`: kotlin.UInt?) : kotlin.Int {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_yggdrasil_uniffi_fn_method_yggnode_tcp_connect_async(
+                uniffiHandle,
+                
+        FfiConverterString.lower(`host`),
+        FfiConverterUShort.lower(`port`),
+        FfiConverterOptionalUInt.lower(`timeoutMs`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_yggdrasil_uniffi_rust_future_poll_i32(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_yggdrasil_uniffi_rust_future_complete_i32(future, continuation) },
+        { future -> UniffiLib.ffi_yggdrasil_uniffi_rust_future_free_i32(future) },
+        // lift function
+        { FfiConverterInt.lift(it) },
+        // Error FFI converter
+        YggException.ErrorHandler,
+    )
+    }
 
     
     /**
@@ -2497,6 +2653,58 @@ public object FfiConverterTypeAccepted: FfiConverterRustBuffer<Accepted> {
     override fun write(value: Accepted, buf: ByteBuffer) {
             FfiConverterInt.write(value.`fd`, buf)
             FfiConverterString.write(value.`peer`, buf)
+    }
+}
+
+
+
+/**
+ * A network interface supplied by the app for multicast discovery.
+ */
+data class NetworkInterface (
+    var `name`: kotlin.String
+    , 
+    /**
+     * Interface index (as from `NetworkInterface.getIndex()` on Android).
+     */
+    var `index`: kotlin.UInt
+    , 
+    /**
+     * IPv6 addresses of the interface, e.g. "fe80::1234".
+     */
+    var `addrs`: List<kotlin.String>
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNetworkInterface: FfiConverterRustBuffer<NetworkInterface> {
+    override fun read(buf: ByteBuffer): NetworkInterface {
+        return NetworkInterface(
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterSequenceString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: NetworkInterface) = (
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterUInt.allocationSize(value.`index`) +
+            FfiConverterSequenceString.allocationSize(value.`addrs`)
+    )
+
+    override fun write(value: NetworkInterface, buf: ByteBuffer) {
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterUInt.write(value.`index`, buf)
+            FfiConverterSequenceString.write(value.`addrs`, buf)
     }
 }
 
@@ -2715,6 +2923,102 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         }
     }
 }
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalSequenceTypeNetworkInterface: FfiConverterRustBuffer<List<NetworkInterface>?> {
+    override fun read(buf: ByteBuffer): List<NetworkInterface>? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterSequenceTypeNetworkInterface.read(buf)
+    }
+
+    override fun allocationSize(value: List<NetworkInterface>?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterSequenceTypeNetworkInterface.allocationSize(value)
+        }
+    }
+
+    override fun write(value: List<NetworkInterface>?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterSequenceTypeNetworkInterface.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.String>> {
+    override fun read(buf: ByteBuffer): List<kotlin.String> {
+        val len = buf.getInt()
+        return List<kotlin.String>(len) {
+            FfiConverterString.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<kotlin.String>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterString.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<kotlin.String>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterString.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeNetworkInterface: FfiConverterRustBuffer<List<NetworkInterface>> {
+    override fun read(buf: ByteBuffer): List<NetworkInterface> {
+        val len = buf.getInt()
+        return List<NetworkInterface>(len) {
+            FfiConverterTypeNetworkInterface.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<NetworkInterface>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeNetworkInterface.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<NetworkInterface>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeNetworkInterface.write(it, buf)
+        }
+    }
+}
+
+
+
+
+
+
+
+
         /**
          * A new TOML configuration with a fresh private key.
          */ fun `generateConfig`(): kotlin.String {

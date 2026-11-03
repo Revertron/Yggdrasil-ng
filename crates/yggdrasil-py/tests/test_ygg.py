@@ -184,3 +184,60 @@ def test_close_wakes_blocked_accept():
     assert node.closed
     with pytest.raises(ConnectionError):
         node.connect("200::1", 80)
+
+
+def test_connect_async_does_not_block(pair):
+    a, b = pair
+
+    async def main():
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        async def handle(reader, writer):
+            writer.write(await reader.readline())
+            await writer.drain()
+            writer.close()
+
+        async with await b.start_server(handle, 7010):
+            t = asyncio.create_task(ticker())
+            sock = await a.connect_async(f"{b.public_key}.pk.ygg", 7010, timeout=20)
+            # No thread-pool thread was needed for the connect.
+            assert not any(th.name.startswith("asyncio_") for th in threading.enumerate())
+            reader, writer = await asyncio.open_connection(sock=sock)
+            writer.write(b"line\n")
+            await writer.drain()
+            assert await asyncio.wait_for(reader.readline(), 10) == b"line\n"
+            writer.close()
+
+            with pytest.raises(ConnectionRefusedError):
+                await a.connect_async(b.address, 7999, timeout=20)
+
+            # Cancelling the task abandons a connect that cannot complete.
+            pending = asyncio.create_task(a.connect_async("200:dead:beef::1", 80))
+            await asyncio.sleep(0.2)
+            assert not pending.done()
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            t.cancel()
+        return ticks
+
+    assert asyncio.run(main()) > 0
+
+
+def test_network_hooks(pair):
+    a, b = pair
+    a.network_changed()
+    a.set_network_interfaces([("wlan0", 3, ["fe80::1"])])
+    with pytest.raises(ValueError):
+        a.set_network_interfaces([("wlan0", 3, ["not an address"])])
+    with ygg.Node(multicast=False, network_interfaces=[("lo", 1, ["::1"])]) as n:
+        n.network_changed()
+        n.close()
+        with pytest.raises(ConnectionError):
+            n.network_changed()

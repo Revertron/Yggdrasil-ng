@@ -103,6 +103,14 @@ int ygg_set_logger(ygg_log_fn callback, void *userdata, const char *filter);
 ygg_node *ygg_node_start(const char *config_toml, uint32_t flags);
 
 /*
+ * Like ygg_node_start, also passing the network interfaces for multicast
+ * discovery (JSON, see ygg_node_set_network_interfaces; NULL for none). Apps
+ * that supply interfaces themselves (e.g. Android, where getifaddrs() is
+ * restricted) must pass them here for multicast to follow later updates.
+ */
+ygg_node *ygg_node_start_ex(const char *config_toml, uint32_t flags, const char *interfaces_json);
+
+/*
  * Stop the node and free it. Sockets it handed out see EOF; the application
  * still closes them itself (close()/closesocket()).
  */
@@ -116,6 +124,19 @@ int ygg_node_public_key(const ygg_node *node, char *buf, size_t len); /* 64 hex 
 
 int ygg_node_add_peer(const ygg_node *node, const char *uri);    /* "tls://host:port" */
 int ygg_node_remove_peer(const ygg_node *node, const char *uri);
+
+/*
+ * Call when the network changed (interface up/down, Wi-Fi <-> mobile,
+ * resume from sleep/Doze): peers that are down are redialled immediately
+ * instead of after their backoff, and the node re-announces itself.
+ */
+int ygg_node_network_changed(const ygg_node *node);
+
+/*
+ * Replace the interfaces used by multicast discovery, as JSON:
+ *   [{"name":"wlan0","index":3,"addrs":["fe80::1234"]}]
+ */
+int ygg_node_set_network_interfaces(const ygg_node *node, const char *interfaces_json);
 
 /*
  * Run an admin API request in-process, e.g. "{\"request\":\"getPeers\"}" or
@@ -133,6 +154,19 @@ char *ygg_node_admin(const ygg_node *node, const char *request_json);
  * close it when done.
  */
 ygg_socket ygg_tcp_connect(const ygg_node *node, const char *host, uint16_t port, int timeout_ms);
+
+/*
+ * Non-blocking connect for event loops. ygg_tcp_connect_start returns a
+ * pending handle that becomes readable when the outcome is known (do not
+ * read or write it). ygg_tcp_connect_finish then returns the connected
+ * stream socket, or YGG_INVALID_SOCKET with the connect error; before that
+ * it fails with YGG_ERR_WOULD_BLOCK. Once the outcome has been returned the
+ * pending handle is closed. ygg_tcp_connect_cancel abandons the connect and
+ * closes the handle.
+ */
+ygg_socket ygg_tcp_connect_start(const ygg_node *node, const char *host, uint16_t port, int timeout_ms);
+ygg_socket ygg_tcp_connect_finish(const ygg_node *node, ygg_socket pending);
+int ygg_tcp_connect_cancel(const ygg_node *node, ygg_socket pending);
 
 /*
  * Listen on `port` of the node's address. The returned socket is only a

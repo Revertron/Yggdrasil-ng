@@ -15,7 +15,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use yggdrasil_embed::{EmbeddedNode, Host, StartOptions, Target};
+use yggdrasil_embed::{EmbeddedNode, Host, NetworkInterface, StartOptions, Target};
 
 pub use error::*;
 pub use yggdrasil_embed::{CSocket, INVALID_SOCKET};
@@ -95,6 +95,24 @@ fn target_arg(host: *const c_char, port: u16) -> Result<Target> {
         return Err(Error::invalid("port is 0"));
     }
     Ok(Target { host, port })
+}
+
+#[derive(serde::Deserialize)]
+struct InterfaceJson {
+    name: String,
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    addrs: Vec<std::net::Ipv6Addr>,
+}
+
+fn parse_interfaces(json: &str) -> Result<Vec<NetworkInterface>> {
+    let parsed: Vec<InterfaceJson> =
+        serde_json::from_str(json).map_err(|e| Error::invalid(format!("invalid interfaces JSON: {e}")))?;
+    Ok(parsed
+        .into_iter()
+        .map(|i| NetworkInterface { name: i.name, index: i.index, addrs: i.addrs })
+        .collect())
 }
 
 fn socket_addr_arg(p: *const c_char, what: &str) -> Result<SocketAddr> {
@@ -178,10 +196,43 @@ pub extern "C" fn ygg_set_logger(callback: Option<LogFn>, userdata: *mut c_void,
 /// key). Returns NULL on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn ygg_node_start(config_toml: *const c_char, flags: u32) -> *mut YggNode {
+    ygg_node_start_ex(config_toml, flags, std::ptr::null())
+}
+
+/// Like ygg_node_start, also taking the network interfaces for multicast
+/// discovery as JSON (see ygg_node_set_network_interfaces); NULL for none.
+#[unsafe(no_mangle)]
+pub extern "C" fn ygg_node_start_ex(
+    config_toml: *const c_char,
+    flags: u32,
+    interfaces_json: *const c_char,
+) -> *mut YggNode {
     guard(std::ptr::null_mut(), || {
-        let options = StartOptions { admin: flags & YGG_START_ADMIN != 0 };
+        let options = StartOptions {
+            admin: flags & YGG_START_ADMIN != 0,
+            network_interfaces: opt_str_arg(interfaces_json, "interfaces")?
+                .map(parse_interfaces)
+                .transpose()?,
+        };
         let node = EmbeddedNode::start_toml(opt_str_arg(config_toml, "config")?, options)?;
         Ok(Box::into_raw(Box::new(node)))
+    })
+}
+
+/// The network changed (interface up/down, Wi-Fi <-> mobile, resume from
+/// Doze): redial peers that are down now and re-announce the node.
+#[unsafe(no_mangle)]
+pub extern "C" fn ygg_node_network_changed(node: *const YggNode) -> i32 {
+    guard_int(|| node_arg(node)?.network_changed().map(|_| 0))
+}
+
+/// Replace the interfaces used by multicast discovery, as JSON:
+/// `[{"name":"wlan0","index":3,"addrs":["fe80::1"]}]`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ygg_node_set_network_interfaces(node: *const YggNode, interfaces_json: *const c_char) -> i32 {
+    guard_int(|| {
+        let interfaces = parse_interfaces(str_arg(interfaces_json, "interfaces")?)?;
+        node_arg(node)?.set_network_interfaces(interfaces).map(|_| 0)
     })
 }
 
@@ -255,6 +306,34 @@ pub extern "C" fn ygg_tcp_connect(node: *const YggNode, host: *const c_char, por
     guard(INVALID_SOCKET, || {
         node_arg(node)?.tcp_connect(&target_arg(host, port)?, timeout_arg(timeout_ms))
     })
+}
+
+/// Start a connect without blocking. Returns a pending handle that becomes
+/// readable when the outcome is known; then call ygg_tcp_connect_finish.
+#[unsafe(no_mangle)]
+pub extern "C" fn ygg_tcp_connect_start(
+    node: *const YggNode,
+    host: *const c_char,
+    port: u16,
+    timeout_ms: i32,
+) -> CSocket {
+    guard(INVALID_SOCKET, || {
+        node_arg(node)?.tcp_connect_start(target_arg(host, port)?, timeout_arg(timeout_ms))
+    })
+}
+
+/// Outcome of ygg_tcp_connect_start: YGG_ERR_WOULD_BLOCK while running,
+/// then the connected stream socket or the connect error. The pending handle
+/// is closed once the outcome has been returned.
+#[unsafe(no_mangle)]
+pub extern "C" fn ygg_tcp_connect_finish(node: *const YggNode, pending: CSocket) -> CSocket {
+    guard(INVALID_SOCKET, || node_arg(node)?.tcp_connect_finish(pending))
+}
+
+/// Abandon a connect from ygg_tcp_connect_start and close its handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn ygg_tcp_connect_cancel(node: *const YggNode, pending: CSocket) -> i32 {
+    guard_int(|| node_arg(node)?.tcp_connect_cancel(pending).map(|_| 0))
 }
 
 /// Listen on `port`. The returned socket becomes readable when a connection

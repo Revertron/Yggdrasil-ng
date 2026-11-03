@@ -51,6 +51,21 @@ fn socket_addr(s: &str) -> PyResult<SocketAddr> {
         .map_err(|_| PyValueError::new_err(format!("{s:?} is not an IP:port address")))
 }
 
+/// (name, index, [IPv6 address, ...]) as passed from Python.
+type Interface = (String, u32, Vec<String>);
+
+fn interfaces(list: Vec<Interface>) -> PyResult<Vec<embed::NetworkInterface>> {
+    list.into_iter()
+        .map(|(name, index, addrs)| {
+            let addrs = addrs
+                .iter()
+                .map(|a| a.parse().map_err(|_| PyValueError::new_err(format!("{a:?} is not an IPv6 address"))))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(embed::NetworkInterface { name, index, addrs })
+        })
+        .collect()
+}
+
 /// Seconds (float) to a duration; `None` stays `None`, negatives are rejected.
 fn duration(seconds: Option<f64>) -> PyResult<Option<Duration>> {
     match seconds {
@@ -98,12 +113,51 @@ impl NativeNode {
 #[pymethods]
 impl NativeNode {
     #[new]
-    #[pyo3(signature = (config_toml=None, admin=false))]
-    fn new(py: Python<'_>, config_toml: Option<String>, admin: bool) -> PyResult<Self> {
+    #[pyo3(signature = (config_toml=None, admin=false, network_interfaces=None))]
+    fn new(
+        py: Python<'_>,
+        config_toml: Option<String>,
+        admin: bool,
+        network_interfaces: Option<Vec<Interface>>,
+    ) -> PyResult<Self> {
+        let network_interfaces = network_interfaces.map(interfaces).transpose()?;
+        let options = StartOptions { admin, network_interfaces };
         let node = py
-            .detach(move || EmbeddedNode::start_toml(config_toml.as_deref(), StartOptions { admin }))
+            .detach(move || EmbeddedNode::start_toml(config_toml.as_deref(), options))
             .map_err(to_py)?;
         Ok(Self { node: Mutex::new(Some(Arc::new(node))) })
+    }
+
+    /// Redial peers that are down now and re-announce the node.
+    fn network_changed(&self, py: Python<'_>) -> PyResult<()> {
+        self.call(py, |n| n.network_changed())
+    }
+
+    /// Interfaces for multicast discovery: [(name, index, [ipv6, ...]), ...].
+    fn set_network_interfaces(&self, py: Python<'_>, network_interfaces: Vec<Interface>) -> PyResult<()> {
+        let list = interfaces(network_interfaces)?;
+        self.call(py, move |n| n.set_network_interfaces(list))
+    }
+
+    /// Start a non-blocking connect; returns a handle that turns readable
+    /// when tcp_connect_finish has the outcome.
+    #[pyo3(signature = (host, port, timeout=None))]
+    fn tcp_connect_start(&self, py: Python<'_>, host: &str, port: u16, timeout: Option<f64>) -> PyResult<i64> {
+        if port == 0 {
+            return Err(PyValueError::new_err("port is 0"));
+        }
+        let target = Target { host: parse(host)?, port };
+        let timeout = duration(timeout)?;
+        self.call(py, move |n| n.tcp_connect_start(target, timeout).map(sock))
+    }
+
+    /// Socket handle of the finished connect; BlockingIOError while running.
+    fn tcp_connect_finish(&self, py: Python<'_>, pending: i64) -> PyResult<i64> {
+        self.call(py, move |n| n.tcp_connect_finish(csock(pending)).map(sock))
+    }
+
+    fn tcp_connect_cancel(&self, py: Python<'_>, pending: i64) -> PyResult<()> {
+        self.call(py, move |n| n.tcp_connect_cancel(csock(pending)))
     }
 
     fn address(&self, py: Python<'_>) -> PyResult<String> {

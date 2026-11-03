@@ -201,7 +201,32 @@ fun formatIpv6(bytes: ByteArray): String {
 fun YggNode.connect(host: String, port: Int, timeoutMs: Int? = null): YggStream =
     YggStream(tcpConnect(host, port.toUShort(), timeoutMs?.toUInt()), null)
 
+/**
+ * Connect over TCP without blocking a thread. Cancelling the coroutine
+ * abandons the connect.
+ */
+suspend fun YggNode.connectAsync(host: String, port: Int, timeoutMs: Int? = null): YggStream =
+    YggStream(tcpConnectAsync(host, port.toUShort(), timeoutMs?.toUInt()), null)
+
 fun YggNode.listen(port: Int): YggListener = YggListener(this, port)
+
+/**
+ * Describe a system interface for multicast discovery, e.g. the one named by
+ * `LinkProperties.interfaceName` in an Android `NetworkCallback`.
+ */
+fun java.net.NetworkInterface.toYgg(): NetworkInterface = NetworkInterface(
+    name = name,
+    index = index.coerceAtLeast(0).toUInt(),
+    addrs = inetAddresses.toList()
+        .filterIsInstance<Inet6Address>()
+        .map { formatIpv6(it.address) },
+)
+
+/** All interfaces that are up and not loopback, for [YggNode.setNetworkInterfaces]. */
+fun systemNetworkInterfaces(): List<NetworkInterface> =
+    java.net.NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+        .filter { runCatching { it.isUp && !it.isLoopback }.getOrDefault(false) }
+        .map { it.toYgg() }
 
 fun YggNode.udp(port: Int = 0): YggUdpSocket = YggUdpSocket(this, port)
 

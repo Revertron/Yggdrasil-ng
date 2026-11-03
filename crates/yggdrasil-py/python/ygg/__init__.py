@@ -81,6 +81,7 @@ class Node:
         listen: Iterable[str] = (),
         multicast: Optional[bool] = None,
         admin: bool = False,
+        network_interfaces: Optional[Iterable[Tuple[str, int, Iterable[str]]]] = None,
     ) -> None:
         extra = []
         peers, listen = list(peers), list(listen)
@@ -94,7 +95,10 @@ class Node:
             # Top-level keys must precede any [table] in TOML; a key given both
             # here and in `config` is reported as a duplicate (ValueError).
             config = "\n".join(extra) + "\n" + (config or "")
-        self._native = _native.NativeNode(config, admin)
+        interfaces = None
+        if network_interfaces is not None:
+            interfaces = [(name, index, list(addrs)) for name, index, addrs in network_interfaces]
+        self._native = _native.NativeNode(config, admin, interfaces)
 
     # ---- identity and control
 
@@ -110,6 +114,18 @@ class Node:
     def public_key(self) -> str:
         """Hex-encoded public key; `f"{node.public_key}.pk.ygg"` names this node."""
         return self._native.public_key()
+
+    def network_changed(self) -> None:
+        """Call when the network changed (interface up/down, Wi-Fi <-> mobile,
+        resume from sleep): peers that are down are redialled now instead of
+        after their backoff, and the node re-announces itself."""
+        self._native.network_changed()
+
+    def set_network_interfaces(self, interfaces: Iterable[Tuple[str, int, Iterable[str]]]) -> None:
+        """Interfaces for multicast discovery, as (name, index, [IPv6, ...]).
+        Pass them to the constructor too: multicast only follows supplied
+        interfaces if they are known when it starts."""
+        self._native.set_network_interfaces([(n, i, list(a)) for n, i, a in interfaces])
 
     def add_peer(self, uri: str) -> None:
         self._native.add_peer(uri)
@@ -143,9 +159,40 @@ class Node:
         return Listener(self, port)
 
     async def connect_async(self, host: str, port: int, timeout: Optional[float] = None) -> socket.socket:
+        """Connect without blocking the event loop (or a thread): waits for
+        the pending handle with `loop.add_reader`. Cancelling the task
+        abandons the connect."""
         loop = asyncio.get_running_loop()
-        fd = await loop.run_in_executor(None, self._native.tcp_connect, host, port, timeout)
-        return socket.socket(fileno=fd)
+        native = self._native
+        pending = native.tcp_connect_start(host, port, timeout)
+        outcome_taken = False
+        try:
+            while True:
+                try:
+                    fd = native.tcp_connect_finish(pending)
+                    outcome_taken = True
+                    return socket.socket(fileno=fd)
+                except BlockingIOError:
+                    pass
+                except BaseException:
+                    outcome_taken = True  # the error was the outcome; handle is closed
+                    raise
+                ready = loop.create_future()
+                try:
+                    loop.add_reader(pending, lambda: ready.done() or ready.set_result(None))
+                except NotImplementedError:
+                    # Event loops without add_reader (Windows proactor).
+                    native.tcp_connect_cancel(pending)
+                    outcome_taken = True
+                    fd = await loop.run_in_executor(None, native.tcp_connect, host, port, timeout)
+                    return socket.socket(fileno=fd)
+                try:
+                    await ready
+                finally:
+                    loop.remove_reader(pending)
+        finally:
+            if not outcome_taken and not native.closed():
+                native.tcp_connect_cancel(pending)
 
     async def open_connection(
         self, host: str, port: int, timeout: Optional[float] = None, **kwargs: Any

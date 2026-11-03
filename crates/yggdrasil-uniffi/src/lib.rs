@@ -87,6 +87,35 @@ fn csock(fd: i32) -> embed::CSocket {
     fd as embed::CSocket
 }
 
+/// A network interface supplied by the app for multicast discovery.
+#[derive(uniffi::Record)]
+pub struct NetworkInterface {
+    pub name: String,
+    /// Interface index (as from `NetworkInterface.getIndex()` on Android).
+    pub index: u32,
+    /// IPv6 addresses of the interface, e.g. "fe80::1234".
+    pub addrs: Vec<String>,
+}
+
+fn convert_interfaces(list: Vec<NetworkInterface>) -> Result<Vec<embed::NetworkInterface>> {
+    list.into_iter()
+        .map(|i| {
+            let addrs = i
+                .addrs
+                .iter()
+                .map(|a| {
+                    a.split('%')
+                        .next()
+                        .unwrap_or(a)
+                        .parse()
+                        .map_err(|_| YggException::InvalidArgument(format!("{a:?} is not an IPv6 address")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(embed::NetworkInterface { name: i.name, index: i.index, addrs })
+        })
+        .collect()
+}
+
 /// A connection accepted by [`YggNode::tcp_accept`].
 #[derive(uniffi::Record)]
 pub struct Accepted {
@@ -163,10 +192,47 @@ impl YggNode {
 impl YggNode {
     /// Start a node from TOML configuration (null: defaults with an ephemeral
     /// key). TUN settings are ignored; `admin` also starts the admin socket.
-    #[uniffi::constructor(default(config_toml = None, admin = false))]
-    pub fn new(config_toml: Option<String>, admin: bool) -> Result<Arc<Self>> {
-        let node = EmbeddedNode::start_toml(config_toml.as_deref(), StartOptions { admin })?;
+    /// `network_interfaces`: interfaces for multicast discovery supplied by
+    /// the app (on Android from ConnectivityManager, as `getifaddrs()` is
+    /// restricted). Multicast only follows supplied interfaces if they are
+    /// given here; update them with [`set_network_interfaces`].
+    #[uniffi::constructor(default(config_toml = None, admin = false, network_interfaces = None))]
+    pub fn new(
+        config_toml: Option<String>,
+        admin: bool,
+        network_interfaces: Option<Vec<NetworkInterface>>,
+    ) -> Result<Arc<Self>> {
+        let options = StartOptions {
+            admin,
+            network_interfaces: network_interfaces.map(convert_interfaces).transpose()?,
+        };
+        let node = EmbeddedNode::start_toml(config_toml.as_deref(), options)?;
         Ok(Arc::new(Self { node: Mutex::new(Some(Arc::new(node))) }))
+    }
+
+    /// Call when the network changed (`ConnectivityManager.NetworkCallback`,
+    /// Wi-Fi <-> mobile, resume from Doze): peers that are down are redialled
+    /// now instead of after their backoff, and the node re-announces itself.
+    pub fn network_changed(&self) -> Result<()> {
+        Ok(self.get()?.network_changed()?)
+    }
+
+    /// Replace the interfaces used by multicast discovery.
+    pub fn set_network_interfaces(&self, interfaces: Vec<NetworkInterface>) -> Result<()> {
+        Ok(self.get()?.set_network_interfaces(convert_interfaces(interfaces)?)?)
+    }
+
+    /// Connect without blocking a thread (a Kotlin `suspend fun`); returns the
+    /// connected stream socket (fd). Cancelling the coroutine abandons the
+    /// connect. `timeout_ms` null: 30 s.
+    #[uniffi::method(default(timeout_ms = None))]
+    pub async fn tcp_connect_async(&self, host: String, port: u16, timeout_ms: Option<u32>) -> Result<i32> {
+        if port == 0 {
+            return Err(YggException::InvalidArgument("port is 0".into()));
+        }
+        let target = Target { host: parse(&host)?, port };
+        let connect = self.get()?.tcp_connect_async(target, millis(timeout_ms));
+        Ok(fd(connect.await?))
     }
 
     pub fn address(&self) -> Result<String> {

@@ -264,3 +264,57 @@ fn services_and_errors() {
         ygg_node_stop(n.b);
     }
 }
+
+#[test]
+fn pending_connect_and_network_hooks() {
+    let n = nodes();
+    let listener = ygg_tcp_listen(n.b, 7100);
+    assert_ne!(listener, INVALID_SOCKET);
+
+    // Non-blocking connect: wait for readability with poll(2), then finish.
+    let host = cstr(&format!("{}.pk.ygg", n.b_key));
+    let pending = ygg_tcp_connect_start(n.a, host.as_ptr(), 7100, 0);
+    assert_ne!(pending, INVALID_SOCKET, "{:?}", last_error());
+    let mut pfd = libc::pollfd { fd: pending, events: libc::POLLIN, revents: 0 };
+    assert_eq!(unsafe { libc::poll(&mut pfd, 1, 20_000) }, 1, "connect did not complete");
+    let fd = ygg_tcp_connect_finish(n.a, pending);
+    assert_ne!(fd, INVALID_SOCKET, "{:?}", last_error());
+    let accepted = ygg_tcp_accept(n.b, listener, std::ptr::null_mut(), 0, 10_000);
+    assert_ne!(accepted, INVALID_SOCKET);
+    let mut client = unsafe { UnixStream::from_raw_fd(fd) };
+    let mut server = unsafe { UnixStream::from_raw_fd(accepted) };
+    client.write_all(b"nb").unwrap();
+    let mut got = [0u8; 2];
+    server.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"nb");
+
+    // Still running -> WOULD_BLOCK; cancel closes the handle.
+    let nowhere = cstr("200:dead:beef::1");
+    let pending = ygg_tcp_connect_start(n.a, nowhere.as_ptr(), 80, 0);
+    assert_eq!(ygg_tcp_connect_finish(n.a, pending), INVALID_SOCKET);
+    assert_eq!(ygg_last_error(), YGG_ERR_WOULD_BLOCK);
+    assert_eq!(ygg_tcp_connect_cancel(n.a, pending), 0);
+    assert_eq!(ygg_tcp_connect_cancel(n.a, pending), -YGG_ERR_NOT_FOUND);
+
+    // Network hooks.
+    assert_eq!(ygg_node_network_changed(n.a), 0);
+    let ifaces = cstr(r#"[{"name":"wlan0","index":3,"addrs":["fe80::1"]}]"#);
+    assert_eq!(ygg_node_set_network_interfaces(n.a, ifaces.as_ptr()), 0);
+    let bad = cstr(r#"[{"name":"wlan0","addrs":["not an address"]}]"#);
+    assert_eq!(ygg_node_set_network_interfaces(n.a, bad.as_ptr()), -YGG_ERR_INVALID_ARGUMENT);
+    assert!(last_error().1.contains("interfaces JSON"));
+
+    let conf = cstr("admin_listen = \"none\"\nmulticast_interfaces = []\n");
+    let started = ygg_node_start_ex(conf.as_ptr(), 0, ifaces.as_ptr());
+    assert!(!started.is_null(), "{:?}", last_error());
+    assert!(ygg_node_start_ex(conf.as_ptr(), 0, bad.as_ptr()).is_null());
+    assert_eq!(ygg_last_error(), YGG_ERR_INVALID_ARGUMENT);
+
+    drop((client, server));
+    assert_eq!(ygg_tcp_listener_close(n.b, listener), 0);
+    unsafe {
+        ygg_node_stop(started);
+        ygg_node_stop(n.a);
+        ygg_node_stop(n.b);
+    }
+}

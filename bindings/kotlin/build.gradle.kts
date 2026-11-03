@@ -14,6 +14,8 @@ repositories { mavenCentral() }
 
 dependencies {
     implementation("net.java.dev.jna:jna:5.17.0")
+    // The generated bindings implement suspend functions with coroutines.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
     testImplementation(kotlin("test"))
 }
 

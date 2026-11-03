@@ -150,6 +150,43 @@ class YggNodeTest {
     }
 
     @Test
+    fun suspendConnect(): Unit = kotlinx.coroutines.runBlocking {
+        b.listen(7002).use { listener ->
+            val server = thread {
+                listener.accept(timeoutMs = 20_000).use { it.output.write(it.input.readExactly(5)) }
+            }
+            a.connectAsync("${b.publicKey()}.pk.ygg", 7002, timeoutMs = 20_000).use { s ->
+                s.output.write("async".toByteArray())
+                assertEquals("async", String(s.input.readExactly(5)))
+            }
+            server.join(10_000)
+        }
+        assertFailsWith<YggException.ConnectionRefused> { a.connectAsync(b.address(), 7999, timeoutMs = 20_000) }
+        // Cancellation abandons a connect that cannot complete.
+        assertFailsWith<kotlinx.coroutines.TimeoutCancellationException> {
+            kotlinx.coroutines.withTimeout(300) { a.connectAsync("200:dead:beef::1", 80) }
+        }
+    }
+
+    @Test
+    fun networkHooks() {
+        a.networkChanged()
+        a.setNetworkInterfaces(systemNetworkInterfaces())
+        a.setNetworkInterfaces(listOf(NetworkInterface("wlan0", 3u, listOf("fe80::1%wlan0"))))
+        assertFailsWith<YggException.InvalidArgument> {
+            a.setNetworkInterfaces(listOf(NetworkInterface("wlan0", 3u, listOf("not an address"))))
+        }
+        YggNode(
+            "multicast_interfaces = []\nadmin_listen = \"none\"\n",
+            networkInterfaces = listOf(NetworkInterface("lo", 1u, listOf("::1"))),
+        ).use { node ->
+            node.networkChanged()
+            node.shutdown()
+            assertFailsWith<YggException.Closed> { node.networkChanged() }
+        }
+    }
+
+    @Test
     fun badConfig() {
         assertFailsWith<YggException.Config> { YggNode("this is = not [toml") }
     }

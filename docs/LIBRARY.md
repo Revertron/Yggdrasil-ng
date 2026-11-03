@@ -183,6 +183,18 @@ ygg_udp_close(node, u);
 ygg_node_stop(node);
 ```
 
+Non-blocking connect for event loops, and network-change hooks:
+
+```c
+ygg_socket p = ygg_tcp_connect_start(node, "200:1234::1", 80, 0);
+/* poll(p, POLLIN) ... */
+ygg_socket s = ygg_tcp_connect_finish(node, p);   /* YGG_ERR_WOULD_BLOCK until done */
+/* or: ygg_tcp_connect_cancel(node, p); */
+
+ygg_node_network_changed(node);                    /* Wi-Fi <-> mobile, resume, ... */
+ygg_node_set_network_interfaces(node, "[{\"name\":\"wlan0\",\"index\":3,\"addrs\":[\"fe80::1\"]}]");
+```
+
 Conventions (details in the header):
 
 - `int` results are `>= 0` on success and `-YGG_ERR_*` on failure; socket
@@ -232,7 +244,10 @@ server = await node.start_server(handle, 8080)
 ```
 
 Blocking calls release the GIL; `node.close()` wakes threads blocked in
-`accept`. Errors map to built-in exceptions (`ConnectionRefusedError`,
+`accept`. `connect_async`/`open_connection` wait with `loop.add_reader`, so no
+thread is blocked while connecting. `node.network_changed()` and
+`node.set_network_interfaces([(name, index, [addrs])])` are the
+network-change hooks. Errors map to built-in exceptions (`ConnectionRefusedError`,
 `TimeoutError`, `BlockingIOError`, `ConnectionError`, `ValueError`,
 `OSError` with `errno`). `ygg.log_to_python()` routes logs into `logging`.
 See `crates/yggdrasil-py/README.md`.
@@ -264,11 +279,31 @@ setLogger(object : LogSink { override fun log(level: Int, message: String) = Log
 node.close()                                        // stops the node, frees the handle
 ```
 
-All calls block, so run them off the main thread (`Dispatchers.IO`). Errors
+All calls block except `connectAsync`/`tcpConnectAsync` (`suspend`), so run
+them off the main thread (`Dispatchers.IO`). Errors
 are `YggException` subclasses (`ConnectionRefused`, `TimedOut`, `WouldBlock`,
 `Closed`, ...). The raw API (`tcpConnect`, `tcpAccept`, `udpBind`, ... returning
 descriptors as `Int`) is available too; on Android wrap a descriptor with
 `ParcelFileDescriptor.adoptFd(fd)`.
+
+Network changes: Yggdrasil's reconnect backoff grows to minutes, so tell the
+node when connectivity changes, and keep multicast discovery on the current
+interfaces (pass them at start as well; multicast only follows supplied
+interfaces if it starts with them):
+
+```kotlin
+val node = YggNode(config, networkInterfaces = systemNetworkInterfaces())
+connectivityManager.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+    override fun onAvailable(network: Network) = changed()
+    override fun onLost(network: Network) = changed()
+    override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) = changed()
+    private fun changed() = ioScope.launch {
+        node.setNetworkInterfaces(systemNetworkInterfaces())
+        node.networkChanged()           // redial peers now, re-announce
+    }
+})
+// Also call node.networkChanged() when the app resumes from Doze.
+```
 
 Android integration in an app:
 

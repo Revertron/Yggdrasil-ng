@@ -33,6 +33,7 @@ use yggdrasil_stack::{TcpStream, UdpSocket, YggStack, proxy};
 pub use error::*;
 pub use logger::{LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_TRACE, LOG_WARN, set_logger};
 pub use sockpair::{CSocket, INVALID_SOCKET};
+pub use yggdrasil::multicast::NetworkInterface;
 pub use yggdrasil_stack::{Host, Target};
 
 /// Header in front of every datagram on a UDP socket.
@@ -51,6 +52,59 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct StartOptions {
     /// Also start the admin socket on the config's `admin_listen`.
     pub admin: bool,
+    /// Interfaces for multicast discovery supplied by the app (Android's
+    /// ConnectivityManager, where `getifaddrs()` is restricted). Must be
+    /// given here for multicast to follow them; update them later with
+    /// [`EmbeddedNode::set_network_interfaces`].
+    pub network_interfaces: Option<Vec<NetworkInterface>>,
+}
+
+/// A connect started with [`EmbeddedNode::tcp_connect_start`].
+#[derive(Default)]
+struct PendingConnect {
+    /// The outcome once known, unless the connect was cancelled.
+    result: Mutex<PendingState>,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+enum PendingState {
+    #[default]
+    Running,
+    Done(Result<CSocket>),
+    Cancelled,
+}
+
+/// Aborts a task when the future awaiting it is dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn connect_stream(stack: YggStack, target: Target, timeout: Option<Duration>) -> std::io::Result<TcpStream> {
+    let connect = stack.tcp_connect_target(&target);
+    match timeout {
+        Some(t) => tokio::time::timeout(t, connect).await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out"))
+        }),
+        None => connect.await,
+    }
+}
+
+/// Hand `stream` to the application as a socket. Must run inside the node's
+/// runtime.
+fn bridge_in_runtime(stream: TcpStream) -> Result<CSocket> {
+    let (app, mut lib) = sockpair::stream_pair()?;
+    tokio::spawn(async move {
+        let mut stream = stream;
+        if let Err(e) = tokio::io::copy_bidirectional(&mut lib, &mut stream).await {
+            tracing::debug!("embed: tcp bridge ended: {}", e);
+        }
+    });
+    Ok(app)
 }
 
 /// Pending connections of a listener, shared with its accept task.
@@ -68,6 +122,7 @@ pub struct EmbeddedNode {
     stack: YggStack,
     listeners: Mutex<HashMap<CSocket, Arc<Listener>>>,
     udp: Mutex<HashMap<CSocket, JoinHandle<()>>>,
+    pending: Mutex<HashMap<CSocket, Arc<PendingConnect>>>,
     services: Mutex<HashMap<i32, JoinHandle<()>>>,
     next_service: AtomicI32,
 }
@@ -81,14 +136,15 @@ impl EmbeddedNode {
             .enable_all()
             .build()
             .map_err(Error::from)?;
+        let mut builder = NodeBuilder::new(config)
+            .embedded()
+            .admin(options.admin)
+            .admin_required(options.admin);
+        if let Some(interfaces) = options.network_interfaces {
+            builder = builder.network_interfaces(interfaces);
+        }
         let node = runtime
-            .block_on(
-                NodeBuilder::new(config)
-                    .embedded()
-                    .admin(options.admin)
-                    .admin_required(options.admin)
-                    .start(),
-            )
+            .block_on(builder.start())
             .map_err(|e| Error::new(ERR_CONFIG, e.to_string()))?;
         let stack = {
             let _enter = runtime.enter();
@@ -100,6 +156,7 @@ impl EmbeddedNode {
             stack,
             listeners: Mutex::default(),
             udp: Mutex::default(),
+            pending: Mutex::default(),
             services: Mutex::default(),
             next_service: AtomicI32::new(1),
         })
@@ -147,6 +204,22 @@ impl EmbeddedNode {
         self.runtime.block_on(core.add_peer(uri)).map_err(Error::invalid)
     }
 
+    /// Tell the node the network changed (interface up/down, Wi-Fi <->
+    /// mobile, resume from Doze): peers that are down are redialled now
+    /// instead of after their backoff, and the node re-announces itself.
+    pub fn network_changed(&self) -> Result<()> {
+        let core = self.with_node(|n| n.core().clone())?;
+        self.runtime.block_on(core.retry_peers_now());
+        core.force_router_refresh();
+        Ok(())
+    }
+
+    /// Replace the externally supplied interfaces used by multicast discovery
+    /// (see [`StartOptions::network_interfaces`]).
+    pub fn set_network_interfaces(&self, interfaces: Vec<NetworkInterface>) -> Result<()> {
+        self.with_node(|n| n.core().update_network_interfaces(interfaces))
+    }
+
     pub fn remove_peer(&self, uri: &str) -> Result<()> {
         let core = self.with_node(|n| n.core().clone())?;
         self.runtime
@@ -184,29 +257,133 @@ impl EmbeddedNode {
     /// Hand `stream` to the application as a socket.
     fn bridge_tcp(&self, stream: TcpStream) -> Result<CSocket> {
         let _enter = self.runtime.enter();
-        let (app, mut lib) = sockpair::stream_pair()?;
-        self.runtime.spawn(async move {
-            let mut stream = stream;
-            if let Err(e) = tokio::io::copy_bidirectional(&mut lib, &mut stream).await {
-                tracing::debug!("embed: tcp bridge ended: {}", e);
-            }
-        });
-        Ok(app)
+        bridge_in_runtime(stream)
     }
 
     /// Connect and return a connected stream socket. `None` uses the stack's
     /// connect timeout (30 s).
     pub fn tcp_connect(&self, target: &Target, timeout: Option<Duration>) -> Result<CSocket> {
-        let stream = self.runtime.block_on(async {
-            let connect = self.stack.tcp_connect_target(target);
-            match timeout {
-                Some(t) => tokio::time::timeout(t, connect).await.unwrap_or_else(|_| {
-                    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out"))
-                }),
-                None => connect.await,
-            }
-        })?;
+        let stream = self
+            .runtime
+            .block_on(connect_stream(self.stack.clone(), *target, timeout))?;
         self.bridge_tcp(stream)
+    }
+
+    /// Connect without blocking a thread. The future can be awaited on any
+    /// executor (the work runs on the node's runtime). Dropping it cancels
+    /// the connect; a connection that completes after that is closed.
+    pub fn tcp_connect_async(
+        &self,
+        target: Target,
+        timeout: Option<Duration>,
+    ) -> impl Future<Output = Result<CSocket>> + Send + 'static {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let stack = self.stack.clone();
+        let task = self.runtime.spawn(async move {
+            let result = match connect_stream(stack, target, timeout).await {
+                Ok(stream) => bridge_in_runtime(stream),
+                Err(e) => Err(e.into()),
+            };
+            // Nobody is waiting any more: do not leak the connection.
+            if let Err(Ok(fd)) = tx.send(result) {
+                sockpair::close(fd);
+            }
+        });
+        let guard = AbortOnDrop(task.abort_handle());
+        async move {
+            let _guard = guard;
+            rx.await
+                .unwrap_or_else(|_| Err(Error::new(ERR_CLOSED, "node is stopped")))
+        }
+    }
+
+    /// Start a connect for event loops that wait on descriptors. Returns a
+    /// handle that becomes readable when the outcome is known; then call
+    /// [`tcp_connect_finish`](Self::tcp_connect_finish). The handle must not
+    /// be read or written.
+    pub fn tcp_connect_start(&self, target: Target, timeout: Option<Duration>) -> Result<CSocket> {
+        if self.is_stopped() {
+            return Err(Error::new(ERR_CLOSED, "node is stopped"));
+        }
+        let _enter = self.runtime.enter();
+        let (handle, mut lib) = sockpair::stream_pair()?;
+        let state = Arc::new(PendingConnect::default());
+        lock(&self.pending).insert(handle, state.clone());
+        let stack = self.stack.clone();
+        let task_state = state.clone();
+        let task = self.runtime.spawn(async move {
+            let result = match connect_stream(stack, target, timeout).await {
+                Ok(stream) => bridge_in_runtime(stream),
+                Err(e) => Err(e.into()),
+            };
+            {
+                let mut slot = lock(&task_state.result);
+                match *slot {
+                    PendingState::Cancelled => {
+                        if let Ok(fd) = result {
+                            sockpair::close(fd);
+                        }
+                        return;
+                    }
+                    _ => *slot = PendingState::Done(result),
+                }
+            }
+            // Makes the application's handle readable.
+            let _ = lib.write_all(&[1]).await;
+            // Keep our end open so the handle does not also report EOF.
+            let mut probe = [0u8; 1];
+            let _ = lib.read(&mut probe).await;
+        });
+        *lock(&state.task) = Some(task);
+        Ok(handle)
+    }
+
+    /// Collect the outcome of [`tcp_connect_start`](Self::tcp_connect_start):
+    /// `ERR_WOULD_BLOCK` while the connect is running; afterwards the
+    /// connected stream socket or the connect error. Once the outcome is
+    /// returned the pending handle is closed.
+    pub fn tcp_connect_finish(&self, pending: CSocket) -> Result<CSocket> {
+        let state = lock(&self.pending)
+            .get(&pending)
+            .cloned()
+            .ok_or_else(|| Error::new(ERR_NOT_FOUND, "not a pending connect"))?;
+        let outcome = {
+            let mut slot = lock(&state.result);
+            match std::mem::take(&mut *slot) {
+                PendingState::Done(result) => result,
+                other => {
+                    *slot = other;
+                    return Err(Error::new(ERR_WOULD_BLOCK, "connect in progress"));
+                }
+            }
+        };
+        lock(&self.pending).remove(&pending);
+        if let Some(task) = lock(&state.task).take() {
+            task.abort();
+        }
+        sockpair::close(pending);
+        outcome
+    }
+
+    /// Abandon a connect from [`tcp_connect_start`](Self::tcp_connect_start)
+    /// and close its pending handle.
+    pub fn tcp_connect_cancel(&self, pending: CSocket) -> Result<()> {
+        let state = lock(&self.pending)
+            .remove(&pending)
+            .ok_or_else(|| Error::new(ERR_NOT_FOUND, "not a pending connect"))?;
+        Self::cancel_pending(&state);
+        sockpair::close(pending);
+        Ok(())
+    }
+
+    fn cancel_pending(state: &PendingConnect) {
+        if let Some(task) = lock(&state.task).take() {
+            task.abort();
+        }
+        let previous = std::mem::replace(&mut *lock(&state.result), PendingState::Cancelled);
+        if let PendingState::Done(Ok(fd)) = previous {
+            sockpair::close(fd);
+        }
     }
 
     /// Listen on `port`. The returned handle becomes readable when a
@@ -421,6 +598,11 @@ impl EmbeddedNode {
         }
         for (_, task) in lock(&self.udp).drain() {
             task.abort();
+        }
+        // Pending handles belong to the application; connections that were
+        // never collected are ours to close.
+        for (_, state) in lock(&self.pending).drain() {
+            Self::cancel_pending(&state);
         }
         let node = lock(&self.node).take();
         if let Some(node) = node {
