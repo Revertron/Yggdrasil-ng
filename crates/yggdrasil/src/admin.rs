@@ -181,6 +181,40 @@ async fn handle_admin_conn(stream: tokio::net::TcpStream, core: Arc<Core>) {
     }
 }
 
+/// Run one admin request in-process, without the socket. Takes and returns
+/// the same JSON documents as the admin socket (one request, one response).
+pub async fn handle_json(core: &Arc<Core>, request_json: &str) -> String {
+    let resp = match serde_json::from_str::<AdminRequest>(request_json.trim()) {
+        Ok(req) => match handle_request(&req, core).await {
+            Ok(response) => AdminResponse {
+                status: "success".to_string(),
+                error: None,
+                request: req,
+                response,
+            },
+            Err(e) => AdminResponse {
+                status: "error".to_string(),
+                error: Some(e),
+                request: req,
+                response: serde_json::Value::Null,
+            },
+        },
+        Err(e) => AdminResponse {
+            status: "error".to_string(),
+            error: Some(format!("failed to parse request: {}", e)),
+            request: AdminRequest {
+                request: String::new(),
+                arguments: serde_json::Value::Null,
+                keepalive: false,
+            },
+            response: serde_json::Value::Null,
+        },
+    };
+    serde_json::to_string(&resp).unwrap_or_else(|e| {
+        format!("{{\"status\":\"error\",\"error\":\"{}\"}}", e)
+    })
+}
+
 async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_json::Value, String> {
     match req.request.to_lowercase().as_str() {
         "list" => Ok(serde_json::json!({

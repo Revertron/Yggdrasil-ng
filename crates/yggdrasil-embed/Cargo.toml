@@ -1,0 +1,33 @@
+[package]
+name = "yggdrasil-embed"
+version = "0.1.0"
+edition = "2024"
+description = "Embedded Yggdrasil node that hands out connections as OS sockets; shared core of the C, Python and Kotlin bindings"
+license = "MPL-2.0"
+
+[dependencies]
+yggdrasil = { path = "../yggdrasil", default-features = false }
+yggdrasil-stack = { path = "../yggdrasil-stack", features = ["proxy"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+toml = "1"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
+[features]
+default = ["ws", "quic"]
+# Peering transports; tcp:// and tls:// are always available.
+ws = ["yggdrasil/ws"]
+quic = ["yggdrasil/quic"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+libc = "0.2"
+serde_json = "1"

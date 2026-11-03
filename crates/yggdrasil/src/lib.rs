@@ -10,6 +10,7 @@ pub mod firewall;
 pub mod ipv6rwc;
 pub mod links;
 pub mod multicast;
+pub mod node;
 pub mod proto;
 pub mod transport;
 #[cfg(feature = "tun")]

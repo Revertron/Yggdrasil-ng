@@ -5,13 +5,8 @@ use time::macros::format_description;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use yggdrasil::address::{addr_for_key, subnet_for_key};
-use yggdrasil::admin::AdminSocket;
 use yggdrasil::config::Config;
-use yggdrasil::core::Core;
-use yggdrasil::ipv6rwc::ReadWriteCloser;
-
-#[cfg(feature = "tun")]
-use yggdrasil::tun::TunAdapter;
+use yggdrasil::node::NodeBuilder;
 
 #[cfg(windows)]
 mod service;
@@ -177,28 +172,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     };
 
-    // Parse or generate signing key
-    // Priority: config file > YGGDRASIL_PRIVATE_KEY env var > ephemeral
-    let signing_key = if !config.private_key.is_empty() {
-        config
-            .signing_key()
-            .map_err(|e| format!("invalid private key: {}", e))?
-    } else if let Ok(env_key) = std::env::var("YGGDRASIL_PRIVATE_KEY") {
-        tracing::info!("Using private key from YGGDRASIL_PRIVATE_KEY environment variable");
-        let bytes = hex::decode(&env_key)
-            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY hex: {}", e))?;
-        let key_bytes: [u8; 64] = bytes.try_into()
-            .map_err(|v: Vec<u8>| format!("YGGDRASIL_PRIVATE_KEY should be 64 bytes, got {}", v.len()))?;
-        let key = SigningKey::from_keypair_bytes(&key_bytes)
-            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?;
-        if !ironwood::is_public_key_valid(&key.verifying_key().to_bytes()) {
-            return Err("invalid YGGDRASIL_PRIVATE_KEY: public key is a low-order point".into());
-        }
-        key
-    } else {
-        tracing::warn!("No private key configured, generating ephemeral key");
-        SigningKey::generate(&mut rand::rngs::OsRng)
-    };
+    let signing_key = load_signing_key(&config)?;
 
     let public_key = signing_key.verifying_key().to_bytes();
 
@@ -279,166 +253,22 @@ async fn run_node(
         return Err("No configuration: specify --config or --autoconf".into());
     };
 
-    // Parse or generate signing key
-    let signing_key = if !config.private_key.is_empty() {
-        config
-            .signing_key()
-            .map_err(|e| format!("invalid private key: {}", e))?
-    } else if let Ok(env_key) = std::env::var("YGGDRASIL_PRIVATE_KEY") {
-        tracing::info!("Using private key from YGGDRASIL_PRIVATE_KEY environment variable");
-        let bytes = hex::decode(&env_key)
-            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY hex: {}", e))?;
-        let key_bytes: [u8; 64] = bytes.try_into()
-            .map_err(|v: Vec<u8>| format!("YGGDRASIL_PRIVATE_KEY should be 64 bytes, got {}", v.len()))?;
-        let key = SigningKey::from_keypair_bytes(&key_bytes)
-            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?;
-        if !ironwood::is_public_key_valid(&key.verifying_key().to_bytes()) {
-            return Err("invalid YGGDRASIL_PRIVATE_KEY: public key is a low-order point".into());
-        }
-        key
-    } else {
-        tracing::warn!("No private key configured, generating ephemeral key");
-        SigningKey::generate(&mut rand::rngs::OsRng)
-    };
-
+    let signing_key = load_signing_key(&config)?;
 
     // Merge CLI-provided peers (-p/--peer) into a clone of config so the node connects
     // to them on startup (deduped against configured entries).
-    let mut cfg = config.clone();
+    let mut config = config;
     for uri in matches.opt_strs("p") {
-        if !cfg.peers.contains(&uri) {
-            cfg.peers.push(uri);
+        if !config.peers.contains(&uri) {
+            config.peers.push(uri);
         }
     }
 
-    let core = Core::new(signing_key, cfg);
-    tracing::info!("Your IPv6 address is {}", core.address());
-    tracing::info!("Your IPv6 subnet is {}", core.subnet());
-    tracing::info!("Your public key is {}", hex::encode(core.public_key()));
-    tracing::info!("Salsa20 backend: {}", salsa20::active_backend());
-
-    // Initialize links with core reference
-    core.init_links().await;
-
-    // Start listeners and connect to peers
-    core.start().await;
-
-    // Construct firewall (if enabled). Default-off; existing setups are untouched.
-    let firewall = if config.firewall.enable {
-        match yggdrasil::firewall::Firewall::new(&config.firewall) {
-            Ok(fw) => {
-                let fw = std::sync::Arc::new(fw);
-                fw.spawn_gc();
-                tracing::info!(
-                    "Firewall enabled: {} TCP open, {} UDP open, {} bypass subnets, icmp_echo={}",
-                    config.firewall.open_tcp.len(),
-                    config.firewall.open_udp.len(),
-                    config.firewall.open_all_for.len(),
-                    config.firewall.allow_icmp_echo
-                );
-                Some(fw)
-            }
-            Err(e) => {
-                tracing::error!("Firewall configuration error: {}", e);
-                return Err(e.into());
-            }
-        }
-    } else {
-        None
-    };
-
-    // Create IPv6 RWC bridge
-    let mtu = core.mtu();
-    let rwc = ReadWriteCloser::new(
-        core.clone(),
-        mtu,
-        #[cfg(feature = "ckr")]
-        Some(&config.tunnel_routing),
-        firewall,
-    );
-
-    // Wire up path_notify: when ironwood discovers a new path, update the key store
-    core.set_path_notify(rwc.clone());
-
-    // Seed the key store with the keys of directly-connected peers. We authenticated
-    // those keys during the link handshake, so their address/subnet mapping is already
-    // derivable locally -- no reason to buffer the first packet and wait for a lookup
-    // to tell us what we know. Combined with the router's direct-peer shortcut this
-    // takes the first packet to a direct peer from three round trips down to two
-    // (the remaining one being the session Init/Ack).
-    //
-    // Re-run on a timer rather than hooking link setup: it picks up peers that connect
-    // later, survives reconnects, and refreshes `last_seen` so entries can't age out
-    // while the peer is up. `update_key` returns early for entries that are still
-    // fresh, so a tick over an unchanged peer set is a couple of hashmap lookups.
-    let seed_core = core.clone();
-    let seed_rwc = rwc.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
-        loop {
-            ticker.tick().await;
-            for key in seed_core.get_peer_keys().await {
-                seed_rwc.update_key(key).await;
-            }
-        }
-    });
-
-    // Create TUN adapter
-    #[cfg(feature = "tun")]
-    let mut tun = if config.if_name != "none" {
-        let addr_str = core.address().to_string();
-        let subnet_str = core.subnet().to_string();
-        let tun_mtu = config.if_mtu.min(mtu).min(65535) as u16;
-
-        match TunAdapter::new(
-            &config.if_name,
-            rwc.clone(),
-            &addr_str,
-            &subnet_str,
-            tun_mtu,
-            #[cfg(windows)]
-            &config.if_dns_servers,
-            #[cfg(feature = "ckr")]
-            Some(&config.tunnel_routing),
-            #[cfg(feature = "ckr")]
-            core.public_key(),
-        ).await {
-            Ok(tun) => {
-                tracing::info!("TUN adapter started");
-                core.set_tun_info(tun.name(), tun.mtu() as u64);
-                Some(tun)
-            }
-            Err(e) => {
-                // A TUN was requested (if_name != "none") but could not be
-                // created. Fail loudly rather than continuing in a degraded,
-                // TUN-less state: under systemd Type=notify this surfaces as a
-                // failed start (then Restart=always retries) instead of a
-                // silently broken node that still reports "ready".
-                tracing::error!("Failed to create TUN adapter: {}", e);
-                return Err(e.into());
-            }
-        }
-    } else {
-        tracing::info!("TUN adapter disabled");
-        None
-    };
-
-    // Start admin socket
-    let admin = match AdminSocket::new(&config.admin_listen, core.clone()).await {
-        Ok(admin) => Some(admin),
-        Err(e) => {
-            tracing::warn!("Failed to start admin socket: {}", e);
-            None
-        }
-    };
-
-    // Start multicast peer discovery
-    if let Err(e) = core.start_multicast().await {
-        tracing::warn!("Multicast peer discovery disabled: {}", e);
-    }
-
-    // Wait for shutdown signal
-    tracing::info!("Yggdrasil NG started");
+    let node = NodeBuilder::new(config)
+        .signing_key(signing_key)
+        .start()
+        .await
+        .inspect_err(|e| tracing::error!("{}", e))?;
 
     // Tell systemd we're ready (Type=notify). By this point the TUN interface
     // (if any) has been created and the admin socket/multicast started, so
@@ -451,48 +281,38 @@ async fn run_node(
         }
     }
 
+    // Wait for shutdown signal
     shutdown_rx.changed().await.ok();
     tracing::info!("Shutting down...");
-
-    // Cleanup
-    // Remove CKR routes before TUN is destroyed (critical on Windows where
-    // routes don't auto-dissolve when the interface goes away).
-    // Use the name the adapter got, not a second derivation of if_name.
-    #[cfg(all(feature = "ckr", feature = "tun"))]
-    if config.tunnel_routing.enable {
-        if let Some(adapter) = tun.as_ref() {
-            yggdrasil::ckr::remove_routes(
-                &config.tunnel_routing,
-                adapter.name(),
-                core.public_key(),
-            );
-        }
-    }
-
-    // Tear down TUN explicitly so the OS interface is removed before this
-    // function returns. Dropping TunAdapter alone is not enough: its tokio
-    // tasks each hold an Arc<AsyncDevice>, and dropping a JoinHandle does
-    // not abort the task — it only detaches it. Without an explicit close
-    // we'd rely on the runtime drop to abort the tasks, which is too late
-    // in Windows service mode (the SCM may kill the process after we report
-    // Stopped, leaving an orphaned Wintun adapter).
-    //
-    // This happens before core.close() on purpose: the TUN write loop parks
-    // in rwc.read(), so closing the core first pulls the RWC out from under
-    // it and every clean shutdown logs a spurious "RWC read error".
-    #[cfg(feature = "tun")]
-    if let Some(t) = tun.take() {
-        t.close().await;
-    }
-
-    core.close_multicast().await;
-    if let Some(admin) = &admin {
-        admin.close();
-    }
-    core.close().await.ok();
+    node.close().await;
 
     tracing::info!("Goodbye!");
     Ok(())
+}
+
+/// Resolve the node's signing key.
+/// Priority: config file > YGGDRASIL_PRIVATE_KEY env var > ephemeral.
+fn load_signing_key(config: &Config) -> Result<SigningKey, Box<dyn std::error::Error>> {
+    if !config.private_key.is_empty() {
+        return Ok(config
+            .signing_key()
+            .map_err(|e| format!("invalid private key: {}", e))?);
+    }
+    if let Ok(env_key) = std::env::var("YGGDRASIL_PRIVATE_KEY") {
+        tracing::info!("Using private key from YGGDRASIL_PRIVATE_KEY environment variable");
+        let bytes = hex::decode(&env_key)
+            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY hex: {}", e))?;
+        let key_bytes: [u8; 64] = bytes.try_into()
+            .map_err(|v: Vec<u8>| format!("YGGDRASIL_PRIVATE_KEY should be 64 bytes, got {}", v.len()))?;
+        let key = SigningKey::from_keypair_bytes(&key_bytes)
+            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?;
+        if !ironwood::is_public_key_valid(&key.verifying_key().to_bytes()) {
+            return Err("invalid YGGDRASIL_PRIVATE_KEY: public key is a low-order point".into());
+        }
+        return Ok(key);
+    }
+    tracing::warn!("No private key configured, generating ephemeral key");
+    Ok(SigningKey::generate(&mut rand::rngs::OsRng))
 }
 
 fn init_logging(loglevel: &str, logto: Option<&str>) {

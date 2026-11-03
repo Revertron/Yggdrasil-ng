@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/ironwood", "crates/yggdrasil", "crates/salsa20-simd"]
+# Built by maturin as its own workspace, so `cargo test --workspace` and the
+# release builds do not need a Python installation.
+exclude = ["crates/yggdrasil-py"]
+members = ["crates/ironwood", "crates/yggdrasil", "crates/yggdrasil-stack", "crates/yggdrasil-embed", "crates/yggdrasil-ffi", "crates/yggdrasil-uniffi", "crates/salsa20-simd"]
 
 # Redirect the transitive salsa20 (ironwood -> crypto_box -> crypto_secretbox ->
 # salsa20) to the local SIMD fork (AVX2/SSE2 on x86, NEON on aarch64; scalar
