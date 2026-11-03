@@ -1,4 +1,4 @@
-package org.yggdrasil.embed
+package link.yggdrasil.embed
 
 import java.net.ServerSocket
 import java.net.Socket

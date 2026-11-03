@@ -240,7 +240,7 @@ See `crates/yggdrasil-py/README.md`.
 The crate is its own Cargo workspace (built by maturin), so the main
 workspace builds without Python.
 
-## Kotlin / Android (`org.yggdrasil.embed`)
+## Kotlin / Android (`link.yggdrasil.embed`)
 
 UniFFI bindings in `crates/yggdrasil-uniffi`; the generated Kotlin
 (`yggdrasil_uniffi.kt`, uses JNA) and hand-written helpers (`YggStreams.kt`)
@@ -248,7 +248,7 @@ are in `bindings/kotlin/src/main/kotlin`. Regenerate after changing the
 Rust API with `bindings/kotlin/generate.sh`.
 
 ```kotlin
-import org.yggdrasil.embed.*
+import link.yggdrasil.embed.*
 
 val node = YggNode(configToml)                      // null: ephemeral key
 node.connect("<hex key>.pk.ygg", 80).use { s ->     // YggStream
@@ -278,7 +278,7 @@ Android integration (not built in this repository):
 2. Add `bindings/kotlin/src/main/kotlin` to the module's sources and
    `implementation("net.java.dev.jna:jna:5.17.0@aar")` to its dependencies.
 3. With R8/ProGuard, keep JNA and the bindings:
-   `-keep class com.sun.jna.** { *; }` and `-keep class org.yggdrasil.embed.** { *; }`.
+   `-keep class com.sun.jna.** { *; }` and `-keep class link.yggdrasil.embed.** { *; }`.
 4. The app needs the `INTERNET` permission; no `VpnService` is involved.
 
 If the app already ships a UniFFI library, depend on `yggdrasil-uniffi` from

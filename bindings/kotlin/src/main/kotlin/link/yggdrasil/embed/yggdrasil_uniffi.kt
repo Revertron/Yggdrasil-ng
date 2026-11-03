@@ -3,7 +3,7 @@
 
 @file:Suppress("NAME_SHADOWING")
 
-package org.yggdrasil.embed
+package link.yggdrasil.embed
 
 // Common helper code.
 //

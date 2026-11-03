@@ -1,3 +1,3 @@
 [bindings.kotlin]
-package_name = "org.yggdrasil.embed"
+package_name = "link.yggdrasil.embed"
 cdylib_name = "yggdrasil_uniffi"

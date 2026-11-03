@@ -1,6 +1,6 @@
 // Hand-written helpers on top of the generated bindings (yggdrasil_uniffi.kt):
 // Int ports, Java streams over the returned descriptors, UDP framing.
-package org.yggdrasil.embed
+package link.yggdrasil.embed
 
 import java.io.Closeable
 import java.io.FileDescriptor
