@@ -604,16 +604,28 @@ async fn receiver_loop(
             continue;
         }
 
-        // Check if we already have a connection to this key
-        if core.active_links.has_key(&adv.public_key).await {
-            continue;
-        }
-
         // Get source address info
         let from_v6 = match from {
             std::net::SocketAddr::V6(v6) => v6,
             _ => continue,
         };
+
+        // Skip beacons for a socket we are already linked over. Several links to
+        // one peer are allowed, so this checks key + socket rather than key
+        // alone: the same node reachable on a second interface still links up.
+        let beacon_sock = std::net::SocketAddr::V6(SocketAddrV6::new(
+            *from_v6.ip(),
+            adv.port,
+            0,
+            from_v6.scope_id(),
+        ));
+        if core
+            .active_links
+            .has_key_addr(&adv.public_key, &beacon_sock)
+            .await
+        {
+            continue;
+        }
 
         // Find the interface this came from and verify hash
         let scope_id = from_v6.scope_id();

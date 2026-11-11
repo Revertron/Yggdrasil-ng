@@ -88,7 +88,7 @@ impl Core {
 
         let inner = ironwood::new_encrypted_packet_conn(signing_key.clone(), iw_config);
 
-        let active_links = ActiveLinks::new();
+        let active_links = ActiveLinks::new(config.max_inbound_links_per_peer);
 
         // Generate self-signed TLS certificate
         let tls_material = tls::generate_self_signed_cert(&signing_key)
@@ -326,8 +326,18 @@ impl Core {
     }
 
     /// Handle a new peer connection (delegate to ironwood).
-    pub async fn handle_conn(&self, key: [u8; 32], conn: Box<dyn ironwood::types::AsyncConn>, priority: u8) -> Result<(), ironwood::Error> {
-        self.inner.handle_conn(Addr(key), conn, priority).await
+    ///
+    /// `id_tx`, if given, receives ironwood's per-link peer id once allocated;
+    /// the link layer uses it to attribute RTT/cost per link when a peer holds
+    /// several links at once.
+    pub async fn handle_conn(
+        &self,
+        key: [u8; 32],
+        conn: Box<dyn ironwood::types::AsyncConn>,
+        priority: u8,
+        id_tx: Option<tokio::sync::oneshot::Sender<u64>>,
+    ) -> Result<(), ironwood::Error> {
+        self.inner.handle_conn_with_id(Addr(key), conn, priority, id_tx).await
     }
 
     /// Initialize the links with a reference to this core.
@@ -406,7 +416,13 @@ impl Core {
         // Merge latency/cost from ironwood router
         let iw_peers = self.inner.get_peers().await;
         for p in &mut peers {
-            if let Some(iw) = iw_peers.iter().find(|ip| ip.key == p.key) {
+            // Match on the per-link id so that several links to one key each get
+            // their own RTT/cost; fall back to the key while the id is unknown
+            // (a link registered but not yet allocated in ironwood).
+            let by_id = p
+                .peer_id
+                .and_then(|id| iw_peers.iter().find(|ip| ip.id == id));
+            if let Some(iw) = by_id.or_else(|| iw_peers.iter().find(|ip| ip.key == p.key)) {
                 p.latency_ms = iw.latency_ms;
                 p.cost = iw.cost;
             }
@@ -430,6 +446,7 @@ impl Core {
                     latency_ms: 0.0,
                     cost: 0,
                     last_error,
+                    peer_id: None,
                 });
             }
         }

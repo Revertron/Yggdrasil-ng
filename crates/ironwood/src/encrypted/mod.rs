@@ -182,6 +182,19 @@ impl EncryptedPacketConn {
     pub fn force_refresh(&self) {
         self.inner.force_refresh();
     }
+
+    /// Like `handle_conn`, but reports the per-link peer id through `id_tx` once
+    /// it is allocated, so callers holding several links to one key can tell the
+    /// resulting `get_peers()` entries apart.
+    pub async fn handle_conn_with_id(
+        &self,
+        key: Addr,
+        conn: Box<dyn crate::types::AsyncConn>,
+        prio: u8,
+        id_tx: Option<tokio::sync::oneshot::Sender<u64>>,
+    ) -> Result<()> {
+        self.inner.handle_conn_with_id(key, conn, prio, id_tx).await
+    }
 }
 
 /// Background reader loop: reads from inner PacketConn, decrypts via sessions, delivers.
@@ -304,7 +317,7 @@ impl crate::types::PacketConn for EncryptedPacketConn {
     }
 
     async fn handle_conn(&self, key: Addr, conn: Box<dyn crate::types::AsyncConn>, prio: u8) -> Result<()> {
-        self.inner.handle_conn(key, conn, prio).await
+        self.inner.handle_conn_with_id(key, conn, prio, None).await
     }
 
     fn is_closed(&self) -> bool {
