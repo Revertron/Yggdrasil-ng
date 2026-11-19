@@ -71,6 +71,11 @@ if_mtu = 65535
 # If true, your node_info will not be visible to other nodes.
 # node_info_privacy = false
 
+# If true, your node will not answer other nodes' debug requests
+# (debug_remoteGetSelf, debug_remoteGetPeers, debug_remoteGetTree), so its
+# peers and its view of the tree can't be listed by anyone on the network.
+# debug_privacy = false
+
 # List of allowed public keys (hex-encoded). If non-empty, only peers with
 # these public keys will be allowed to connect. Leave empty to allow all peers.
 # allowed_public_keys = []

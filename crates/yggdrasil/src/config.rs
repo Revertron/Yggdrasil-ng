@@ -88,6 +88,12 @@ pub struct Config {
     #[serde(default)]
     pub node_info_privacy: bool,
 
+    /// If true, don't answer other nodes' debug requests (getSelf, getPeers
+    /// and getTree), so the node's peers can't be listed by anyone on the
+    /// network. Its own debug_remote* queries still work.
+    #[serde(default)]
+    pub debug_privacy: bool,
+
     /// If non-empty, only allow peering with these public keys (hex).
     #[serde(default)]
     pub allowed_public_keys: Vec<String>,
@@ -242,6 +248,7 @@ impl Default for Config {
             if_dns_servers: Vec::new(),
             node_info: toml::Value::Table(toml::map::Map::new()),
             node_info_privacy: false,
+            debug_privacy: false,
             allowed_public_keys: Vec::new(),
             multicast_interfaces: default_multicast_interfaces(),
             #[cfg(feature = "ckr")]

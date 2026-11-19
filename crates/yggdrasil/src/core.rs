@@ -224,6 +224,9 @@ impl Core {
     /// Handle one inbound protocol message. Runs on the dedicated proto task,
     /// off the traffic read path, so blocking here is harmless.
     async fn handle_inbound_proto(&self, from_key: [u8; 32], payload: &[u8]) {
+        if self.config.debug_privacy && crate::proto::is_debug_request(payload) {
+            return;
+        }
         // Each query below is a round-trip to the single router actor task, so
         // only ask for what this particular message will use.
         let needs = crate::proto::proto_needs(payload);
