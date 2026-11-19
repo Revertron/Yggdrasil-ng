@@ -1046,6 +1046,9 @@ impl Links {
             entry.handle.abort();
         }
         self.peer_addrs.clear();
+        // The core holds these links, so keeping a handle on it here would keep
+        // a closed node alive.
+        self.core = None;
     }
 }
 

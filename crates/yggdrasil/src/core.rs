@@ -5,6 +5,7 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use ironwood::{Addr, Config as IwConfig, EncryptedPacketConn, PacketConn};
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::address::{addr_for_key, subnet_for_key, Address, Subnet};
 use crate::config::Config;
@@ -49,6 +50,10 @@ pub struct Core {
     tun_info: std::sync::Mutex<Option<(String, u64)>>,
     external_ifaces_tx: watch::Sender<Vec<NetworkInterface>>,
     external_ifaces_rx: watch::Receiver<Vec<NetworkInterface>>,
+    /// Stops the tasks the node runs for itself (inbound proto handling and
+    /// TLS renewal). Both hold the node, so without it a closed node is never
+    /// freed.
+    background: CancellationToken,
 }
 
 impl Core {
@@ -150,20 +155,26 @@ impl Core {
             tun_info: std::sync::Mutex::new(None),
             external_ifaces_tx,
             external_ifaces_rx,
+            background: CancellationToken::new(),
         });
 
         // Spawn inbound proto handler task
         let core_clone = core.clone();
+        let stop = core.background.clone();
         tokio::spawn(async move {
-            while let Some((from_key, payload)) = proto_in_rx.recv().await {
-                core_clone.handle_inbound_proto(from_key, &payload).await;
-            }
+            stop.run_until_cancelled(async move {
+                while let Some((from_key, payload)) = proto_in_rx.recv().await {
+                    core_clone.handle_inbound_proto(from_key, &payload).await;
+                }
+            })
+            .await;
         });
 
         // Spawn TLS certificate renewal task
         let core_clone = core.clone();
+        let stop = core.background.clone();
         tokio::spawn(async move {
-            core_clone.tls_renewal_task().await;
+            stop.run_until_cancelled(core_clone.tls_renewal_task()).await;
         });
 
         core
@@ -337,7 +348,11 @@ impl Core {
     }
 
     /// Close the core and all links.
+    ///
+    /// Also stops the node's own background tasks and drops the links' handle
+    /// on the core, so the node is freed once its owner drops it.
     pub async fn close(&self) -> Result<(), ironwood::Error> {
+        self.background.cancel();
         {
             let mut links = self.links.lock().await;
             links.close().await;
@@ -618,5 +633,36 @@ impl Core {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_closed_node_is_freed() {
+        let core = Core::new(SigningKey::from_bytes(&[7; 32]), Config::default());
+        core.init_links().await;
+        core.start().await;
+        core.close().await.unwrap();
+
+        let weak = Arc::downgrade(&core);
+        let router = Arc::downgrade(&core.inner);
+        drop(core);
+        // Aborted and cancelled tasks drop what they hold the next time the
+        // runtime polls them.
+        for _ in 0..100 {
+            if weak.upgrade().is_none() && router.upgrade().is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "still held after close: core {}, router {}",
+            weak.upgrade().is_some(),
+            router.upgrade().is_some()
+        );
     }
 }

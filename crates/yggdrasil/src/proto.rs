@@ -91,12 +91,16 @@ impl ProtoHandler {
             proto_tx,
         });
 
-        // Spawn cleanup task
-        let handler_clone = handler.clone();
+        // Spawn cleanup task. It holds the handler weakly, so it ends once the
+        // node that owns the handler is gone.
+        let weak = Arc::downgrade(&handler);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(CLEANUP_INTERVAL).await;
-                handler_clone.cleanup_expired().await;
+                let Some(handler) = weak.upgrade() else {
+                    return;
+                };
+                handler.cleanup_expired().await;
             }
         });
 
