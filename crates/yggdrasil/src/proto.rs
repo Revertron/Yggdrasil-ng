@@ -66,6 +66,18 @@ pub fn proto_needs(payload: &[u8]) -> ProtoNeeds {
     }
 }
 
+/// Whether a protocol payload is another node's debug request, as opposed to a
+/// response to one of ours or a NodeInfo message.
+pub fn is_debug_request(payload: &[u8]) -> bool {
+    payload.first() == Some(&TYPE_PROTO_DEBUG)
+        && matches!(
+            payload.get(1),
+            Some(&TYPE_DEBUG_GET_SELF_REQUEST)
+                | Some(&TYPE_DEBUG_GET_PEERS_REQUEST)
+                | Some(&TYPE_DEBUG_GET_TREE_REQUEST)
+        )
+}
+
 /// Protocol handler for remote queries.
 pub struct ProtoHandler {
     /// Callbacks for GetSelf requests (indexed by target key).
@@ -379,5 +391,31 @@ impl ProtoHandler {
         self.nodeinfo_callbacks.lock().await.retain(|_, (_, created)| {
             now.duration_since(*created) < CALLBACK_TIMEOUT
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_requests_count_as_debug_requests() {
+        for request in [
+            TYPE_DEBUG_GET_SELF_REQUEST,
+            TYPE_DEBUG_GET_PEERS_REQUEST,
+            TYPE_DEBUG_GET_TREE_REQUEST,
+        ] {
+            assert!(is_debug_request(&[TYPE_PROTO_DEBUG, request]));
+        }
+        for response in [
+            TYPE_DEBUG_GET_SELF_RESPONSE,
+            TYPE_DEBUG_GET_PEERS_RESPONSE,
+            TYPE_DEBUG_GET_TREE_RESPONSE,
+        ] {
+            assert!(!is_debug_request(&[TYPE_PROTO_DEBUG, response]));
+        }
+        assert!(!is_debug_request(&[TYPE_PROTO_NODEINFO_REQUEST]));
+        assert!(!is_debug_request(&[TYPE_PROTO_DEBUG]));
+        assert!(!is_debug_request(&[]));
     }
 }

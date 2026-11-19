@@ -209,6 +209,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `if_mtu` | integer | TUN MTU (default: 65535) |
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
+| `debug_privacy` | bool | Don't answer other nodes' debug requests: getSelf, getPeers, getTree (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
 | `[tunnel_routing]` | table | CKR tunnel routing config (`ckr` feature, enabled by default) — see [docs/CKR.md](docs/CKR.md) |
 
